@@ -348,6 +348,7 @@ function makeDraggable(element, handle) {
     let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
     let isDragging = false;
 
+    // 鼠标拖拽事件 (PC)
     handle.onmousedown = dragMouseDown;
 
     function dragMouseDown(e) {
@@ -367,8 +368,8 @@ function makeDraggable(element, handle) {
         pos2 = pos4 - e.clientY;
         pos3 = e.clientX;
         pos4 = e.clientY;
-        element.style.top = (element.offsetTop - pos2) + "px";
-        element.style.left = (element.offsetLeft - pos1) + "px";
+        element.style.top = Math.max(10, Math.min(window.innerHeight - 50, element.offsetTop - pos2)) + "px";
+        element.style.left = Math.max(10, Math.min(window.innerWidth - 100, element.offsetLeft - pos1)) + "px";
         element.style.right = "auto";
     }
 
@@ -376,6 +377,32 @@ function makeDraggable(element, handle) {
         document.onmouseup = null;
         document.onmousemove = null;
     }
+
+    // 触摸拖拽事件 (手机移动端支持)
+    handle.ontouchstart = function(e) {
+        if (e.target.closest("#tiandao_widget_close_btn")) return;
+        const touch = e.touches[0];
+        pos3 = touch.clientX;
+        pos4 = touch.clientY;
+        isDragging = false;
+
+        document.ontouchend = function() {
+            document.ontouchend = null;
+            document.ontouchmove = null;
+        };
+
+        document.ontouchmove = function(ev) {
+            const t = ev.touches[0];
+            isDragging = true;
+            pos1 = pos3 - t.clientX;
+            pos2 = pos4 - t.clientY;
+            pos3 = t.clientX;
+            pos4 = t.clientY;
+            element.style.top = Math.max(10, Math.min(window.innerHeight - 50, element.offsetTop - pos2)) + "px";
+            element.style.left = Math.max(10, Math.min(window.innerWidth - 100, element.offsetLeft - pos1)) + "px";
+            element.style.right = "auto";
+        };
+    };
 }
 
 function updateFloatingWidgetUI() {
