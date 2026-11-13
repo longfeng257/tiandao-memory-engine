@@ -140,7 +140,7 @@ globalThis.tiandaoMemoryInterceptor = async function (chat, _contextSize, _abort
         const query = buildRecentContextQuery(chat, settings.targetContentTags, settings.customStripTags);
         await refreshPromptInjection(query);
     } catch (e) {
-        console.warn("[Tiandao Memory] Interceptor refresh error:", e);
+        console.warn("[溯微] Interceptor refresh error:", e);
     }
 };
 
@@ -258,7 +258,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false) {
         syncHiddenMessagesState();
         updateStatusBar(`✅ 第 ${roundNumber} 轮已归档`);
     } catch (err) {
-        console.error("[Tiandao Memory] Summarize turn error:", err);
+        console.error("[溯微] Summarize turn error:", err);
         updateStatusBar(`❌ 总结失败: ${err.message}`, true);
     } finally {
         isSummarizingTurn = false;
@@ -331,7 +331,7 @@ window.tiandaoProcessTurn = async (idx) => {
     await processSingleAiTurn(idx, true);
 };
 
-// ==================== 🌌 实时记忆悬浮窗 (Floating Widget) 模块 ====================
+// ==================== 🌌 “溯微” 实时记忆悬浮窗 (Floating Widget) ====================
 let isWidgetExpanded = false;
 
 function initFloatingWidget() {
@@ -341,23 +341,192 @@ function initFloatingWidget() {
     widget = document.createElement("div");
     widget.id = "tiandao_floating_widget";
     widget.innerHTML = `
-        <div id="tiandao_widget_pill" class="tiandao-widget-pill" title="天道·溯微长线记忆看板 (点击展开/折叠，长按可拖拽)">
-            <span>🌌 天道记忆</span>
+        <div id="tiandao_widget_pill" class="tiandao-widget-pill" title="溯微记忆引擎 (点击展开/折叠，长按可拖拽)">
+            <span>🌌 溯微</span>
             <span id="tiandao_widget_badge" class="tiandao-pill-badge">就绪</span>
         </div>
         <div id="tiandao_widget_card" class="tiandao-widget-card" style="display: none;">
             <div class="tiandao-card-header">
-                <span>🌌 溯微剧情时间线与人物账本</span>
-                <span id="tiandao_widget_close_btn" style="cursor: pointer; opacity: 0.8; font-size: 1.1em;" title="折叠看板">&times;</span>
+                <div class="tiandao-card-tabs">
+                    <button type="button" id="tiandao_tab_ledger_btn" class="tiandao-tab-btn active"><i class="fa-solid fa-book-bookmark"></i> 状态看板</button>
+                    <button type="button" id="tiandao_tab_settings_btn" class="tiandao-tab-btn"><i class="fa-solid fa-sliders"></i> 溯微设置</button>
+                </div>
+                <span id="tiandao_widget_close_btn" class="tiandao-close-btn" title="折叠看板">&times;</span>
             </div>
+            <div id="tiandao_status_bar" class="tiandao-status-bar">当前状态：就绪</div>
             <div id="tiandao_widget_body" class="tiandao-card-body">
-                <!-- 动态内容 -->
+                <!-- Tab 1: 状态看板 -->
+                <div id="tiandao_tab_ledger_content" class="tiandao-tab-page">
+                    <div id="tiandao_widget_body_inner" class="tiandao-ledger-list">
+                        <!-- 动态内容 -->
+                    </div>
+                </div>
+
+                <!-- Tab 2: 完整设置与管理 -->
+                <div id="tiandao_tab_settings_content" class="tiandao-tab-page" style="display: none;">
+                    <!-- 核心运行与轮次裁剪 -->
+                    <div class="tiandao-section">
+                        <div class="tiandao-section-title">⚙️ 核心运行与轮次裁剪</div>
+                        <label class="tiandao-switch-label">
+                            <input id="tiandao_enabled" type="checkbox" />
+                            <span>启用溯微记忆引擎（注入状态账本与时间线）</span>
+                        </label>
+                        <label class="tiandao-switch-label">
+                            <input id="tiandao_auto_summarize" type="checkbox" />
+                            <span>自动调用独立 API 总结每轮对话</span>
+                        </label>
+                        <div class="tiandao-row">
+                            <span>总结触发时机：</span>
+                            <select id="tiandao_summarize_timing" class="tiandao-select">
+                                <option value="on_next_send">玩家发送下一条时 (重Roll零消耗·推荐)</option>
+                                <option value="after_reply">AI 回复后立即总结</option>
+                            </select>
+                        </div>
+                        <hr class="tiandao-divider" />
+                        <label class="tiandao-switch-label">
+                            <input id="tiandao_auto_hide" type="checkbox" />
+                            <span><b>自动隐藏超出轮次原文</b>（只发最近 N 轮）</span>
+                        </label>
+                        <div class="tiandao-row">
+                            <span>保留最近几轮一问一答：</span>
+                            <div style="display:flex; align-items:center; gap:6px;">
+                                <input id="tiandao_keep_recent" type="number" class="tiandao-input" min="1" max="25" style="width: 55px; text-align: center;" />
+                                <button type="button" id="tiandao_restore_hidden_btn" class="tiandao-btn tiandao-btn-sm" title="恢复所有被溯微隐藏的历史轮次">
+                                    <i class="fa-solid fa-eye"></i> 恢复全部
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 独立总结 API 设置 -->
+                    <div class="tiandao-section">
+                        <div class="tiandao-section-title">🔌 独立总结 API 设置 (OpenAI 兼容)</div>
+                        <div class="tiandao-field">
+                            <label>API 地址 (Base URL)</label>
+                            <input id="tiandao_api_url" type="text" class="tiandao-input" placeholder="https://api.deepseek.com/v1" />
+                        </div>
+                        <div class="tiandao-field">
+                            <label>API Key</label>
+                            <input id="tiandao_api_key" type="password" class="tiandao-input" placeholder="sk-..." />
+                        </div>
+                        <div class="tiandao-row" style="gap:8px;">
+                            <div style="flex: 1.4;">
+                                <label style="font-size:0.8em; opacity:0.85; display:block; margin-bottom:2px;">总结模型 (Model)</label>
+                                <input id="tiandao_model" type="text" class="tiandao-input" placeholder="deepseek-chat" />
+                            </div>
+                            <div style="flex: 0.8;">
+                                <label style="font-size:0.8em; opacity:0.85; display:block; margin-bottom:2px;">温度 (Temp)</label>
+                                <input id="tiandao_temp" type="number" step="0.1" min="0" max="1.5" class="tiandao-input" />
+                            </div>
+                        </div>
+                        <div class="tiandao-field" style="margin-top:6px;">
+                            <label>🎯 目标正文标签（白名单优先，逗号分隔）</label>
+                            <input id="tiandao_target_tags" type="text" class="tiandao-input" placeholder="content,story,reply" />
+                        </div>
+                        <div class="tiandao-field">
+                            <label>备用排除标签（黑名单）</label>
+                            <input id="tiandao_strip_tags" type="text" class="tiandao-input" placeholder="thinking,think,report,options_engine" />
+                        </div>
+                        <div style="margin-top: 6px;">
+                            <button type="button" id="tiandao_test_api_btn" class="tiandao-btn tiandao-btn-full"><i class="fa-solid fa-plug"></i> 测试独立 API 连接</button>
+                        </div>
+                    </div>
+
+                    <!-- 记忆金字塔与注入设置 -->
+                    <details class="tiandao-details">
+                        <summary><i class="fa-solid fa-tree"></i> 记忆金字塔与提示词注入设置</summary>
+                        <div class="tiandao-section-sub">
+                            <div class="tiandao-row">
+                                <span>向上合并步长 (满 K 条合并为 1 条)：</span>
+                                <input id="tiandao_merge_chunk" type="number" class="tiandao-input" min="2" max="15" style="width: 55px; text-align: center;" />
+                            </div>
+                            <div class="tiandao-row">
+                                <span>最大递归层级数 (L0 ~ L_max)：</span>
+                                <input id="tiandao_max_level" type="number" class="tiandao-input" min="2" max="5" style="width: 55px; text-align: center;" />
+                            </div>
+                            <div class="tiandao-row">
+                                <span>提示词注入位置：</span>
+                                <select id="tiandao_inject_pos" class="tiandao-select">
+                                    <option value="1">聊天历史中 (@ Depth)</option>
+                                    <option value="0">聊天历史之后</option>
+                                    <option value="2">主提示词之前</option>
+                                </select>
+                            </div>
+                            <div class="tiandao-row">
+                                <span>提示词注入深度 (Depth)：</span>
+                                <input id="tiandao_inject_depth" type="number" class="tiandao-input" min="0" max="20" style="width: 55px; text-align: center;" />
+                            </div>
+                            <div class="tiandao-row">
+                                <span>提示词注入角色 (Role)：</span>
+                                <select id="tiandao_inject_role" class="tiandao-select">
+                                    <option value="0">System (系统)</option>
+                                    <option value="1">User (用户·高兼容)</option>
+                                    <option value="2">Assistant (AI助手)</option>
+                                </select>
+                            </div>
+                        </div>
+                    </details>
+
+                    <!-- 向量与关键词混合检索设置 -->
+                    <details class="tiandao-details">
+                        <summary><i class="fa-solid fa-magnifying-glass"></i> 陈年小事按需唤醒 (混合检索)</summary>
+                        <div class="tiandao-section-sub">
+                            <label class="tiandao-switch-label">
+                                <input id="tiandao_enable_retrieval" type="checkbox" />
+                                <span>开启历史微摘要按需唤醒 (聊到旧事自动召回)</span>
+                            </label>
+                            <div class="tiandao-row">
+                                <span>最多唤醒历史小事条数 (Top-K)：</span>
+                                <input id="tiandao_retrieval_topk" type="number" class="tiandao-input" min="1" max="10" style="width: 55px; text-align: center;" />
+                            </div>
+                            <label class="tiandao-switch-label" style="margin-top: 6px;">
+                                <input id="tiandao_use_embedding" type="checkbox" />
+                                <span>启用外部 Embedding 向量 API（默认本地双字分词）</span>
+                            </label>
+                            <div id="tiandao_embedding_box" style="display: none; margin-top: 6px;">
+                                <div class="tiandao-field">
+                                    <label>Embedding URL</label>
+                                    <input id="tiandao_emb_url" type="text" class="tiandao-input" placeholder="https://api.siliconflow.cn/v1" />
+                                </div>
+                                <div class="tiandao-field">
+                                    <label>Embedding API Key</label>
+                                    <input id="tiandao_emb_key" type="password" class="tiandao-input" placeholder="sk-..." />
+                                </div>
+                                <div class="tiandao-field">
+                                    <label>Embedding 模型</label>
+                                    <input id="tiandao_emb_model" type="text" class="tiandao-input" placeholder="BAAI/bge-m3" />
+                                </div>
+                            </div>
+                        </div>
+                    </details>
+
+                    <!-- 记忆维护与数据操作 -->
+                    <div class="tiandao-section">
+                        <div class="tiandao-section-title">🛠️ 记忆维护与数据操作</div>
+                        <div class="tiandao-btn-grid">
+                            <button type="button" id="tiandao_open_viewer_btn" class="tiandao-btn"><i class="fa-solid fa-book-open"></i> 时间线总览与备份</button>
+                            <button type="button" id="tiandao_Summarize_last_btn" class="tiandao-btn"><i class="fa-solid fa-rotate"></i> 手动总结最新一轮</button>
+                            <button type="button" id="tiandao_backfill_btn" class="tiandao-btn"><i class="fa-solid fa-clock-rotate-left"></i> 一键扫描旧历史</button>
+                            <button type="button" id="tiandao_clear_memory_btn" class="tiandao-btn tiandao-btn-danger"><i class="fa-solid fa-trash"></i> 清空本存档记忆</button>
+                        </div>
+                    </div>
+
+                    <!-- 最近对话轮次管理 -->
+                    <div class="tiandao-section">
+                        <div class="tiandao-section-title">🕒 最近对话轮次重整</div>
+                        <div id="tiandao_turns_list" class="tiandao-turns-list">
+                            <!-- 动态渲染最近一问一答轮次 -->
+                        </div>
+                    </div>
+                </div>
             </div>
+
+            <!-- 卡片底部状态与快捷操作 -->
             <div class="tiandao-card-footer">
-                <span style="opacity: 0.7;" id="tiandao_widget_summary_info">L0: 0 | L1: 0 | L2: 0</span>
+                <span style="opacity: 0.8;" id="tiandao_widget_summary_info">L0: 0 | L1: 0 | L2: 0</span>
                 <div style="display: flex; gap: 6px;">
-                    <button id="tiandao_widget_refresh_last_btn" class="menu_button" style="padding: 2px 8px; font-size: 0.85em; width: auto;"><i class="fa-solid fa-rotate"></i> 重整本轮</button>
-                    <button id="tiandao_widget_full_view_btn" class="menu_button" style="padding: 2px 8px; font-size: 0.85em; width: auto;"><i class="fa-solid fa-book-open"></i> 账本</button>
+                    <button type="button" id="tiandao_widget_refresh_last_btn" class="tiandao-btn tiandao-btn-sm" title="重整当前最新一问一答轮次"><i class="fa-solid fa-rotate"></i> 重整本轮</button>
+                    <button type="button" id="tiandao_widget_full_view_btn" class="tiandao-btn tiandao-btn-sm" title="查看完整叙事时间线与备份"><i class="fa-solid fa-book-open"></i> 账本</button>
                 </div>
             </div>
         </div>
@@ -367,19 +536,42 @@ function initFloatingWidget() {
     const pill = document.getElementById("tiandao_widget_pill");
     const card = document.getElementById("tiandao_widget_card");
     const closeBtn = document.getElementById("tiandao_widget_close_btn");
+    const tabLedgerBtn = document.getElementById("tiandao_tab_ledger_btn");
+    const tabSettingsBtn = document.getElementById("tiandao_tab_settings_btn");
+    const tabLedgerContent = document.getElementById("tiandao_tab_ledger_content");
+    const tabSettingsContent = document.getElementById("tiandao_tab_settings_content");
     const fullViewBtn = document.getElementById("tiandao_widget_full_view_btn");
     const refreshLastBtn = document.getElementById("tiandao_widget_refresh_last_btn");
 
+    // 展开/折叠
     pill.addEventListener("click", () => {
         isWidgetExpanded = !isWidgetExpanded;
         card.style.display = isWidgetExpanded ? "flex" : "none";
-        if (isWidgetExpanded) updateFloatingWidgetUI();
+        if (isWidgetExpanded) {
+            updateFloatingWidgetUI();
+        }
     });
 
     closeBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         isWidgetExpanded = false;
         card.style.display = "none";
+    });
+
+    // Tab 切换
+    tabLedgerBtn.addEventListener("click", () => {
+        tabLedgerBtn.classList.add("active");
+        tabSettingsBtn.classList.remove("active");
+        tabLedgerContent.style.display = "block";
+        tabSettingsContent.style.display = "none";
+    });
+
+    tabSettingsBtn.addEventListener("click", () => {
+        tabSettingsBtn.classList.add("active");
+        tabLedgerBtn.classList.remove("active");
+        tabLedgerContent.style.display = "none";
+        tabSettingsContent.style.display = "block";
+        renderRecentTurnsList();
     });
 
     if (fullViewBtn) fullViewBtn.addEventListener("click", () => openMemoryViewerModal());
@@ -390,6 +582,7 @@ function initFloatingWidget() {
     });
 
     makeDraggable(widget, pill);
+    bindSettingsUI();
     updateFloatingWidgetUI();
 }
 
@@ -400,7 +593,7 @@ function makeDraggable(element, handle) {
     handle.onmousedown = dragMouseDown;
 
     function dragMouseDown(e) {
-        if (e.target.closest("#tiandao_widget_close_btn")) return;
+        if (e.target.closest("#tiandao_widget_close_btn, button, input, select, textarea")) return;
         e.preventDefault();
         pos3 = e.clientX;
         pos4 = e.clientY;
@@ -427,7 +620,7 @@ function makeDraggable(element, handle) {
     }
 
     handle.ontouchstart = function(e) {
-        if (e.target.closest("#tiandao_widget_close_btn")) return;
+        if (e.target.closest("#tiandao_widget_close_btn, button, input, select, textarea")) return;
         const touch = e.touches[0];
         pos3 = touch.clientX;
         pos4 = touch.clientY;
@@ -466,7 +659,7 @@ function updateFloatingWidgetUI() {
     const memoryData = getChatMemory();
     const ledger = memoryData.stateLedger || {};
     const badge = document.getElementById("tiandao_widget_badge");
-    const body = document.getElementById("tiandao_widget_body");
+    const bodyInner = document.getElementById("tiandao_widget_body_inner");
     const summaryInfo = document.getElementById("tiandao_widget_summary_info");
 
     const l0Count = (memoryData.levels?.[0] || []).length;
@@ -474,7 +667,7 @@ function updateFloatingWidgetUI() {
     const l2Count = (memoryData.levels?.[2] || []).length;
 
     if (badge) {
-        const lastRound = memoryData.lastProcessedRound > 0 ? `第${memoryData.lastProcessedRound}轮` : "未开始";
+        const lastRound = memoryData.lastProcessedRound > 0 ? `第${memoryData.lastProcessedRound}轮` : "就绪";
         badge.textContent = lastRound;
     }
 
@@ -482,7 +675,7 @@ function updateFloatingWidgetUI() {
         summaryInfo.textContent = `L0(${l0Count}) L1(${l1Count}) L2(${l2Count}) | 池:${memoryData.archivePool?.length || 0}`;
     }
 
-    if (!body) return;
+    if (!bodyInner) return;
 
     const chars = ledger.characters || {};
     const charCards = [];
@@ -516,7 +709,7 @@ function updateFloatingWidgetUI() {
         ? ledger.todosAndPromises.map(x => `<div>📌 ${x}</div>`).join("")
         : "<div style='opacity:0.6;'>暂无待办约定</div>";
 
-    body.innerHTML = `
+    bodyInner.innerHTML = `
         <div class="tiandao-card-block" style="background: rgba(224, 194, 128, 0.08);">
             <div class="tiandao-block-title"><i class="fa-solid fa-clock"></i> 故事时间</div>
             <div class="tiandao-block-content" style="color:#f3d48d; font-weight:bold;">${ledger.time || "未知时间"}</div>
@@ -538,15 +731,15 @@ function openMemoryViewerModal() {
 
     const html = `
     <div class="tiandao-modal-container">
-        <h3 style="margin-top:0; color:#e0c280;">🌌 天道·溯微 剧情时间线总览与人物账本</h3>
+        <h3 style="margin-top:0; color:#e0c280;">🌌 溯微 剧情时间线总览与人物账本</h3>
         <p style="font-size:0.85em; opacity:0.85; margin-bottom:8px;">
             按一问一答轮数清晰呈现的故事时间线与在场各人物状态。纯叙事文本展示，无杂乱代码：
         </p>
         <div class="tiandao-btn-row" style="margin-bottom:10px;">
-            <div id="tiandao_export_json_btn" class="menu_button" style="width:auto; padding:4px 10px;">
+            <div id="tiandao_export_json_btn" class="tiandao-btn" style="width:auto; padding:5px 12px;">
                 <i class="fa-solid fa-file-export"></i> 导出记忆备份 (.json)
             </div>
-            <label class="menu_button" style="width:auto; padding:4px 10px; cursor:pointer; margin:0;">
+            <label class="tiandao-btn" style="width:auto; padding:5px 12px; cursor:pointer; margin:0;">
                 <i class="fa-solid fa-file-import"></i> 导入记忆备份
                 <input id="tiandao_import_json_input" type="file" accept=".json" style="display:none;" />
             </label>
@@ -573,7 +766,7 @@ function openMemoryViewerModal() {
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement("a");
                     a.href = url;
-                    a.download = `tiandao_memory_${ctx.name2 || "chat"}_${Date.now()}.json`;
+                    a.download = `suwei_memory_${ctx.name2 || "chat"}_${Date.now()}.json`;
                     a.click();
                     URL.revokeObjectURL(url);
                 });
@@ -660,7 +853,6 @@ function bindSettingsUI() {
     });
     bindCheck("tiandao_auto_summarize", "autoSummarizePerTurn");
     bindInput("tiandao_summarize_timing", "summarizeTiming");
-    bindCheck("tiandao_show_widget", "showFloatingWidget", () => updateFloatingWidgetUI());
 
     bindCheck("tiandao_auto_hide", "autoHideOldMessages", (checked) => {
         const count = syncHiddenMessagesState(!checked);
@@ -704,95 +896,85 @@ function bindSettingsUI() {
 
     const testBtn = document.getElementById("tiandao_test_api_btn");
     if (testBtn) testBtn.addEventListener("click", async () => {
-            try {
-                updateStatusBar("⏳ 正在测试独立 API 连接...");
-                const reply = await callIndependentLLM(settings, [{ role: "user", content: "请仅回复“连接成功”四个字。" }]);
-                updateStatusBar(`✅ API 测试通过！模型回复: ${reply.slice(0, 30)}`);
-            } catch (e) {
-                updateStatusBar(`❌ API 连接失败: ${e.message}`, true);
-            }
-        });
+        try {
+            updateStatusBar("⏳ 正在测试独立 API 连接...");
+            const reply = await callIndependentLLM(settings, [{ role: "user", content: "请仅回复“连接成功”四个字。" }]);
+            updateStatusBar(`✅ API 测试通过！模型回复: ${reply.slice(0, 30)}`);
+        } catch (e) {
+            updateStatusBar(`❌ API 连接失败: ${e.message}`, true);
+        }
+    });
 
     const viewerBtn = document.getElementById("tiandao_open_viewer_btn");
     if (viewerBtn) viewerBtn.addEventListener("click", () => openMemoryViewerModal());
 
     const sumLastBtn = document.getElementById("tiandao_Summarize_last_btn");
     if (sumLastBtn) sumLastBtn.addEventListener("click", async () => {
-            const ctx = getSTContext();
-            const chat = ctx.chat || [];
-            if (chat.length === 0) return updateStatusBar("当前无聊天消息", true);
-            await processSingleAiTurn(chat.length - 1, true);
-        });
+        const ctx = getSTContext();
+        const chat = ctx.chat || [];
+        if (chat.length === 0) return updateStatusBar("当前无聊天消息", true);
+        await processSingleAiTurn(chat.length - 1, true);
+    });
 
     const backfillBtn = document.getElementById("tiandao_backfill_btn");
     if (backfillBtn) backfillBtn.addEventListener("click", async () => {
-            if (isBackfilling) {
-                abortBackfillFlag = true;
-                updateStatusBar("⏸️ 正在安全停止历史回溯...");
-                return;
-            }
-            const ctx = getSTContext();
-            const chat = ctx.chat || [];
-            if (chat.length === 0) return updateStatusBar("当前无历史消息可扫描", true);
-            const memoryData = getChatMemory();
-            const nextStart = Math.max(0, (memoryData.lastProcessedMessageId ?? -1) + 1);
-            if (nextStart >= chat.length) return updateStatusBar("✅ 所有历史对话轮次均已在记忆树中。");
-            if (!confirm(`确定要扫描当前存档中的历史对话轮次吗？`)) return;
-            isBackfilling = true;
-            abortBackfillFlag = false;
-            backfillBtn.innerHTML = `<i class="fa-solid fa-stop"></i> 暂停历史回溯扫描`;
-            try {
-                const userName = ctx.name1 || "User";
-                const charName = ctx.name2 || "Character";
-                await backfillExistingChatHistory(settings, memoryData, chat, userName, charName, {
-                    onProgress: (cur, total, roundNumber) => updateStatusBar(`⏳ 扫描旧历史 (${cur}/${total}) · 第 ${roundNumber} 轮...`),
-                    onChunkSaved: async () => { await saveChatMemory(); await refreshPromptInjection(); },
-                    shouldAbort: () => abortBackfillFlag,
-                });
-                syncHiddenMessagesState();
-                updateStatusBar(`✅ 存量历史按轮次扫描构建完成！`);
-            } catch (e) { updateStatusBar(`❌ 历史回溯中断: ${e.message}`, true); }
-            finally { isBackfilling = false; backfillBtn.innerHTML = `<i class="fa-solid fa-clock-rotate-left"></i> 一键扫描旧历史构建记忆树`; }
-        });
+        if (isBackfilling) {
+            abortBackfillFlag = true;
+            updateStatusBar("⏸️ 正在安全停止历史回溯...");
+            return;
+        }
+        const ctx = getSTContext();
+        const chat = ctx.chat || [];
+        if (chat.length === 0) return updateStatusBar("当前无历史消息可扫描", true);
+        const memoryData = getChatMemory();
+        const nextStart = Math.max(0, (memoryData.lastProcessedMessageId ?? -1) + 1);
+        if (nextStart >= chat.length) return updateStatusBar("✅ 所有历史对话轮次均已在记忆树中。");
+        if (!confirm(`确定要扫描当前存档中的历史对话轮次吗？`)) return;
+        isBackfilling = true;
+        abortBackfillFlag = false;
+        backfillBtn.innerHTML = `<i class="fa-solid fa-stop"></i> 暂停扫描`;
+        try {
+            const userName = ctx.name1 || "User";
+            const charName = ctx.name2 || "Character";
+            await backfillExistingChatHistory(settings, memoryData, chat, userName, charName, {
+                onProgress: (cur, total, roundNumber) => updateStatusBar(`⏳ 扫描旧历史 (${cur}/${total}) · 第 ${roundNumber} 轮...`),
+                onChunkSaved: async () => { await saveChatMemory(); await refreshPromptInjection(); },
+                shouldAbort: () => abortBackfillFlag,
+            });
+            syncHiddenMessagesState();
+            updateStatusBar(`✅ 存量历史按轮次扫描构建完成！`);
+        } catch (e) { updateStatusBar(`❌ 历史回溯中断: ${e.message}`, true); }
+        finally { isBackfilling = false; backfillBtn.innerHTML = `<i class="fa-solid fa-clock-rotate-left"></i> 一键扫描旧历史`; }
+    });
 
     const restoreHiddenBtn = document.getElementById("tiandao_restore_hidden_btn");
     if (restoreHiddenBtn) restoreHiddenBtn.addEventListener("click", () => {
-            syncHiddenMessagesState(true);
-            settings.autoHideOldMessages = false;
-            document.getElementById("tiandao_auto_hide").checked = false;
-            saveSettings();
-            updateStatusBar(`👁️ 已恢复显示所有历史原文。`);
-        });
+        syncHiddenMessagesState(true);
+        settings.autoHideOldMessages = false;
+        const autoHideEl = document.getElementById("tiandao_auto_hide");
+        if (autoHideEl) autoHideEl.checked = false;
+        saveSettings();
+        updateStatusBar(`👁️ 已恢复显示所有历史原文。`);
+    });
 
     const clearBtn = document.getElementById("tiandao_clear_memory_btn");
     if (clearBtn) clearBtn.addEventListener("click", async () => {
-            if (!confirm("确定要清空当前聊天存档的所有天道记忆树与状态账本吗？")) return;
-            const ctx = getSTContext();
-            const metadata = ctx.chatMetadata || window.chat_metadata;
-            if (metadata) {
-                metadata.tiandao_memory = createEmptyMemoryData();
-                await saveChatMemory();
-                await refreshPromptInjection();
-                updateStatusBar("🗑️ 已清空本存档记忆账本");
-                updateFloatingWidgetUI();
-            }
-        });
+        if (!confirm("确定要清空当前聊天存档的所有记忆与状态账本吗？")) return;
+        const ctx = getSTContext();
+        const metadata = ctx.chatMetadata || window.chat_metadata;
+        if (metadata) {
+            metadata.tiandao_memory = createEmptyMemoryData();
+            await saveChatMemory();
+            await refreshPromptInjection();
+            updateStatusBar("🗑️ 已清空本存档记忆账本");
+            updateFloatingWidgetUI();
+        }
+    });
 }
 
 (async function initTiandaoMemoryExtension() {
     try {
-        const scriptUrl = import.meta.url;
-        const basePath = scriptUrl.substring(0, scriptUrl.lastIndexOf("/"));
-        const res = await fetch(`${basePath}/settings.html`);
-        if (res.ok) {
-            const html = await res.text();
-            const container = document.getElementById("extensions_settings2") || document.getElementById("extensions_settings");
-            if (container) {
-                container.insertAdjacentHTML("beforeend", html);
-                bindSettingsUI();
-            }
-        }
-        
+        // 直接初始化悬浮窗（所有设置与状态看板均已收敛在悬浮窗内）
         initFloatingWidget();
 
         const ctx = getSTContext();
@@ -845,6 +1027,6 @@ function bindSettingsUI() {
                 }
             });
         }
-        console.log("[Tiandao Memory Engine] v1.6.0 (按轮数精准时间线与状态账本) 加载完毕！");
-    } catch (err) { console.error("[Tiandao Memory Engine] 初始化异常:", err); }
+        console.log("[溯微] v1.7.0 (纯悬浮窗架构·按轮数精准时间线与状态账本) 加载完毕！");
+    } catch (err) { console.error("[溯微] 初始化异常:", err); }
 })();

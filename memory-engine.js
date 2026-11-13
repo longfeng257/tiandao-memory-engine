@@ -1,5 +1,5 @@
 /**
- * 天道·溯微记忆引擎 (Tiandao Memory Engine) - 核心引擎模块
+ * 溯微记忆引擎 (Tiandao Memory Engine) - 核心引擎模块
  *
  * 核心设计：
  * 1. 按“一问一答轮数 (Round)”进行叙事归档与时间线提炼（绝非生硬楼层，一问一答即为一轮）。
@@ -617,7 +617,7 @@ export function buildInjectedMemoryPrompt(memoryData, retrievedSnacks = []) {
     }
 
     return `<tiandao_memory_system>
-# 天道·溯微剧情时间线与人物动态状态（最高事实基准）
+# 溯微剧情时间线与人物动态状态（最高事实基准）
 
 ## 一、当前各人物实时物理状态账本（绝对优先于角色卡初始设定）
 - **当前故事时间**: ${ledger.time || "未知"}
