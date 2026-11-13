@@ -4,7 +4,8 @@ import {
     cleanMessageText,
     callIndependentLLM,
     summarizeSingleTurn,
-    rollbackMemoryFromFloor,
+    rollbackMemoryFromMessageIndex,
+    calculateRoundForMessageIndex,
     retrieveRelevantArchivedMemories,
     buildInjectedMemoryPrompt,
     buildNarrativeStoryView,
@@ -33,6 +34,11 @@ function getSettings() {
     const extSettings = ctx.extensionSettings || window.extension_settings || {};
     if (!extSettings[EXTENSION_NAME]) {
         extSettings[EXTENSION_NAME] = Object.assign({}, DEFAULT_SETTINGS);
+    }
+    // 兼容旧配置项迁移
+    if (extSettings[EXTENSION_NAME].keepRecentRoundsCount === undefined) {
+        const oldMessagesCount = extSettings[EXTENSION_NAME].keepRecentMessagesCount;
+        extSettings[EXTENSION_NAME].keepRecentRoundsCount = oldMessagesCount ? Math.max(1, Math.round(oldMessagesCount / 2)) : 3;
     }
     for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
         if (extSettings[EXTENSION_NAME][k] === undefined) {
@@ -118,7 +124,6 @@ async function refreshPromptInjection(customQuery = "") {
         Number(settings.injectionRole ?? 0)
     );
 
-    // 实时更新悬浮窗内容
     updateFloatingWidgetUI();
 }
 
@@ -139,6 +144,10 @@ globalThis.tiandaoMemoryInterceptor = async function (chat, _contextSize, _abort
     }
 };
 
+/**
+ * 严格按照一问一答“轮数 (Round)”来裁剪隐藏历史：
+ * 保留最近 keepRecentRoundsCount 轮完整一问一答（即最近 N 个有效 AI 消息及其配对的 User 输入），更早的旧轮次自动隐藏
+ */
 function syncHiddenMessagesState(forceRestoreAll = false) {
     const settings = getSettings();
     const ctx = getSTContext();
@@ -146,8 +155,25 @@ function syncHiddenMessagesState(forceRestoreAll = false) {
     if (chat.length === 0) return 0;
 
     const shouldHide = settings.enabled && settings.autoHideOldMessages && !forceRestoreAll;
-    const keepCount = Math.max(1, Number(settings.keepRecentMessagesCount || 6));
-    const cutoffIndex = shouldHide ? Math.max(0, chat.length - keepCount) : 0;
+    const keepRounds = Math.max(1, Number(settings.keepRecentRoundsCount || 3));
+
+    // 计算分界点：从后往前找第 keepRounds 个 AI 回复的起始索引
+    let aiCount = 0;
+    let cutoffIndex = 0;
+
+    if (shouldHide) {
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const msg = chat[i];
+            if (msg && !msg.is_user && (!msg.is_system || msg.extra?.tiandao_hidden)) {
+                aiCount++;
+                if (aiCount === keepRounds) {
+                    // 若前一条是配对的 user 消息，保留该 user 消息
+                    cutoffIndex = (i > 0 && chat[i - 1]?.is_user) ? i - 1 : i;
+                    break;
+                }
+            }
+        }
+    }
 
     let restoredCount = 0;
 
@@ -178,6 +204,9 @@ function syncHiddenMessagesState(forceRestoreAll = false) {
     return restoredCount;
 }
 
+/**
+ * 总结指定的一问一答轮次
+ */
 async function processSingleAiTurn(targetMessageId, isManual = false) {
     const settings = getSettings();
     if (!settings.enabled && !isManual) return;
@@ -194,6 +223,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false) {
     const memoryData = getChatMemory();
     const userName = ctx.name1 || "User";
     const charName = ctx.name2 || targetMsg.name || "Character";
+    const roundNumber = calculateRoundForMessageIndex(chat, msgIdx);
 
     const lines = [];
     let startFloor = msgIdx;
@@ -201,31 +231,32 @@ async function processSingleAiTurn(targetMessageId, isManual = false) {
         startFloor = msgIdx - 1;
         const userCleaned = cleanMessageText(chat[msgIdx - 1].mes, settings.targetContentTags, settings.customStripTags);
         if (userCleaned) {
-            lines.push(`【第${msgIdx - 1}楼 · ${userName}】：\n${userCleaned}`);
+            lines.push(`【${userName}】：\n${userCleaned}`);
         }
     }
     const aiCleaned = cleanMessageText(targetMsg.mes, settings.targetContentTags, settings.customStripTags);
     if (aiCleaned) {
-        lines.push(`【第${msgIdx}楼 · ${charName}】：\n${aiCleaned}`);
+        lines.push(`【${charName}】：\n${aiCleaned}`);
     }
     if (lines.length === 0) return;
 
-    const floorRange = startFloor === msgIdx ? `${msgIdx}` : `${startFloor}-${msgIdx}`;
-    
     isSummarizingTurn = true;
     try {
-        updateStatusBar(`⏳ 正在总结第 ${floorRange} 楼并更新状态账本...`);
+        updateStatusBar(`⏳ 正在总结第 ${roundNumber} 轮对话并更新状态账本...`);
         await summarizeSingleTurn(settings, memoryData, {
-            floorRange,
+            roundNumber,
+            startMessageId: startFloor,
+            endMessageId: msgIdx,
             userName,
             charName,
             dialogueText: lines.join("\n\n"),
         });
         memoryData.lastProcessedMessageId = msgIdx;
+        memoryData.lastProcessedRound = roundNumber;
         await saveChatMemory();
         await refreshPromptInjection(aiCleaned);
         syncHiddenMessagesState();
-        updateStatusBar(`✅ 第 ${floorRange} 楼已归档`);
+        updateStatusBar(`✅ 第 ${roundNumber} 轮已归档`);
     } catch (err) {
         console.error("[Tiandao Memory] Summarize turn error:", err);
         updateStatusBar(`❌ 总结失败: ${err.message}`, true);
@@ -236,6 +267,9 @@ async function processSingleAiTurn(targetMessageId, isManual = false) {
     }
 }
 
+/**
+ * 玩家发送下一条消息时，结算上一轮已定稿的一问一答
+ */
 async function settlePendingConfirmedTurnsBeforeGeneration(chat, generationType) {
     const settings = getSettings();
     if (!settings.enabled || !settings.autoSummarizePerTurn) return;
@@ -256,6 +290,9 @@ async function settlePendingConfirmedTurnsBeforeGeneration(chat, generationType)
     }
 }
 
+/**
+ * 渲染最近对话轮次列表（按一问一答轮数清晰排布）
+ */
 function renderRecentTurnsList() {
     const list = document.getElementById("tiandao_turns_list");
     if (!list) return;
@@ -263,19 +300,31 @@ function renderRecentTurnsList() {
     const chat = ctx.chat || [];
     const html = [];
     
-    let count = 0;
-    for (let i = chat.length - 1; i >= 0 && count < 10; i--) {
+    // 找出所有有效 AI 消息
+    const turns = [];
+    for (let i = 0; i < chat.length; i++) {
         const msg = chat[i];
-        if (msg && !msg.is_user) {
-            html.push(`
-            <div class="tiandao-turn-item">
-                <span>第 ${i} 楼: ${msg.name || "AI"}</span>
-                <span class="tiandao-turn-btn" onclick="window.tiandaoProcessTurn(${i})">🔄 重新总结</span>
-            </div>`);
-            count++;
+        if (msg && !msg.is_user && (!msg.is_system || msg.extra?.tiandao_hidden)) {
+            turns.push({
+                round: turns.length + 1,
+                msgIdx: i,
+                name: msg.name || ctx.name2 || "AI",
+            });
         }
     }
-    list.innerHTML = html.join("");
+
+    // 只展示最近 10 轮
+    const recentTurns = turns.slice(-10).reverse();
+
+    for (const t of recentTurns) {
+        html.push(`
+        <div class="tiandao-turn-item">
+            <span><b>第 ${t.round} 轮</b> (${t.name})</span>
+            <span class="tiandao-turn-btn" onclick="window.tiandaoProcessTurn(${t.msgIdx})">🔄 重新总结本轮</span>
+        </div>`);
+    }
+
+    list.innerHTML = html.length > 0 ? html.join("") : "<div style='opacity:0.6; padding:4px;'>暂无已完成的对话轮次</div>";
 }
 
 window.tiandaoProcessTurn = async (idx) => {
@@ -292,13 +341,13 @@ function initFloatingWidget() {
     widget = document.createElement("div");
     widget.id = "tiandao_floating_widget";
     widget.innerHTML = `
-        <div id="tiandao_widget_pill" class="tiandao-widget-pill" title="天道·溯微长线记忆看板 (点击展开/折叠，可按住拖拽)">
+        <div id="tiandao_widget_pill" class="tiandao-widget-pill" title="天道·溯微长线记忆看板 (点击展开/折叠，长按可拖拽)">
             <span>🌌 天道记忆</span>
             <span id="tiandao_widget_badge" class="tiandao-pill-badge">就绪</span>
         </div>
         <div id="tiandao_widget_card" class="tiandao-widget-card" style="display: none;">
             <div class="tiandao-card-header">
-                <span>🌌 溯微实时状态账本</span>
+                <span>🌌 溯微剧情时间线与人物账本</span>
                 <span id="tiandao_widget_close_btn" style="cursor: pointer; opacity: 0.8; font-size: 1.1em;" title="折叠看板">&times;</span>
             </div>
             <div id="tiandao_widget_body" class="tiandao-card-body">
@@ -340,7 +389,6 @@ function initFloatingWidget() {
         if (chat.length > 0) await processSingleAiTurn(chat.length - 1, true);
     });
 
-    // 支持自由拖拽悬浮窗
     makeDraggable(widget, pill);
     updateFloatingWidgetUI();
 }
@@ -349,7 +397,6 @@ function makeDraggable(element, handle) {
     let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
     let isDragging = false;
 
-    // 鼠标拖拽事件 (PC)
     handle.onmousedown = dragMouseDown;
 
     function dragMouseDown(e) {
@@ -379,7 +426,6 @@ function makeDraggable(element, handle) {
         document.onmousemove = null;
     }
 
-    // 触摸拖拽事件 (手机移动端支持)
     handle.ontouchstart = function(e) {
         if (e.target.closest("#tiandao_widget_close_btn")) return;
         const touch = e.touches[0];
@@ -428,8 +474,8 @@ function updateFloatingWidgetUI() {
     const l2Count = (memoryData.levels?.[2] || []).length;
 
     if (badge) {
-        const lastFloor = memoryData.lastProcessedMessageId >= 0 ? `第${memoryData.lastProcessedMessageId}楼` : "未开始";
-        badge.textContent = lastFloor;
+        const lastRound = memoryData.lastProcessedRound > 0 ? `第${memoryData.lastProcessedRound}轮` : "未开始";
+        badge.textContent = lastRound;
     }
 
     if (summaryInfo) {
@@ -492,9 +538,9 @@ function openMemoryViewerModal() {
 
     const html = `
     <div class="tiandao-modal-container">
-        <h3 style="margin-top:0; color:#e0c280;">🌌 天道·溯微 剧情时间线总览与状态账本</h3>
+        <h3 style="margin-top:0; color:#e0c280;">🌌 天道·溯微 剧情时间线总览与人物账本</h3>
         <p style="font-size:0.85em; opacity:0.85; margin-bottom:8px;">
-            默认纯叙事展示完整故事时间线脉络及各人物当前物理状态。若需底层改动，可点击下方折叠栏微调 JSON：
+            按一问一答轮数清晰呈现的故事时间线与在场各人物状态。纯叙事文本展示，无杂乱代码：
         </p>
         <div class="tiandao-btn-row" style="margin-bottom:10px;">
             <div id="tiandao_export_json_btn" class="menu_button" style="width:auto; padding:4px 10px;">
@@ -506,8 +552,8 @@ function openMemoryViewerModal() {
             </label>
         </div>
         <div style="margin-bottom:12px;">
-            <b style="color: #f3d48d;"><i class="fa-solid fa-book-bookmark"></i>【纯叙事时间线总览 (纯故事文本阅读)】：</b>
-            <textarea readonly style="min-height:220px; line-height: 1.6; font-family: inherit; font-size: 0.9em; background: rgba(0,0,0,0.45);">${narrativeStoryText.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</textarea>
+            <b style="color: #f3d48d;"><i class="fa-solid fa-book-bookmark"></i>【纯故事时间线总览】：</b>
+            <textarea readonly style="min-height:230px; line-height: 1.6; font-family: inherit; font-size: 0.9em; background: rgba(0,0,0,0.45);">${narrativeStoryText.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</textarea>
         </div>
         <details style="margin-top: 8px;">
             <summary style="cursor:pointer; color:#a8d8b9; font-size:0.88em; padding:4px 0;"><i class="fa-solid fa-code"></i> 点击展开高级底层数据编辑器 (JSON)</summary>
@@ -619,15 +665,15 @@ function bindSettingsUI() {
     bindCheck("tiandao_auto_hide", "autoHideOldMessages", (checked) => {
         const count = syncHiddenMessagesState(!checked);
         if (!checked) {
-            updateStatusBar(`👁️ 已关闭自动隐藏，恢复显示 ${count} 层旧楼层原文`);
+            updateStatusBar(`👁️ 已关闭自动隐藏，恢复显示 ${count} 条历史原文`);
         } else {
-            updateStatusBar(`🙈 已开启原文楼层裁剪：仅发送最近 ${settings.keepRecentMessagesCount} 层原文`);
+            updateStatusBar(`🙈 已开启原文裁剪：仅发送最近 ${settings.keepRecentRoundsCount} 轮完整一问一答原文`);
         }
     });
-    bindInput("tiandao_keep_recent", "keepRecentMessagesCount", true, (val) => {
+    bindInput("tiandao_keep_recent", "keepRecentRoundsCount", true, (val) => {
         syncHiddenMessagesState();
         if (settings.autoHideOldMessages) {
-            updateStatusBar(`📏 已更新原文保留层数：当前仅发送最近 ${val} 层原文`);
+            updateStatusBar(`📏 已更新保留轮数：当前仅发送最近 ${val} 轮一问一答原文`);
         }
     });
 
@@ -690,8 +736,8 @@ function bindSettingsUI() {
             if (chat.length === 0) return updateStatusBar("当前无历史消息可扫描", true);
             const memoryData = getChatMemory();
             const nextStart = Math.max(0, (memoryData.lastProcessedMessageId ?? -1) + 1);
-            if (nextStart >= chat.length) return updateStatusBar("✅ 所有历史楼层均已在记忆树中。");
-            if (!confirm(`确定要从第 ${nextStart} 楼开始扫描存量历史消息？`)) return;
+            if (nextStart >= chat.length) return updateStatusBar("✅ 所有历史对话轮次均已在记忆树中。");
+            if (!confirm(`确定要扫描当前存档中的历史对话轮次吗？`)) return;
             isBackfilling = true;
             abortBackfillFlag = false;
             backfillBtn.innerHTML = `<i class="fa-solid fa-stop"></i> 暂停历史回溯扫描`;
@@ -699,12 +745,12 @@ function bindSettingsUI() {
                 const userName = ctx.name1 || "User";
                 const charName = ctx.name2 || "Character";
                 await backfillExistingChatHistory(settings, memoryData, chat, userName, charName, {
-                    onProgress: (cur, total, floorRange) => updateStatusBar(`⏳ 扫描旧历史 (${cur}/${total}) · 第 ${floorRange} 楼...`),
+                    onProgress: (cur, total, roundNumber) => updateStatusBar(`⏳ 扫描旧历史 (${cur}/${total}) · 第 ${roundNumber} 轮...`),
                     onChunkSaved: async () => { await saveChatMemory(); await refreshPromptInjection(); },
                     shouldAbort: () => abortBackfillFlag,
                 });
                 syncHiddenMessagesState();
-                updateStatusBar(`✅ 存量历史扫描构建完成！`);
+                updateStatusBar(`✅ 存量历史按轮次扫描构建完成！`);
             } catch (e) { updateStatusBar(`❌ 历史回溯中断: ${e.message}`, true); }
             finally { isBackfilling = false; backfillBtn.innerHTML = `<i class="fa-solid fa-clock-rotate-left"></i> 一键扫描旧历史构建记忆树`; }
         });
@@ -715,7 +761,7 @@ function bindSettingsUI() {
             settings.autoHideOldMessages = false;
             document.getElementById("tiandao_auto_hide").checked = false;
             saveSettings();
-            updateStatusBar(`👁️ 已恢复显示所有历史楼层原文。`);
+            updateStatusBar(`👁️ 已恢复显示所有历史原文。`);
         });
 
     const clearBtn = document.getElementById("tiandao_clear_memory_btn");
@@ -747,7 +793,6 @@ function bindSettingsUI() {
             }
         }
         
-        // 初始化悬浮窗
         initFloatingWidget();
 
         const ctx = getSTContext();
@@ -773,14 +818,14 @@ function bindSettingsUI() {
                 const chat = ctx.chat || [];
                 const memoryData = getChatMemory();
                 if (memoryData.lastProcessedMessageId >= chat.length) {
-                    if (rollbackMemoryFromFloor(memoryData, chat.length)) { await saveChatMemory(); await refreshPromptInjection(); }
+                    if (rollbackMemoryFromMessageIndex(memoryData, chat.length)) { await saveChatMemory(); await refreshPromptInjection(); }
                 }
                 syncHiddenMessagesState(); renderRecentTurnsList(); updateFloatingWidgetUI();
             });
             if (eventTypes.MESSAGE_EDITED) eventSource.on(eventTypes.MESSAGE_EDITED, async (idx) => {
                 const memoryData = getChatMemory();
                 if (memoryData.lastProcessedMessageId >= idx) {
-                    rollbackMemoryFromFloor(memoryData, idx);
+                    rollbackMemoryFromMessageIndex(memoryData, idx);
                     await saveChatMemory();
                     await processSingleAiTurn(idx, true);
                     renderRecentTurnsList();
@@ -792,7 +837,7 @@ function bindSettingsUI() {
                 const memoryData = getChatMemory();
                 const startFloor = idx > 0 && chat[idx - 1]?.is_user ? idx - 1 : idx;
                 if (memoryData.lastProcessedMessageId >= startFloor) {
-                    rollbackMemoryFromFloor(memoryData, startFloor);
+                    rollbackMemoryFromMessageIndex(memoryData, startFloor);
                     await saveChatMemory();
                     await refreshPromptInjection();
                     renderRecentTurnsList();
@@ -800,6 +845,6 @@ function bindSettingsUI() {
                 }
             });
         }
-        console.log("[Tiandao Memory Engine] v1.4.0 (悬浮窗看板 + 白名单标签抓取) 加载完毕！");
+        console.log("[Tiandao Memory Engine] v1.6.0 (按轮数精准时间线与状态账本) 加载完毕！");
     } catch (err) { console.error("[Tiandao Memory Engine] 初始化异常:", err); }
 })();

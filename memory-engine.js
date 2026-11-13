@@ -2,17 +2,18 @@
  * 天道·溯微记忆引擎 (Tiandao Memory Engine) - 核心引擎模块
  *
  * 核心设计：
- * 1. 结构化人物物理状态账本：按在场各角色（不仅是 User）分别追踪：地点、状态与行动、衣着穿戴、已摘除饰品锁（防人设回滚）、随身道具。
- * 2. 叙事时间线记忆金字塔：用时间跨度与叙事文本串联剧情（例如：第1轮某年某月某日上午发生…，第5轮某日晚上…），告别冰冷代码感。
- * 3. 重Roll回滚快照与存量断点续传。
+ * 1. 按“一问一答轮数 (Round)”进行叙事归档与时间线提炼（绝非生硬楼层，一问一答即为一轮）。
+ * 2. 结构化人物物理状态账本：按在场各角色（不仅是 User）分别追踪：地点、状态与行动、衣着穿戴、已摘除饰品锁（防人设回滚）、随身道具。
+ * 3. 纯故事叙事时间线记忆金字塔：用时间跨度与叙事文本串联剧情（例如：第1轮某年某月某日上午发生…，第5轮某日晚上…），告别冰冷代码感。
+ * 4. 重Roll回滚快照与存量断点续传。
  */
 
 export const DEFAULT_SETTINGS = {
     enabled: true,
     autoSummarizePerTurn: true,
     summarizeTiming: "on_next_send", // "on_next_send": 等玩家发送下一条消息时再总结上一轮(重Roll零浪费) | "after_reply": AI回复完立即总结
-    autoHideOldMessages: true,       // 默认开启：只向主模型发送最近 N 层原文，超出的旧楼层自动隐藏只看插件总结
-    keepRecentMessagesCount: 6,      // 发送给主模型的最近完整原文楼层数（超出部分自动隐藏）
+    autoHideOldMessages: true,       // 默认开启：只向主模型发送最近 N 轮完整一问一答原文，超出的旧轮次自动隐藏只看插件总结
+    keepRecentRoundsCount: 3,        // 发送给主模型的最近完整一问一答轮数（默认3轮，即最近6条正文，超出部分自动隐藏）
 
     // 独立总结 API 设置 (OpenAI 兼容格式: DeepSeek / Gemini / 硅基流动 / OpenRouter / NewAPI 等)
     apiUrl: "https://api.deepseek.com/v1",
@@ -29,7 +30,7 @@ export const DEFAULT_SETTINGS = {
     showFloatingWidget: true, // 是否在聊天窗口显示实时记忆悬浮看板
 
     // 递归合并树参数
-    mergeChunkSize: 5, // 每满 5 条向上合并为 1 条 (例如: 5条L0 -> 1条L1, 5条L1 -> 1条L2)
+    mergeChunkSize: 5, // 每满 5 轮向上合并为 1 条阶段脉络 (例如: 1~5轮 -> 1条L1, 5条L1 -> 1条L2)
     maxLevel: 3,       // 最大递归层级 (L0 -> L1 -> L2 -> L3)
 
     // 向量与关键词混合检索设置 (召回陈年小事)
@@ -56,26 +57,17 @@ export function deepClone(obj) {
 
 /**
  * 创建空白的聊天记忆元数据结构（绑定在当前 chat_metadata.tiandao_memory 上）
- * 彻底重构为按人物划分（地点、行动状态、穿戴、已摘除锁、随身道具）
  */
 export function createEmptyMemoryData() {
     return {
         version: 3,
         lastProcessedMessageId: -1,
+        lastProcessedRound: 0,
         // 常驻动态状态账本（按人物深度追踪，永不因压缩丢失）
         stateLedger: {
             time: "未知时间",
-            characters: {
-                // 示例结构：
-                // "角色名": {
-                //    location: "所处具体地点",
-                //    statusAndAction: "当前心理状态/姿势动作/行动",
-                //    wear: "当前穿戴的衣服与饰品",
-                //    removedItemsLock: ["已摘下的饰品或脱下的外套（未重戴绝不恢复）"],
-                //    inventory: ["随身携带的物品/信物/武器道具"]
-                // }
-            },
-            todosAndPromises: [], // ["双方的未完成约定或待办事项"]
+            characters: {},
+            todosAndPromises: [],
         },
         levels: {
             0: [],
@@ -88,10 +80,10 @@ export function createEmptyMemoryData() {
 }
 
 /**
- * 解析 floorRange 字符串（如 "12-13" 或 "12"）为起止楼层数字
+ * 解析 roundRange 字符串（如 "1-5" 或 "3"）为起止数字
  */
-export function parseFloorRange(floorRange) {
-    const str = String(floorRange || "0").trim();
+export function parseRoundRange(roundRange) {
+    const str = String(roundRange || "0").trim();
     const parts = str.split("-").map(n => parseInt(n, 10)).filter(n => !Number.isNaN(n));
     if (parts.length === 0) return { start: 0, end: 0 };
     if (parts.length === 1) return { start: parts[0], end: parts[0] };
@@ -99,17 +91,33 @@ export function parseFloorRange(floorRange) {
 }
 
 /**
- * 当发生重Roll (Swipe)、编辑楼层或删除楼层时，回滚并清理 >= cutoffStartFloor 的 L0 记忆与状态账本
+ * 根据聊天记录计算某条 AI 消息对应的真实“第几轮 (Round)”
+ * 规则：一问一答算一轮（统计该消息及之前出现的非 user、非纯 system 回复总数）
  */
-export function rollbackMemoryFromFloor(memoryData, cutoffStartFloor) {
-    if (!memoryData || typeof cutoffStartFloor !== "number" || cutoffStartFloor < 0) return false;
+export function calculateRoundForMessageIndex(chat, messageIndex) {
+    if (!Array.isArray(chat) || messageIndex < 0 || messageIndex >= chat.length) return 1;
+    let round = 0;
+    for (let i = 0; i <= messageIndex; i++) {
+        const msg = chat[i];
+        if (msg && !msg.is_user && (!msg.is_system || msg.extra?.tiandao_hidden)) {
+            round++;
+        }
+    }
+    return Math.max(1, round);
+}
+
+/**
+ * 当发生重Roll (Swipe)、编辑或删除楼层时，回滚并清理 >= cutoffMessageId 的 L0 记忆与状态账本
+ */
+export function rollbackMemoryFromMessageIndex(memoryData, cutoffMessageId) {
+    if (!memoryData || typeof cutoffMessageId !== "number" || cutoffMessageId < 0) return false;
 
     const l0List = memoryData.levels?.[0] || [];
     const archiveList = memoryData.archivePool || [];
 
     const removedFromArchive = archiveList
-        .filter(item => parseFloorRange(item.floorRange).start >= cutoffStartFloor)
-        .sort((a, b) => parseFloorRange(a.floorRange).start - parseFloorRange(b.floorRange).start);
+        .filter(item => (item.endMessageId ?? parseRoundRange(item.roundRange).start) >= cutoffMessageId)
+        .sort((a, b) => (a.startMessageId ?? 0) - (b.startMessageId ?? 0));
 
     let rolledBack = false;
     if (removedFromArchive.length > 0) {
@@ -119,7 +127,7 @@ export function rollbackMemoryFromFloor(memoryData, cutoffStartFloor) {
             memoryData.stateLedger = deepClone(earliestRemoved.preStateSnapshot);
         } else {
             const remainingBefore = archiveList
-                .filter(item => parseFloorRange(item.floorRange).end < cutoffStartFloor && item.postStateSnapshot);
+                .filter(item => (item.endMessageId ?? 0) < cutoffMessageId && item.postStateSnapshot);
             if (remainingBefore.length > 0) {
                 memoryData.stateLedger = deepClone(remainingBefore[remainingBefore.length - 1].postStateSnapshot);
             }
@@ -127,28 +135,28 @@ export function rollbackMemoryFromFloor(memoryData, cutoffStartFloor) {
     }
 
     if (Array.isArray(memoryData.levels?.[0])) {
-        memoryData.levels[0] = l0List.filter(item => parseFloorRange(item.floorRange).start < cutoffStartFloor);
+        memoryData.levels[0] = l0List.filter(item => (item.endMessageId ?? parseRoundRange(item.roundRange).start) < cutoffMessageId);
     }
     if (Array.isArray(memoryData.archivePool)) {
-        memoryData.archivePool = archiveList.filter(item => parseFloorRange(item.floorRange).start < cutoffStartFloor);
+        memoryData.archivePool = archiveList.filter(item => (item.endMessageId ?? parseRoundRange(item.roundRange).start) < cutoffMessageId);
     }
 
-    const remainingEnds = (memoryData.archivePool || []).map(item => parseFloorRange(item.floorRange).end);
+    const remainingEnds = (memoryData.archivePool || []).map(item => item.endMessageId ?? 0);
     memoryData.lastProcessedMessageId = remainingEnds.length > 0 ? Math.max(...remainingEnds) : -1;
+    
+    const remainingRounds = (memoryData.archivePool || []).map(item => parseRoundRange(item.roundRange).end);
+    memoryData.lastProcessedRound = remainingRounds.length > 0 ? Math.max(...remainingRounds) : 0;
 
     return rolledBack;
 }
 
 /**
- * 提取与清理模型输出的正文：
- * 1. 【目标标签优先（白名单）】：若设定了目标标签（如 content, story, reply 等），直接且仅提取标签内部的正文。
- * 2. 【备用排除标签（黑名单）】：若未匹配到目标标签，则自动剥离指定排除标签。
+ * 提取与清理模型输出的正文
  */
 export function cleanMessageText(rawText, targetContentTagsStr = "", customStripTagsStr = "") {
     if (!rawText) return "";
     let text = String(rawText);
 
-    // 1. 优先白名单目标提取
     const targetTags = String(targetContentTagsStr || "")
         .split(/[,，\s]+/)
         .map(t => t.trim().replace(/^<|>$/g, ""))
@@ -165,7 +173,6 @@ export function cleanMessageText(rawText, targetContentTagsStr = "", customStrip
         }
     }
 
-    // 2. 备用黑名单剥离
     const defaultTags = ["thinking", "think", "report", "options_engine", "small_theater", "status_bar"];
     const customTags = String(customStripTagsStr || "")
         .split(/[,，\s]+/)
@@ -249,7 +256,7 @@ export function safeParseJSON(text) {
 }
 
 /**
- * 调用 Embedding API 获取向量（可选，用于高精度语义检索）
+ * 调用 Embedding API 获取向量
  */
 export async function getEmbeddingVector(settings, inputText) {
     if (!settings.useEmbeddingApi || !settings.embeddingApiUrl || !settings.embeddingApiKey) {
@@ -279,34 +286,34 @@ export async function getEmbeddingVector(settings, inputText) {
 }
 
 /**
- * 单轮处理：
+ * 单轮处理（一问一答算一轮）：
  * 1. 提取时间线纯叙事微摘要（格式：某年某月某日...发生在...）
  * 2. 按人物分别追踪：地点、状态与行动、衣着穿戴、已摘除饰品锁、随身道具
  */
 export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
-    const { floorRange, userName, charName, dialogueText } = turnInfo;
-    const { start: startFloor } = parseFloorRange(floorRange);
+    const { roundNumber, startMessageId, endMessageId, userName, charName, dialogueText } = turnInfo;
+    const currentRound = Number(roundNumber || 1);
 
-    if (memoryData.lastProcessedMessageId >= startFloor) {
-        rollbackMemoryFromFloor(memoryData, startFloor);
+    if (memoryData.lastProcessedMessageId >= startMessageId) {
+        rollbackMemoryFromMessageIndex(memoryData, startMessageId);
     }
 
     const preStateSnapshot = deepClone(memoryData.stateLedger);
     const currentStateJson = JSON.stringify(memoryData.stateLedger, null, 2);
 
     const systemPrompt = `你是一个高精度的长线角色扮演状态追踪器与纯叙事记忆引擎。
-请阅读【上一轮人物状态账本】与【最新一轮剧情文本】，输出严格的 JSON 格式结果。
+请阅读【上一轮各人物状态账本】与【最新一轮一问一答剧情】，输出严格的 JSON 格式结果。
 
 核心要求：
 1. **纯叙事时间线微摘要 (l0_summary)**：
-   - 必须采用纯粹的故事时间线口吻（拒绝任何代码感或空洞概括）。
+   - 必须采用故事时间线口吻（拒绝任何代码感或“第X楼”等机械字眼）。
    - 范例：“[某年某月某日上午] 在客厅里，${charName}脱下外套并随手放在沙发上，与${userName}商定了明天的行程，心情逐渐放松...”
    - 精炼保留时间流逝、地点、剧情推进、情感互动细节与关键动作（80~140字）。
    - 提取 3~5 个关键词 (keywords)。
 2. **按人物分别追踪物理状态 (characters)**：
-   - 必须为剧情中出场的各个角色（包括主角 ${userName}、女/男主 ${charName}、以及其他重要在场配角）分别建立对象：
+   - 为出场的各个角色（包括主角 ${userName}、女/男主 ${charName}、以及其他重要在场配角）分别建立对象：
      * **location**：该角色当前具体所在的地点/房间。
-     * **statusAndAction**：当前神态动作、心里状态或正在进行的行动。
+     * **statusAndAction**：当前神态动作、心理状态或正在进行的行动。
      * **wear**：当前身上的衣着与穿戴（根据剧情穿脱实时更新）。
      * **removedItemsLock（核心防回滚锁·极其重要）**：
        - 只要该角色在剧情中摘下了某件饰品（如眼镜、耳环、发卡）或脱下了衣物（如外套、鞋袜），必须加入此数组！注明状态（例："金丝眼镜（已摘下放床头柜，当前未佩戴）"）。
@@ -342,13 +349,13 @@ export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
   }
 }`;
 
-    const userPrompt = `【当前楼层范围】：第 ${floorRange} 楼
+    const userPrompt = `【当前剧情轮次】：第 ${currentRound} 轮
 【主要在场人物】：User = ${userName}, Char = ${charName}
 
 【上一轮人物状态账本 (请在此基础上增量更新，切勿丢失各角色的已摘除饰品锁)】：
 ${currentStateJson}
 
-【最新一轮剧情文本】：
+【第 ${currentRound} 轮一问一答剧情】：
 ${dialogueText}
 
 请直接输出更新后的 JSON：`;
@@ -363,10 +370,8 @@ ${dialogueText}
         throw new Error("模型返回格式无法解析为有效摘要 JSON: " + rawOutput.slice(0, 150));
     }
 
-    // 更新状态账本
     if (parsed.stateLedger) {
         const nextChars = parsed.stateLedger.characters || {};
-        // 确保继承旧数据中未出现但仍在场的角色数据
         const oldChars = memoryData.stateLedger.characters || {};
         const mergedChars = {};
 
@@ -380,7 +385,6 @@ ${dialogueText}
             };
         }
 
-        // 如果旧角色本轮没在 nextChars 中被提，但有未戴回的饰品，保留并继承
         for (const [name, oldData] of Object.entries(oldChars)) {
             if (!mergedChars[name] && oldData && (oldData.removedItemsLock || []).length > 0) {
                 mergedChars[name] = oldData;
@@ -396,12 +400,13 @@ ${dialogueText}
         };
     }
 
-    // 生成 L0 节点
     const embedding = await getEmbeddingVector(settings, `${parsed.l0_summary} ${(parsed.keywords || []).join(" ")}`);
     const l0Entry = {
         id: `L0_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         level: 0,
-        floorRange: String(floorRange),
+        roundRange: String(currentRound),
+        startMessageId: startMessageId,
+        endMessageId: endMessageId,
         text: parsed.l0_summary.trim(),
         keywords: Array.isArray(parsed.keywords) ? parsed.keywords : [],
         timestamp: Date.now(),
@@ -414,7 +419,6 @@ ${dialogueText}
     memoryData.levels[0].push(l0Entry);
     memoryData.archivePool.push(l0Entry);
 
-    // 清理过早的状态快照节省存档体积
     if (memoryData.archivePool.length > 10) {
         for (let i = 0; i < memoryData.archivePool.length - 10; i++) {
             delete memoryData.archivePool[i].preStateSnapshot;
@@ -428,7 +432,7 @@ ${dialogueText}
 }
 
 /**
- * 递归金字塔合并引擎
+ * 递归金字塔合并引擎（按轮次归并）
  */
 export async function checkAndCascadeMerge(settings, memoryData) {
     const chunkSize = Math.max(2, Number(settings.mergeChunkSize || 5));
@@ -440,12 +444,11 @@ export async function checkAndCascadeMerge(settings, memoryData) {
         }
         while (memoryData.levels[lvl].length >= chunkSize) {
             const itemsToMerge = memoryData.levels[lvl].slice(0, chunkSize);
-            const firstFloor = itemsToMerge[0].floorRange.split("-")[0];
-            const lastFloorPart = itemsToMerge[itemsToMerge.length - 1].floorRange.split("-");
-            const lastFloor = lastFloorPart[lastFloorPart.length - 1];
-            const mergedFloorRange = `${firstFloor}-${lastFloor}`;
+            const firstRound = parseRoundRange(itemsToMerge[0].roundRange).start;
+            const lastRound = parseRoundRange(itemsToMerge[itemsToMerge.length - 1].roundRange).end;
+            const mergedRoundRange = `${firstRound}-${lastRound}`;
 
-            const mergedText = await mergeSummariesAtLevel(settings, lvl, itemsToMerge, mergedFloorRange);
+            const mergedText = await mergeSummariesAtLevel(settings, lvl, itemsToMerge, mergedRoundRange);
 
             memoryData.levels[lvl].splice(0, chunkSize);
             if (!Array.isArray(memoryData.levels[lvl + 1])) {
@@ -454,7 +457,7 @@ export async function checkAndCascadeMerge(settings, memoryData) {
             memoryData.levels[lvl + 1].push({
                 id: `L${lvl + 1}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
                 level: lvl + 1,
-                floorRange: mergedFloorRange,
+                roundRange: mergedRoundRange,
                 text: mergedText,
                 timestamp: Date.now(),
             });
@@ -463,27 +466,27 @@ export async function checkAndCascadeMerge(settings, memoryData) {
 }
 
 /**
- * 调用独立 API 将 N 条同级摘要合成为 1 条纯叙事时间线的高级摘要
+ * 将 N 条同级轮次摘要合成为 1 条大阶段故事脉络
  */
-async function mergeSummariesAtLevel(settings, currentLevel, items, mergedFloorRange) {
+async function mergeSummariesAtLevel(settings, currentLevel, items, mergedRoundRange) {
     const targetLevel = currentLevel + 1;
     const wordLimit = targetLevel === 1 ? "150~250字" : "250~400字";
 
     const systemPrompt = `你是一个叙事剧情时间线提炼引擎。
-请将连续的 ${items.length} 条【第 ${mergedFloorRange} 楼的剧情微摘要】合并为一条连贯、高信息密度的【L${targetLevel} 故事脉络时间线】（篇幅 ${wordLimit}）。
+请将连续的 ${items.length} 轮【第 ${mergedRoundRange} 轮剧情微摘要】合并为一条连贯、高信息密度的【L${targetLevel} 故事脉络时间线】（篇幅 ${wordLimit}）。
 
 合并要求：
 1. **纯故事叙述，充满时间感**：用故事口吻描述这段时间的起承转合（例：“从某月某日上午...经过几番波折，直到当晚...”）。
 2. 保留重要事件、人物关系情感转折、以及关键承诺或随身道具变动。
-3. **直接输出合并后的纯叙事文本**，严禁包含任何 JSON 或代码。`;
+3. **直接输出合并后的纯叙事文本**，严禁包含任何代码或格式说明。`;
 
     const listText = items
-        .map((it, idx) => `${idx + 1}. [第${it.floorRange}楼] ${it.text}`)
+        .map((it, idx) => `${idx + 1}. [第${it.roundRange}轮] ${it.text}`)
         .join("\n");
 
     const merged = await callIndependentLLM(settings, [
         { role: "system", content: systemPrompt },
-        { role: "user", content: `请将以下时间线的剧情摘要合并为一段纯叙事时间线：\n\n${listText}` },
+        { role: "user", content: `请将以下时间线的各轮剧情摘要合并为一段连贯故事脉络：\n\n${listText}` },
     ]);
 
     return merged.replace(/^```[\s\S]*?\n/, "").replace(/```$/, "").trim();
@@ -560,16 +563,13 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
 }
 
 /**
- * 组装给主模型的记忆注入块：
- * 按人物分别展示：所处地点、状态行动、穿戴、已摘除饰品锁、随身道具
- * 搭配纯叙事的时间线脉络
+ * 组装给主模型的记忆注入块（纯轮次时间线 + 各人物物理状态）
  */
 export function buildInjectedMemoryPrompt(memoryData, retrievedSnacks = []) {
     if (!memoryData) return "";
     const ledger = memoryData.stateLedger || {};
     const chars = ledger.characters || {};
 
-    // 格式化各人物状态
     const charBlocks = [];
     for (const [name, info] of Object.entries(chars)) {
         if (!info) continue;
@@ -590,29 +590,28 @@ export function buildInjectedMemoryPrompt(memoryData, retrievedSnacks = []) {
         ? ledger.todosAndPromises.map(x => `  * 📌 ${x}`).join("\n")
         : "  * 无";
 
-    // 组装纯叙事剧情时间线
     const timelineSections = [];
     const maxLvl = Math.max(...Object.keys(memoryData.levels || {}).map(Number), 3);
 
     for (let lvl = maxLvl; lvl >= 1; lvl--) {
         const list = memoryData.levels?.[lvl] || [];
         if (list.length > 0) {
-            const title = lvl === 1 ? "阶段剧情时间线 (近期)" : `长线剧情时间线 (卷级/大阶段)`;
-            const lines = list.map(it => `• [第${it.floorRange}楼] ${it.text}`).join("\n");
+            const title = lvl === 1 ? "阶段剧情脉络 (近期)" : `长线剧情大阶段脉络`;
+            const lines = list.map(it => `• [第 ${it.roundRange} 轮阶段总览] ${it.text}`).join("\n");
             timelineSections.push(`### ${title}\n${lines}`);
         }
     }
 
     const l0List = memoryData.levels?.[0] || [];
     if (l0List.length > 0) {
-        const lines = l0List.map(it => `• [第${it.floorRange}楼] ${it.text}`).join("\n");
+        const lines = l0List.map(it => `• [第 ${it.roundRange} 轮] ${it.text}`).join("\n");
         timelineSections.push(`### 最近单轮剧情时间线\n${lines}`);
     }
 
     let retrievedSection = "";
     if (retrievedSnacks && retrievedSnacks.length > 0) {
         const rLines = retrievedSnacks
-            .map(it => `• [过往回忆·第${it.floorRange}楼] ${it.text}`)
+            .map(it => `• [过往回忆·第 ${it.roundRange} 轮] ${it.text}`)
             .join("\n");
         retrievedSection = `\n## 三、当前话题相关的过往回忆片段（按需唤醒）\n${rLines}\n`;
     }
@@ -621,18 +620,18 @@ export function buildInjectedMemoryPrompt(memoryData, retrievedSnacks = []) {
 # 天道·溯微剧情时间线与人物动态状态（最高事实基准）
 
 ## 一、当前各人物实时物理状态账本（绝对优先于角色卡初始设定）
-- **当前剧情时间**: ${ledger.time || "未知"}
+- **当前故事时间**: ${ledger.time || "未知"}
 ${charBlocks.join("\n\n") || "（暂无出场人物状态）"}
 - **各角色未完成约定与待办**:
 ${todoLines}
 
-## 二、剧情时间线叙事脉络（由远及近）
+## 二、剧情时间线叙事脉络（由远及近·按轮数推进）
 ${timelineSections.join("\n\n") || "（尚无归档时间线）"}
 ${retrievedSection}</tiandao_memory_system>`;
 }
 
 /**
- * 组装给玩家在面板上阅读的“纯叙事时间线总览”（完全不带任何代码，纯故事流阅读体验）
+ * 组装纯叙事时间线总览（按轮数展示）
  */
 export function buildNarrativeStoryView(memoryData) {
     if (!memoryData) return "暂无记忆记录。";
@@ -660,19 +659,18 @@ export function buildNarrativeStoryView(memoryData) {
         lines.push(`📌 待办与约定事项：\n${ledger.todosAndPromises.map(x => "  • " + x).join("\n")}\n`);
     }
 
-    lines.push(`📜 故事完整叙事时间线：`);
+    lines.push(`📜 剧情时间线脉络（按一问一答轮数）：`);
 
-    // 优先展示高阶时间线，再展示近期单轮细节
     const allSummaries = [];
     const maxLvl = Math.max(...Object.keys(memoryData.levels || {}).map(Number), 3);
     for (let lvl = maxLvl; lvl >= 1; lvl--) {
         const list = memoryData.levels?.[lvl] || [];
         for (const it of list) {
-            allSummaries.push(`• [第 ${it.floorRange} 楼阶段总览]\n  ${it.text}`);
+            allSummaries.push(`• [第 ${it.roundRange} 轮阶段总览]\n  ${it.text}`);
         }
     }
     for (const it of (memoryData.levels?.[0] || [])) {
-        allSummaries.push(`• [第 ${it.floorRange} 楼]\n  ${it.text}`);
+        allSummaries.push(`• [第 ${it.roundRange} 轮]\n  ${it.text}`);
     }
 
     if (allSummaries.length === 0) {
@@ -742,7 +740,7 @@ export function mergeEditedMemoryWithEmbeddings(originalData, editedData) {
 }
 
 /**
- * 存量历史一键回溯构建器
+ * 存量历史一键回溯构建器（按一问一答轮次扫描）
  */
 export async function backfillExistingChatHistory(
     settings,
@@ -758,57 +756,69 @@ export async function backfillExistingChatHistory(
         throw new Error("当前聊天没有可扫描的历史消息");
     }
 
-    const startIdx = Math.max(0, (memoryData.lastProcessedMessageId ?? -1) + 1);
-    const endIdx = chatMessages.length - 1;
-    if (startIdx > endIdx) {
+    // 找出所有配对的有效 AI 回复楼层
+    const aiMessageIndices = [];
+    for (let idx = 0; idx < chatMessages.length; idx++) {
+        const m = chatMessages[idx];
+        if (m && !m.is_user && (!m.is_system || m.extra?.tiandao_hidden)) {
+            aiMessageIndices.push(idx);
+        }
+    }
+
+    if (aiMessageIndices.length === 0) {
         return { processedCount: 0, aborted: false };
     }
 
-    const totalToProcess = endIdx - startIdx + 1;
-    const stepSize = totalToProcess > 40 ? 4 : 2;
-    let processedChunks = 0;
-    let processedMessages = 0;
-    const totalChunks = Math.ceil(totalToProcess / stepSize);
+    const startAiIdx = Math.max(0, (memoryData.lastProcessedMessageId ?? -1));
+    const pendingAiIndices = aiMessageIndices.filter(i => i > startAiIdx);
 
-    for (let i = startIdx; i <= endIdx; i += stepSize) {
+    if (pendingAiIndices.length === 0) {
+        return { processedCount: 0, aborted: false };
+    }
+
+    let processedCount = 0;
+    const totalRounds = pendingAiIndices.length;
+
+    for (let i = 0; i < pendingAiIndices.length; i++) {
         if (typeof shouldAbort === "function" && shouldAbort()) {
-            return { processedCount: processedMessages, aborted: true };
+            return { processedCount, aborted: true };
         }
 
-        const sliceEnd = Math.min(i + stepSize - 1, endIdx);
+        const msgIdx = pendingAiIndices[i];
+        const roundNumber = aiMessageIndices.indexOf(msgIdx) + 1;
+
+        let startFloor = msgIdx;
         const batchMsgs = [];
-        for (let j = i; j <= sliceEnd; j++) {
-            const m = chatMessages[j];
-            if (!m) continue;
-            if (m.is_system && !m.extra?.tiandao_hidden) continue;
-            const speaker = m.is_user ? userName : (m.name || charName);
-            const cleaned = cleanMessageText(m.mes, settings.targetContentTags, settings.customStripTags);
-            if (cleaned) {
-                batchMsgs.push(`【第${j}楼 · ${speaker}】：\n${cleaned}`);
-            }
+        if (msgIdx > 0 && chatMessages[msgIdx - 1]?.is_user) {
+            startFloor = msgIdx - 1;
+            const uClean = cleanMessageText(chatMessages[msgIdx - 1].mes, settings.targetContentTags, settings.customStripTags);
+            if (uClean) batchMsgs.push(`【${userName}】：\n${uClean}`);
         }
+        const aClean = cleanMessageText(chatMessages[msgIdx].mes, settings.targetContentTags, settings.customStripTags);
+        if (aClean) batchMsgs.push(`【${chatMessages[msgIdx].name || charName}】：\n${aClean}`);
 
         if (batchMsgs.length > 0) {
-            const floorRange = i === sliceEnd ? `${i}` : `${i}-${sliceEnd}`;
             if (typeof onProgress === "function") {
-                onProgress(processedChunks + 1, totalChunks, floorRange);
+                onProgress(i + 1, totalRounds, roundNumber);
             }
             await summarizeSingleTurn(settings, memoryData, {
-                floorRange,
+                roundNumber,
+                startMessageId: startFloor,
+                endMessageId: msgIdx,
                 userName,
                 charName,
                 dialogueText: batchMsgs.join("\n\n"),
             });
         }
 
-        memoryData.lastProcessedMessageId = sliceEnd;
-        processedChunks++;
-        processedMessages += (sliceEnd - i + 1);
+        memoryData.lastProcessedMessageId = msgIdx;
+        memoryData.lastProcessedRound = roundNumber;
+        processedCount++;
 
         if (typeof onChunkSaved === "function") {
-            await onChunkSaved(sliceEnd);
+            await onChunkSaved(msgIdx);
         }
     }
 
-    return { processedCount: processedMessages, aborted: false };
+    return { processedCount, aborted: false };
 }

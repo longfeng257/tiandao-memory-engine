@@ -30,13 +30,13 @@
                 <hr style="border-color: rgba(255,255,255,0.08); margin: 8px 0;" />
                 <label class="checkbox_label">
                     <input id="tiandao_auto_hide" type="checkbox" />
-                    <span><b>自动隐藏超出楼层原文（只发送最近 N 楼原文，超出部分只看插件总结）</b></span>
+                    <span><b>自动隐藏超出轮次原文（只发送最近 N 轮一问一答原文，超出部分只看插件总结）</b></span>
                 </label>
                 <div class="tiandao-row">
-                    <span>仅发送最近几楼完整原文：</span>
+                    <span>仅发送最近几轮完整一问一答：</span>
                     <div style="display:flex; align-items:center; gap:6px;">
-                        <input id="tiandao_keep_recent" type="number" class="text_pole" min="1" max="50" style="width: 70px;" />
-                        <div id="tiandao_restore_hidden_btn" class="menu_button" style="width:auto; padding:3px 8px; font-size:0.82em;" title="恢复所有被天道插件隐藏的历史楼层">
+                        <input id="tiandao_keep_recent" type="number" class="text_pole" min="1" max="25" style="width: 70px;" />
+                        <div id="tiandao_restore_hidden_btn" class="menu_button" style="width:auto; padding:3px 8px; font-size:0.82em;" title="恢复所有被天道插件隐藏的历史轮次">
                             <i class="fa-solid fa-eye"></i> 恢复全部原文
                         </div>
                     </div>
@@ -155,9 +155,9 @@
 
                 <!-- 最近对话轮次管理 -->
                 <div class="tiandao-section">
-                    <div class="tiandao-section-title">🕒 最近对话轮次与指定楼层重总结</div>
+                    <div class="tiandao-section-title">🕒 最近对话轮次与指定轮数重新总结</div>
                     <div id="tiandao_turns_list" class="tiandao-turns-list">
-                        <!-- 动态渲染最近对话 -->
+                        <!-- 动态渲染最近一问一答轮次 -->
                     </div>
                 </div>
         </div>
