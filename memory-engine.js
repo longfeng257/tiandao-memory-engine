@@ -1,12 +1,10 @@
 /**
  * 天道·溯微记忆引擎 (Tiandao Memory Engine) - 核心引擎模块
  *
- * 核心能力：
- * 1. 零配置动态状态账本（自动追踪衣着穿脱、已摘除饰品防回滚锁、剧情新增/消耗物品、防全知信息隔离表、待办事项，内置防膨胀淘汰机制）
- * 2. 分层递归记忆树（L0单轮微摘要 -> 满N条合并为L1小阶段摘要 -> 满N条L1合并为L2大阶段摘要 -> 支持无限层级递归）
- * 3. 重Roll (Swipe) / 删楼 / 编辑自动回滚覆盖机制（每层 L0 保存状态账本快照，同层重新生成或删楼时自动回滚并替换旧记忆，绝不重复叠加）
- * 4. 混合检索回溯池（所有退居幕后的L0微摘要自动进入回溯池，支持独立Embedding向量检索 + 本地BM25/双字分词零成本混合唤醒）
- * 5. 存量历史一键回溯构建（支持中途暂停/继续、每批次实时存档断点续传）
+ * 核心设计：
+ * 1. 结构化人物物理状态账本：按在场各角色（不仅是 User）分别追踪：地点、状态与行动、衣着穿戴、已摘除饰品锁（防人设回滚）、随身道具。
+ * 2. 叙事时间线记忆金字塔：用时间跨度与叙事文本串联剧情（例如：第1轮某年某月某日上午发生…，第5轮某日晚上…），告别冰冷代码感。
+ * 3. 重Roll回滚快照与存量断点续传。
  */
 
 export const DEFAULT_SETTINGS = {
@@ -58,32 +56,33 @@ export function deepClone(obj) {
 
 /**
  * 创建空白的聊天记忆元数据结构（绑定在当前 chat_metadata.tiandao_memory 上）
+ * 彻底重构为按人物划分（地点、行动状态、穿戴、已摘除锁、随身道具）
  */
 export function createEmptyMemoryData() {
     return {
-        version: 2,
+        version: 3,
         lastProcessedMessageId: -1,
-        // 常驻动态状态账本（每轮增量更新，永不因合并而压缩丢失）
+        // 常驻动态状态账本（按人物深度追踪，永不因压缩丢失）
         stateLedger: {
-            timeAndPlace: "未知时间｜未知地点",
-            characterWear: {},       // { "角色名": "当前穿戴的衣服与饰品" }
-            removedItemsLock: [],    // ["角色A的金丝眼镜（已于卧室摘下未戴）", ...] 专门防初始人设回滚！
-            inventoryAndProps: [],   // ["剧情中获得的物品/信物/道具及当前位置"]
-            knowledgeIsolation: [],  // ["某私密事件/秘密：仅User与A知晓，B不在场不知情"] 防全知！
-            todosAndPromises: [],    // ["待办事项、日程约定或未完成承诺"]
+            time: "未知时间",
+            characters: {
+                // 示例结构：
+                // "角色名": {
+                //    location: "所处具体地点",
+                //    statusAndAction: "当前心理状态/姿势动作/行动",
+                //    wear: "当前穿戴的衣服与饰品",
+                //    removedItemsLock: ["已摘下的饰品或脱下的外套（未重戴绝不恢复）"],
+                //    inventory: ["随身携带的物品/信物/武器道具"]
+                // }
+            },
+            todosAndPromises: [], // ["双方的未完成约定或待办事项"]
         },
-        // 分层递归记忆树
-        // levels[0] = L0 (当前尚未被合并的最新单层微摘要, 满5条则合并为1条推入 levels[1])
-        // levels[1] = L1 (每条代表 5 层楼的阶段总结, 满5条则合并为1条推入 levels[2])
-        // levels[2] = L2 (每条代表 25 层楼的大阶段总结)
-        // levels[3] = L3 (每条代表 125 层楼的卷级总结)
         levels: {
             0: [],
             1: [],
             2: [],
             3: [],
         },
-        // 全量 L0 历史小事回溯池（即使 L0 被合并进 L1 从常驻栏移除，原件依然保存在这里供向量/关键词随时捞取陈年小事）
         archivePool: [],
     };
 }
@@ -108,7 +107,6 @@ export function rollbackMemoryFromFloor(memoryData, cutoffStartFloor) {
     const l0List = memoryData.levels?.[0] || [];
     const archiveList = memoryData.archivePool || [];
 
-    // 找出需要被回滚移除的条目中最早的一条，若有 preStateSnapshot 则用它恢复状态账本
     const removedFromArchive = archiveList
         .filter(item => parseFloorRange(item.floorRange).start >= cutoffStartFloor)
         .sort((a, b) => parseFloorRange(a.floorRange).start - parseFloorRange(b.floorRange).start);
@@ -120,7 +118,6 @@ export function rollbackMemoryFromFloor(memoryData, cutoffStartFloor) {
         if (earliestRemoved.preStateSnapshot) {
             memoryData.stateLedger = deepClone(earliestRemoved.preStateSnapshot);
         } else {
-            // 如果没有 preStateSnapshot，尝试找早于 cutoffStartFloor 的最后一条记录的 postStateSnapshot
             const remainingBefore = archiveList
                 .filter(item => parseFloorRange(item.floorRange).end < cutoffStartFloor && item.postStateSnapshot);
             if (remainingBefore.length > 0) {
@@ -129,7 +126,6 @@ export function rollbackMemoryFromFloor(memoryData, cutoffStartFloor) {
         }
     }
 
-    // 清理 levels[0] 与 archivePool 中属于 >= cutoffStartFloor 的记录
     if (Array.isArray(memoryData.levels?.[0])) {
         memoryData.levels[0] = l0List.filter(item => parseFloorRange(item.floorRange).start < cutoffStartFloor);
     }
@@ -137,7 +133,6 @@ export function rollbackMemoryFromFloor(memoryData, cutoffStartFloor) {
         memoryData.archivePool = archiveList.filter(item => parseFloorRange(item.floorRange).start < cutoffStartFloor);
     }
 
-    // 更新 lastProcessedMessageId
     const remainingEnds = (memoryData.archivePool || []).map(item => parseFloorRange(item.floorRange).end);
     memoryData.lastProcessedMessageId = remainingEnds.length > 0 ? Math.max(...remainingEnds) : -1;
 
@@ -146,9 +141,8 @@ export function rollbackMemoryFromFloor(memoryData, cutoffStartFloor) {
 
 /**
  * 提取与清理模型输出的正文：
- * 1. 【目标标签优先（白名单）】：若设定了目标标签（如 content, story, reply 等），一旦在文本中匹配到对应标签，
- *    直接且仅提取标签内部的真实剧情正文，天然过滤所有外部思考链与状态栏！
- * 2. 【备用排除标签（黑名单）】：若未匹配到目标标签，则自动剥离指定排除标签（如 thinking, think, report 等）。
+ * 1. 【目标标签优先（白名单）】：若设定了目标标签（如 content, story, reply 等），直接且仅提取标签内部的正文。
+ * 2. 【备用排除标签（黑名单）】：若未匹配到目标标签，则自动剥离指定排除标签。
  */
 export function cleanMessageText(rawText, targetContentTagsStr = "", customStripTagsStr = "") {
     if (!rawText) return "";
@@ -185,7 +179,6 @@ export function cleanMessageText(rawText, targetContentTagsStr = "", customStrip
         text = text.replace(reg, "");
     }
 
-    // 剥离 <details> 折叠块
     text = text.replace(/<details[\s\S]*?<\/details>/gi, "").trim();
     return text;
 }
@@ -286,68 +279,73 @@ export async function getEmbeddingVector(settings, inputText) {
 }
 
 /**
- * 单轮处理：提取本轮 L0 微摘要 + 增量更新状态账本（零配置自动追踪饰品穿脱、物品增减、知情权、待办）
- * 若检测到当前楼层已被总结过（如重Roll/编辑），会自动先回滚该楼层旧状态再重新总结
+ * 单轮处理：
+ * 1. 提取时间线纯叙事微摘要（格式：某年某月某日...发生在...）
+ * 2. 按人物分别追踪：地点、状态与行动、衣着穿戴、已摘除饰品锁、随身道具
  */
 export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
     const { floorRange, userName, charName, dialogueText } = turnInfo;
     const { start: startFloor } = parseFloorRange(floorRange);
 
-    // 如果当前总结的起始楼层 <= 已处理过的最大楼层，说明是重Roll(Swipe)或重跑，自动回滚旧的同层/后续记录
     if (memoryData.lastProcessedMessageId >= startFloor) {
         rollbackMemoryFromFloor(memoryData, startFloor);
     }
 
-    // 保存本轮更新前的状态账本快照（用于未来可能的重Roll回滚）
     const preStateSnapshot = deepClone(memoryData.stateLedger);
     const currentStateJson = JSON.stringify(memoryData.stateLedger, null, 2);
 
-    const systemPrompt = `你是一个高精度的角色扮演叙事状态追踪器与微摘要引擎。
-请阅读【上一轮状态账本】与【最新一轮剧情文本】，输出严格的 JSON 格式结果（不要输出任何多余解释或 Markdown 代码块包裹之外的文字）。
+    const systemPrompt = `你是一个高精度的长线角色扮演状态追踪器与纯叙事记忆引擎。
+请阅读【上一轮人物状态账本】与【最新一轮剧情文本】，输出严格的 JSON 格式结果。
 
 核心要求：
-1. **单轮微摘要 (l0_summary)**：
-   - 用 60~120 字精准记录本轮发生的具体事件、时间地点、情感互动细节以及看似微小但值得纪念的生活小事（如顺手买的食物、聊到的过往、环境小插曲）。
-   - 提取 3~6 个检索关键词 (keywords)，方便日后几百层后聊到相关话题时唤醒。
-2. **零配置动态状态账本更新与防膨胀法则 (stateLedger)**：
-   - **timeAndPlace**：更新当前具体日期、时间点、距上轮的时间流逝与当前地点。
-   - **characterWear**：记录在场人物当前的穿着与佩戴饰品（若已经离开场景的不在场次要人物可移除）。
-   - **removedItemsLock（核心防回滚锁·极其重要）**：
-     * 只要人物在剧情中摘下了某件饰品（如眼镜、耳环、项链、发圈、手表）或脱下了某件衣物（如外套、鞋袜），必须立刻将其加入此数组，并注明状态（例："${charName}的金丝眼镜（已摘下放在床头柜，当前未佩戴）"）。
-     * **继承铁律**：上一轮状态账本 \`removedItemsLock\` 中已有的条目，只要本轮剧情中没有明确描写“重新戴上/重新穿上”，**必须原封不动继续保留在数组中**，绝对禁止擅自清空！只有明确重写穿戴后才可从中移除。
-   - **inventoryAndProps（上限最多保留10条·自动淘汰过时杂物）**：记录剧情中新获得、赠送、转移的重要信物/随身道具及当前场景关键物品位置；已经吃完用完的消耗品、或早已离开的旧场景普通杂物请及时清理，保持精炼。
-   - **knowledgeIsolation（防全知隔离锁·上限最多保留8条）**：记录私密事件或独处行为的知情者边界（例："卧室内的亲密互动与某秘密仅${userName}与${charName}知晓，其他不在场角色完全不知情"）。已公开或不再具备保密意义的旧条目请及时合并或移除。
-   - **todosAndPromises（上限最多保留8条）**：更新角色接下来的日程、工作课业待办或双方约定的事项（已完成的事项立刻移除，新约定及时加入）。
+1. **纯叙事时间线微摘要 (l0_summary)**：
+   - 必须采用纯粹的故事时间线口吻（拒绝任何代码感或空洞概括）。
+   - 范例：“[某年某月某日上午] 在客厅里，${charName}脱下外套并随手放在沙发上，与${userName}商定了明天的行程，心情逐渐放松...”
+   - 精炼保留时间流逝、地点、剧情推进、情感互动细节与关键动作（80~140字）。
+   - 提取 3~5 个关键词 (keywords)。
+2. **按人物分别追踪物理状态 (characters)**：
+   - 必须为剧情中出场的各个角色（包括主角 ${userName}、女/男主 ${charName}、以及其他重要在场配角）分别建立对象：
+     * **location**：该角色当前具体所在的地点/房间。
+     * **statusAndAction**：当前神态动作、心里状态或正在进行的行动。
+     * **wear**：当前身上的衣着与穿戴（根据剧情穿脱实时更新）。
+     * **removedItemsLock（核心防回滚锁·极其重要）**：
+       - 只要该角色在剧情中摘下了某件饰品（如眼镜、耳环、发卡）或脱下了衣物（如外套、鞋袜），必须加入此数组！注明状态（例："金丝眼镜（已摘下放床头柜，当前未佩戴）"）。
+       - **继承铁律**：上轮账本中该角色已有的已摘除饰品锁，只要本轮剧情未明确描写重新戴上，**必须原封不动保留**，严禁擅自清空！
+     * **inventory**：该角色随身携带的重要信物、道具、钥匙、手机或关键物品（随身道具，上限 6 条）。
+3. **todosAndPromises**：各角色间尚未完成的约定、日程或待办（已完成的事项移除，新约定加入）。
 
 请严格按以下 JSON 结构返回：
 {
-  "l0_summary": "[时间·地点] 本轮核心事件与生活小细节...",
-  "keywords": ["关键词1", "关键词2", "关键词3"],
+  "l0_summary": "[具体时间] 剧情纯叙事...",
+  "keywords": ["关键词1", "关键词2"],
   "stateLedger": {
-    "timeAndPlace": "具体时间｜具体地点",
-    "characterWear": {
-      "${charName}": "当前衣着与穿戴",
-      "${userName}": "当前衣着与穿戴"
+    "time": "具体日期与时间段（例：春季某日上午）",
+    "characters": {
+      "${charName}": {
+        "location": "当前具体地点",
+        "statusAndAction": "神态动作与当前正在做的事",
+        "wear": "当前衣着与佩戴",
+        "removedItemsLock": ["已摘下/脱下未重新穿戴的饰品或衣物（未重戴绝不清除）"],
+        "inventory": ["随身携带的关键道具/信物"]
+      },
+      "${userName}": {
+        "location": "当前具体地点",
+        "statusAndAction": "当前神态动作与行动",
+        "wear": "当前衣着",
+        "removedItemsLock": [],
+        "inventory": ["随身携带的道具"]
+      }
     },
-    "removedItemsLock": [
-      "已摘下/已脱去且尚未重新穿戴的饰品或衣物（未重戴则一直保留）"
-    ],
-    "inventoryAndProps": [
-      "关键物品/剧情新增道具及当前位置"
-    ],
-    "knowledgeIsolation": [
-      "私密事件/独处秘密的知情范围界定"
-    ],
     "todosAndPromises": [
-      "待办日程与约定"
+      "未完成的约定或待办事项"
     ]
   }
 }`;
 
     const userPrompt = `【当前楼层范围】：第 ${floorRange} 楼
-【主角与角色】：User = ${userName}, Char = ${charName}
+【主要在场人物】：User = ${userName}, Char = ${charName}
 
-【上一轮状态账本 (请在此基础上增量更新，切勿丢失未恢复的已摘除饰品锁)】：
+【上一轮人物状态账本 (请在此基础上增量更新，切勿丢失各角色的已摘除饰品锁)】：
 ${currentStateJson}
 
 【最新一轮剧情文本】：
@@ -365,27 +363,40 @@ ${dialogueText}
         throw new Error("模型返回格式无法解析为有效摘要 JSON: " + rawOutput.slice(0, 150));
     }
 
-    // 更新状态账本（带长度兜底截断，防止几百层后无限膨胀）
+    // 更新状态账本
     if (parsed.stateLedger) {
+        const nextChars = parsed.stateLedger.characters || {};
+        // 确保继承旧数据中未出现但仍在场的角色数据
+        const oldChars = memoryData.stateLedger.characters || {};
+        const mergedChars = {};
+
+        for (const [name, charData] of Object.entries(nextChars)) {
+            mergedChars[name] = {
+                location: charData.location || "未知位置",
+                statusAndAction: charData.statusAndAction || "平静",
+                wear: charData.wear || "日常衣着",
+                removedItemsLock: Array.isArray(charData.removedItemsLock) ? charData.removedItemsLock.slice(0, 10) : [],
+                inventory: Array.isArray(charData.inventory) ? charData.inventory.slice(0, 8) : [],
+            };
+        }
+
+        // 如果旧角色本轮没在 nextChars 中被提，但有未戴回的饰品，保留并继承
+        for (const [name, oldData] of Object.entries(oldChars)) {
+            if (!mergedChars[name] && oldData && (oldData.removedItemsLock || []).length > 0) {
+                mergedChars[name] = oldData;
+            }
+        }
+
         memoryData.stateLedger = {
-            timeAndPlace: parsed.stateLedger.timeAndPlace || memoryData.stateLedger.timeAndPlace,
-            characterWear: parsed.stateLedger.characterWear || memoryData.stateLedger.characterWear,
-            removedItemsLock: Array.isArray(parsed.stateLedger.removedItemsLock)
-                ? parsed.stateLedger.removedItemsLock.slice(0, 15)
-                : memoryData.stateLedger.removedItemsLock,
-            inventoryAndProps: Array.isArray(parsed.stateLedger.inventoryAndProps)
-                ? parsed.stateLedger.inventoryAndProps.slice(0, 12)
-                : memoryData.stateLedger.inventoryAndProps,
-            knowledgeIsolation: Array.isArray(parsed.stateLedger.knowledgeIsolation)
-                ? parsed.stateLedger.knowledgeIsolation.slice(0, 10)
-                : memoryData.stateLedger.knowledgeIsolation,
+            time: parsed.stateLedger.time || memoryData.stateLedger.time || "未知时间",
+            characters: mergedChars,
             todosAndPromises: Array.isArray(parsed.stateLedger.todosAndPromises)
-                ? parsed.stateLedger.todosAndPromises.slice(0, 10)
-                : memoryData.stateLedger.todosAndPromises,
+                ? parsed.stateLedger.todosAndPromises.slice(0, 8)
+                : (memoryData.stateLedger.todosAndPromises || []),
         };
     }
 
-    // 生成 L0 节点（附带前后状态快照以支持无损回滚）
+    // 生成 L0 节点
     const embedding = await getEmbeddingVector(settings, `${parsed.l0_summary} ${(parsed.keywords || []).join(" ")}`);
     const l0Entry = {
         id: `L0_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -399,12 +410,11 @@ ${dialogueText}
         postStateSnapshot: deepClone(memoryData.stateLedger),
     };
 
-    // 推入 L0 队列，同时永久备份进 archivePool（供未来检索小事）
     if (!memoryData.levels[0]) memoryData.levels[0] = [];
     memoryData.levels[0].push(l0Entry);
     memoryData.archivePool.push(l0Entry);
 
-    // 清理过早的历史状态快照（只保留最近 10 条 L0 的状态快照即可，节省存档体积）
+    // 清理过早的状态快照节省存档体积
     if (memoryData.archivePool.length > 10) {
         for (let i = 0; i < memoryData.archivePool.length - 10; i++) {
             delete memoryData.archivePool[i].preStateSnapshot;
@@ -412,16 +422,13 @@ ${dialogueText}
         }
     }
 
-    // 检查是否触发递归向上合并 (例如 L0 满 5 条 -> 合并为 1 条 L1；L1 满 5 条 -> 合并为 1 条 L2)
     await checkAndCascadeMerge(settings, memoryData);
 
     return l0Entry;
 }
 
 /**
- * 递归金字塔合并引擎：
- * 当第 k 层的条目数 >= mergeChunkSize (如 5 条) 时，取出最早的 5 条合并为第 k+1 层的 1 条摘要。
- * 如：1~5条 L0 -> 第1条 L1；6~10条 L0 -> 第2条 L1... 当 L1 攒满 5 条 (即 1~25层) -> 合并为第1条 L2！
+ * 递归金字塔合并引擎
  */
 export async function checkAndCascadeMerge(settings, memoryData) {
     const chunkSize = Math.max(2, Number(settings.mergeChunkSize || 5));
@@ -456,19 +463,19 @@ export async function checkAndCascadeMerge(settings, memoryData) {
 }
 
 /**
- * 调用独立 API 将 N 条同级摘要合成为 1 条高一级摘要
+ * 调用独立 API 将 N 条同级摘要合成为 1 条纯叙事时间线的高级摘要
  */
 async function mergeSummariesAtLevel(settings, currentLevel, items, mergedFloorRange) {
     const targetLevel = currentLevel + 1;
     const wordLimit = targetLevel === 1 ? "150~250字" : "250~400字";
 
-    const systemPrompt = `你是一个叙事记忆金字塔压缩引擎。
-请将以下连续的 ${items.length} 条【L${currentLevel} 阶段摘要】（涵盖第 ${mergedFloorRange} 楼）合并浓缩为一条连贯、高信息密度的【L${targetLevel} 汇总摘要】（篇幅控制在 ${wordLimit}）。
+    const systemPrompt = `你是一个叙事剧情时间线提炼引擎。
+请将连续的 ${items.length} 条【第 ${mergedFloorRange} 楼的剧情微摘要】合并为一条连贯、高信息密度的【L${targetLevel} 故事脉络时间线】（篇幅 ${wordLimit}）。
 
 合并要求：
-1. **严格保留时间跨度与起止节点**：在开头用 \`[起止时间跨度]\` 标明这段剧情经历的具体时间范围。
-2. **保留关键剧情脉络、情感升温节点与有代表性的生活细节**：不要写成空洞的流水账，保留具体发生过的重要事件、去过的地点、关键对话结论与关系转折。
-3. **直接输出合并后的摘要纯文本**，不要输出任何前缀解释。`;
+1. **纯故事叙述，充满时间感**：用故事口吻描述这段时间的起承转合（例：“从某月某日上午...经过几番波折，直到当晚...”）。
+2. 保留重要事件、人物关系情感转折、以及关键承诺或随身道具变动。
+3. **直接输出合并后的纯叙事文本**，严禁包含任何 JSON 或代码。`;
 
     const listText = items
         .map((it, idx) => `${idx + 1}. [第${it.floorRange}楼] ${it.text}`)
@@ -476,15 +483,14 @@ async function mergeSummariesAtLevel(settings, currentLevel, items, mergedFloorR
 
     const merged = await callIndependentLLM(settings, [
         { role: "system", content: systemPrompt },
-        { role: "user", content: `请合并以下 ${items.length} 条摘要：\n\n${listText}` },
+        { role: "user", content: `请将以下时间线的剧情摘要合并为一段纯叙事时间线：\n\n${listText}` },
     ]);
 
     return merged.replace(/^```[\s\S]*?\n/, "").replace(/```$/, "").trim();
 }
 
 /**
- * 混合检索引擎（余弦相似度向量检索 + 中文双字Bigram与关键词匹配保底）
- * 用于在几百层后根据当前最新话题，从 archivePool 中精准捞取某个时间段发生过的小事！
+ * 混合检索回溯池
  */
 function extractBigramsAndTokens(text) {
     if (!text) return new Set();
@@ -514,7 +520,6 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
         return [];
     }
 
-    // 已经在当前活跃 L0 队列中的最新摘要不需要重复召回
     const activeL0Ids = new Set((memoryData.levels[0] || []).map(x => x.id));
     const candidates = memoryData.archivePool.filter(item => !activeL0Ids.has(item.id));
     if (candidates.length === 0) return [];
@@ -524,7 +529,6 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
 
     const scored = candidates.map(item => {
         let score = 0;
-        // 1. 关键词命中加分
         if (Array.isArray(item.keywords)) {
             for (const kw of item.keywords) {
                 if (kw && queryText.includes(kw)) {
@@ -532,7 +536,6 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
                 }
             }
         }
-        // 2. 字符 Bigram 局部重叠度
         const itemBigrams = extractBigramsAndTokens(item.text + " " + (item.keywords || []).join(" "));
         if (queryBigrams.size > 0 && itemBigrams.size > 0) {
             let overlap = 0;
@@ -541,7 +544,6 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
             }
             score += (overlap / Math.sqrt(queryBigrams.size * itemBigrams.size)) * 0.6;
         }
-        // 3. 若开启了 Embedding 向量且存在向量，叠加语义余弦相似度
         if (queryEmbedding && item.embedding) {
             const cos = cosineSimilarity(queryEmbedding, item.embedding);
             score += Math.max(0, cos) * 1.2;
@@ -558,82 +560,132 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
 }
 
 /**
- * 组装最终注入给主写作模型的上下文提示词块 `<tiandao_memory_system>`
+ * 组装给主模型的记忆注入块：
+ * 按人物分别展示：所处地点、状态行动、穿戴、已摘除饰品锁、随身道具
+ * 搭配纯叙事的时间线脉络
  */
 export function buildInjectedMemoryPrompt(memoryData, retrievedSnacks = []) {
     if (!memoryData) return "";
     const ledger = memoryData.stateLedger || {};
+    const chars = ledger.characters || {};
 
-    const wearLines = Object.entries(ledger.characterWear || {})
-        .map(([k, v]) => `  * ${k}: ${v}`)
-        .join("\n") || "  * 暂无记录";
+    // 格式化各人物状态
+    const charBlocks = [];
+    for (const [name, info] of Object.entries(chars)) {
+        if (!info) continue;
+        const removed = (info.removedItemsLock || []).length > 0
+            ? `\n    - 已摘除/脱下饰品(锁): ${info.removedItemsLock.join("; ")} [未描写重戴前严禁出现!]`
+            : "";
+        const inv = (info.inventory || []).length > 0
+            ? `\n    - 随身携带道具: ${info.inventory.join("; ")}`
+            : "";
 
-    const removedLines = (ledger.removedItemsLock || []).length > 0
-        ? ledger.removedItemsLock.map(x => `  * ⚠️ ${x}`).join("\n")
-        : "  * 无";
-
-    const propLines = (ledger.inventoryAndProps || []).length > 0
-        ? ledger.inventoryAndProps.map(x => `  * ${x}`).join("\n")
-        : "  * 无";
-
-    const isoLines = (ledger.knowledgeIsolation || []).length > 0
-        ? ledger.knowledgeIsolation.map(x => `  * 🔒 ${x}`).join("\n")
-        : "  * 无特殊隔离";
+        charBlocks.push(`- **【${name}】**
+    - 当前地点: ${info.location || "未知"}
+    - 状态与行动: ${info.statusAndAction || "无"}
+    - 当前穿戴: ${info.wear || "常规穿戴"}${removed}${inv}`);
+    }
 
     const todoLines = (ledger.todosAndPromises || []).length > 0
         ? ledger.todosAndPromises.map(x => `  * 📌 ${x}`).join("\n")
         : "  * 无";
 
-    // 组装分层递归记忆树（从高层级宏观脉络 到 低层级近期细节）
-    const treeSections = [];
+    // 组装纯叙事剧情时间线
+    const timelineSections = [];
     const maxLvl = Math.max(...Object.keys(memoryData.levels || {}).map(Number), 3);
 
     for (let lvl = maxLvl; lvl >= 1; lvl--) {
         const list = memoryData.levels?.[lvl] || [];
         if (list.length > 0) {
-            const title = lvl === 1 ? "近期阶段脉络 (L1)" : lvl === 2 ? "中远期大阶段脉络 (L2)" : `远期卷级总览 (L${lvl})`;
-            const lines = list.map(it => `- [第${it.floorRange}楼] ${it.text}`).join("\n");
-            treeSections.push(`### ${title}\n${lines}`);
+            const title = lvl === 1 ? "阶段剧情时间线 (近期)" : `长线剧情时间线 (卷级/大阶段)`;
+            const lines = list.map(it => `• [第${it.floorRange}楼] ${it.text}`).join("\n");
+            timelineSections.push(`### ${title}\n${lines}`);
         }
     }
 
     const l0List = memoryData.levels?.[0] || [];
     if (l0List.length > 0) {
-        const lines = l0List.map(it => `- [第${it.floorRange}楼] ${it.text}`).join("\n");
-        treeSections.push(`### 最近单轮微摘要 (L0)\n${lines}`);
+        const lines = l0List.map(it => `• [第${it.floorRange}楼] ${it.text}`).join("\n");
+        timelineSections.push(`### 最近单轮剧情时间线\n${lines}`);
     }
 
     let retrievedSection = "";
     if (retrievedSnacks && retrievedSnacks.length > 0) {
         const rLines = retrievedSnacks
-            .map(it => `- [回忆闪回·第${it.floorRange}楼] ${it.text}`)
+            .map(it => `• [过往回忆·第${it.floorRange}楼] ${it.text}`)
             .join("\n");
-        retrievedSection = `\n## 三、与当前话题相关的过往细节回忆（按需唤醒）\n${rLines}\n`;
+        retrievedSection = `\n## 三、当前话题相关的过往回忆片段（按需唤醒）\n${rLines}\n`;
     }
 
     return `<tiandao_memory_system>
-# 天道·溯微长线记忆与当前物理状态账本（最高事实基准）
+# 天道·溯微剧情时间线与人物动态状态（最高事实基准）
 
-## 一、当前实时物理状态账本（每轮动态更新·绝对优先于角色卡默认穿戴）
-- **当前时间与地点**: ${ledger.timeAndPlace || "未知"}
-- **当前在场人物穿戴**:
-${wearLines}
-- **已摘除/已脱下/不在身物品锁（未明确重写穿戴前严禁凭空出现在身上！）**:
-${removedLines}
-- **剧情关键物品与当前位置**:
-${propLines}
-- **防全知信息隔离表（不在知情名单内的角色绝对禁止知晓！）**:
-${isoLines}
-- **待办日程与约定事项**:
+## 一、当前各人物实时物理状态账本（绝对优先于角色卡初始设定）
+- **当前剧情时间**: ${ledger.time || "未知"}
+${charBlocks.join("\n\n") || "（暂无出场人物状态）"}
+- **各角色未完成约定与待办**:
 ${todoLines}
 
-## 二、分层递归剧情记忆树（由远及近）
-${treeSections.join("\n\n") || "（尚无历史归档摘要）"}
+## 二、剧情时间线叙事脉络（由远及近）
+${timelineSections.join("\n\n") || "（尚无归档时间线）"}
 ${retrievedSection}</tiandao_memory_system>`;
 }
 
 /**
- * 为可视化 JSON 编辑器剥离冗长的 embedding 数组与内部状态快照，避免文本框被数万行浮点数撑爆
+ * 组装给玩家在面板上阅读的“纯叙事时间线总览”（完全不带任何代码，纯故事流阅读体验）
+ */
+export function buildNarrativeStoryView(memoryData) {
+    if (!memoryData) return "暂无记忆记录。";
+    const ledger = memoryData.stateLedger || {};
+    const chars = ledger.characters || {};
+
+    const charList = Object.entries(chars).map(([name, info]) => {
+        const removed = (info.removedItemsLock || []).length > 0
+            ? `\n  - ⚠️ 已摘除饰品锁: ${info.removedItemsLock.join(", ")}`
+            : "";
+        const inv = (info.inventory || []).length > 0
+            ? `\n  - 随身道具: ${info.inventory.join(", ")}`
+            : "";
+        return `【${name}】
+  - 所在地点: ${info.location || "未知"}
+  - 状态与行动: ${info.statusAndAction || "正常"}
+  - 衣着穿戴: ${info.wear || "未记录"}${removed}${inv}`;
+    }).join("\n\n");
+
+    const lines = [];
+    lines.push(`📖 当前故事时间：${ledger.time || "未知"}\n`);
+    lines.push(`👥 在场各人物当前状态：\n${charList || "暂无出场人物"}\n`);
+
+    if ((ledger.todosAndPromises || []).length > 0) {
+        lines.push(`📌 待办与约定事项：\n${ledger.todosAndPromises.map(x => "  • " + x).join("\n")}\n`);
+    }
+
+    lines.push(`📜 故事完整叙事时间线：`);
+
+    // 优先展示高阶时间线，再展示近期单轮细节
+    const allSummaries = [];
+    const maxLvl = Math.max(...Object.keys(memoryData.levels || {}).map(Number), 3);
+    for (let lvl = maxLvl; lvl >= 1; lvl--) {
+        const list = memoryData.levels?.[lvl] || [];
+        for (const it of list) {
+            allSummaries.push(`• [第 ${it.floorRange} 楼阶段总览]\n  ${it.text}`);
+        }
+    }
+    for (const it of (memoryData.levels?.[0] || [])) {
+        allSummaries.push(`• [第 ${it.floorRange} 楼]\n  ${it.text}`);
+    }
+
+    if (allSummaries.length === 0) {
+        lines.push("  （暂无剧情总结）");
+    } else {
+        lines.push(allSummaries.join("\n\n"));
+    }
+
+    return lines.join("\n");
+}
+
+/**
+ * 剥离 embedding
  */
 export function createEditableMemoryCopy(memoryData) {
     const copy = deepClone(memoryData);
@@ -653,7 +705,7 @@ export function createEditableMemoryCopy(memoryData) {
 }
 
 /**
- * 将用户在 JSON 编辑器中修改后的数据与原有的 embedding 向量及快照无损合并还原
+ * 还原 embedding
  */
 export function mergeEditedMemoryWithEmbeddings(originalData, editedData) {
     if (!originalData || !editedData) return editedData;
@@ -690,7 +742,7 @@ export function mergeEditedMemoryWithEmbeddings(originalData, editedData) {
 }
 
 /**
- * 存量历史一键回溯构建器（支持中途安全暂停 + 每完成一批次立即持久化保存断点）
+ * 存量历史一键回溯构建器
  */
 export async function backfillExistingChatHistory(
     settings,
@@ -728,7 +780,6 @@ export async function backfillExistingChatHistory(
         for (let j = i; j <= sliceEnd; j++) {
             const m = chatMessages[j];
             if (!m) continue;
-            // 仅跳过非天道隐藏的纯系统提示消息，天道自身隐藏的历史楼层仍需正常扫描
             if (m.is_system && !m.extra?.tiandao_hidden) continue;
             const speaker = m.is_user ? userName : (m.name || charName);
             const cleaned = cleanMessageText(m.mes, settings.targetContentTags, settings.customStripTags);
@@ -754,7 +805,6 @@ export async function backfillExistingChatHistory(
         processedChunks++;
         processedMessages += (sliceEnd - i + 1);
 
-        // 每批次完成后立即触发持久化保存，防止中途刷新或断网丢失进度
         if (typeof onChunkSaved === "function") {
             await onChunkSaved(sliceEnd);
         }

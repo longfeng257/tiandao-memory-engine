@@ -7,6 +7,7 @@ import {
     rollbackMemoryFromFloor,
     retrieveRelevantArchivedMemories,
     buildInjectedMemoryPrompt,
+    buildNarrativeStoryView,
     createEditableMemoryCopy,
     mergeEditedMemoryWithEmbeddings,
     backfillExistingChatHistory,
@@ -437,39 +438,44 @@ function updateFloatingWidgetUI() {
 
     if (!body) return;
 
-    const wearHtml = Object.entries(ledger.characterWear || {})
-        .map(([k, v]) => `<div><b>${k}</b>: ${v}</div>`)
-        .join("") || "暂无记录";
+    const chars = ledger.characters || {};
+    const charCards = [];
 
-    const removedHtml = (ledger.removedItemsLock || []).length > 0
-        ? ledger.removedItemsLock.map(x => `<div style="color: #fca5a5;">⚠️ ${x}</div>`).join("")
-        : "<div style='opacity:0.6;'>无摘除/脱下饰品</div>";
+    for (const [name, info] of Object.entries(chars)) {
+        if (!info) continue;
+        const removed = (info.removedItemsLock || []).length > 0
+            ? `<div style="color: #fca5a5; margin-top:2px;">⚠️ <b>摘除饰品锁</b>: ${info.removedItemsLock.join(", ")}</div>`
+            : "";
+        const inv = (info.inventory || []).length > 0
+            ? `<div style="color: #93c5fd; margin-top:2px;">📦 <b>随身道具</b>: ${info.inventory.join(", ")}</div>`
+            : "";
 
-    const propHtml = (ledger.inventoryAndProps || []).length > 0
-        ? ledger.inventoryAndProps.map(x => `<div>📦 ${x}</div>`).join("")
-        : "<div style='opacity:0.6;'>无重要道具</div>";
+        charCards.push(`
+            <div class="tiandao-card-block" style="border-left: 3px solid #e0c280;">
+                <div class="tiandao-block-title">
+                    <span>👤 ${name}</span>
+                    <span style="font-size:0.8em; opacity:0.8; font-weight:normal;">📍 ${info.location || "未知位置"}</span>
+                </div>
+                <div class="tiandao-block-content">
+                    <div><b>状态行动</b>: ${info.statusAndAction || "平静"}</div>
+                    <div><b>当前衣着</b>: ${info.wear || "常规穿戴"}</div>
+                    ${removed}
+                    ${inv}
+                </div>
+            </div>
+        `);
+    }
 
     const todoHtml = (ledger.todosAndPromises || []).length > 0
         ? ledger.todosAndPromises.map(x => `<div>📌 ${x}</div>`).join("")
         : "<div style='opacity:0.6;'>暂无待办约定</div>";
 
     body.innerHTML = `
-        <div class="tiandao-card-block">
-            <div class="tiandao-block-title"><i class="fa-solid fa-clock"></i> 时空地点</div>
-            <div class="tiandao-block-content" style="color:#f3d48d;">${ledger.timeAndPlace || "未知"}</div>
+        <div class="tiandao-card-block" style="background: rgba(224, 194, 128, 0.08);">
+            <div class="tiandao-block-title"><i class="fa-solid fa-clock"></i> 故事时间</div>
+            <div class="tiandao-block-content" style="color:#f3d48d; font-weight:bold;">${ledger.time || "未知时间"}</div>
         </div>
-        <div class="tiandao-card-block">
-            <div class="tiandao-block-title"><i class="fa-solid fa-shirt"></i> 当前人物穿戴</div>
-            <div class="tiandao-block-content">${wearHtml}</div>
-        </div>
-        <div class="tiandao-card-block" style="border-color: rgba(248, 113, 113, 0.25);">
-            <div class="tiandao-block-title" style="color: #fca5a5;"><i class="fa-solid fa-lock"></i> 已摘除饰品锁 (防初始回滚)</div>
-            <div class="tiandao-block-content">${removedHtml}</div>
-        </div>
-        <div class="tiandao-card-block">
-            <div class="tiandao-block-title"><i class="fa-solid fa-box"></i> 关键物品与随身道具</div>
-            <div class="tiandao-block-content">${propHtml}</div>
-        </div>
+        ${charCards.length > 0 ? charCards.join("") : "<div style='opacity:0.6; padding:6px;'>暂无在场人物</div>"}
         <div class="tiandao-card-block">
             <div class="tiandao-block-title"><i class="fa-solid fa-list-check"></i> 待办与约定追踪</div>
             <div class="tiandao-block-content">${todoHtml}</div>
@@ -482,13 +488,13 @@ function openMemoryViewerModal() {
     const memoryData = getChatMemory();
     const editableCopy = createEditableMemoryCopy(memoryData);
     const jsonPretty = JSON.stringify(editableCopy, null, 2);
-    const previewPrompt = buildInjectedMemoryPrompt(memoryData, []);
+    const narrativeStoryText = buildNarrativeStoryView(memoryData);
 
     const html = `
     <div class="tiandao-modal-container">
-        <h3 style="margin-top:0; color:#e0c280;">🌌 天道·溯微 当前注入预览与状态账本编辑</h3>
+        <h3 style="margin-top:0; color:#e0c280;">🌌 天道·溯微 剧情时间线总览与状态账本</h3>
         <p style="font-size:0.85em; opacity:0.85; margin-bottom:8px;">
-            下方展示当前实时注入给主模型的提示词预览，以及可手动修改的底层 JSON 账本（已自动隐藏冗长的 Embedding 向量数据，修改饰品锁、衣着、待办或各级摘要后点击<b>保存修改</b>即可无损合并生效）：
+            默认纯叙事展示完整故事时间线脉络及各人物当前物理状态。若需底层改动，可点击下方折叠栏微调 JSON：
         </p>
         <div class="tiandao-btn-row" style="margin-bottom:10px;">
             <div id="tiandao_export_json_btn" class="menu_button" style="width:auto; padding:4px 10px;">
@@ -499,14 +505,16 @@ function openMemoryViewerModal() {
                 <input id="tiandao_import_json_input" type="file" accept=".json" style="display:none;" />
             </label>
         </div>
-        <div style="margin-bottom:10px;">
-            <b>【当前实际注入上下文预览】：</b>
-            <textarea readonly style="min-height:170px; opacity:0.9;">${previewPrompt.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</textarea>
+        <div style="margin-bottom:12px;">
+            <b style="color: #f3d48d;"><i class="fa-solid fa-book-bookmark"></i>【纯叙事时间线总览 (纯故事文本阅读)】：</b>
+            <textarea readonly style="min-height:220px; line-height: 1.6; font-family: inherit; font-size: 0.9em; background: rgba(0,0,0,0.45);">${narrativeStoryText.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</textarea>
         </div>
-        <div>
-            <b>【底层记忆树与状态账本数据 (可直接编辑保存)】：</b>
-            <textarea id="tiandao_json_editor" style="min-height:260px;">${jsonPretty.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</textarea>
-        </div>
+        <details style="margin-top: 8px;">
+            <summary style="cursor:pointer; color:#a8d8b9; font-size:0.88em; padding:4px 0;"><i class="fa-solid fa-code"></i> 点击展开高级底层数据编辑器 (JSON)</summary>
+            <div style="margin-top: 6px;">
+                <textarea id="tiandao_json_editor" style="min-height:220px; font-family: monospace;">${jsonPretty.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</textarea>
+            </div>
+        </details>
     </div>`;
 
     if (typeof ctx.callGenericPopup === "function" || typeof window.callPopup === "function") {
