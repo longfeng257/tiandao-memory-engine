@@ -8,6 +8,6 @@
   "generate_interceptor": "tiandaoMemoryInterceptor",
   "author": "Tiandao",
   "version": "1.2.0",
-  "homePage": "https://github.com/your-username/tiandao-memory-engine",
+  "homePage": "https://github.com/longfeng257/tiandao-memory-engine",
   "auto_update": true
 }
