@@ -1,0 +1,13 @@
+{
+  "display_name": "天道·溯微记忆引擎 (Tiandao Memory Engine)",
+  "loading_order": 50,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "generate_interceptor": "tiandaoMemoryInterceptor",
+  "author": "Tiandao",
+  "version": "1.2.0",
+  "homePage": "https://github.com/your-username/tiandao-memory-engine",
+  "auto_update": true
+}

@@ -1,0 +1,106 @@
+.tiandao-memory-settings .tiandao-section {
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+}
+
+.tiandao-memory-settings .tiandao-section-title {
+    font-weight: bold;
+    font-size: 0.95em;
+    margin-bottom: 8px;
+    color: #e0c280;
+    border-bottom: 1px solid rgba(224, 194, 128, 0.25);
+    padding-bottom: 4px;
+}
+
+.tiandao-memory-settings .tiandao-field {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 8px;
+}
+
+.tiandao-memory-settings .tiandao-field label {
+    font-size: 0.85em;
+    opacity: 0.85;
+    margin-bottom: 3px;
+}
+
+.tiandao-memory-settings .tiandao-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 6px 0;
+    font-size: 0.9em;
+}
+
+.tiandao-memory-settings .tiandao-btn-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+}
+
+.tiandao-memory-settings .tiandao-btn-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.tiandao-memory-settings .tiandao-status-bar {
+    font-size: 0.85em;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.06);
+    color: #a8d8b9;
+    margin-bottom: 6px;
+    word-break: break-all;
+}
+
+.tiandao-modal-container {
+    text-align: left;
+    max-height: 70vh;
+    overflow-y: auto;
+    padding: 6px;
+}
+
+.tiandao-modal-container textarea {
+    width: 100%;
+    min-height: 260px;
+    font-family: monospace;
+    font-size: 0.88em;
+    background: rgba(0, 0, 0, 0.35);
+    color: #eee;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 6px;
+    padding: 8px;
+}
+
+.tiandao-memory-settings .tiandao-turns-list {
+    max-height: 200px;
+    overflow-y: auto;
+    font-size: 0.85em;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.tiandao-memory-settings .tiandao-turn-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 6px;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 4px;
+}
+
+.tiandao-memory-settings .tiandao-turn-item:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.tiandao-memory-settings .tiandao-turn-btn {
+    cursor: pointer;
+    color: #a8d8b9;
+    font-weight: bold;
+}
