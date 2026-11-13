@@ -16,6 +16,10 @@
                     <input id="tiandao_auto_summarize" type="checkbox" />
                     <span>自动调用独立 API 总结对话并更新状态账本</span>
                 </label>
+                <label class="checkbox_label">
+                    <input id="tiandao_show_widget" type="checkbox" />
+                    <span><b>在聊天界面显示实时记忆悬浮窗（可随时拖拽查看角色穿戴/物品/待办）</b></span>
+                </label>
                 <div class="tiandao-row">
                     <span>自动总结触发时机：</span>
                     <select id="tiandao_summarize_timing" class="text_pole" style="width: 225px;">
@@ -61,7 +65,11 @@
                     </div>
                 </div>
                 <div class="tiandao-field" style="margin-top: 6px;">
-                    <label>总结前自动剥离的非正文 XML 标签（逗号分隔，避免思维链/小剧场干扰总结）</label>
+                    <label><b>🎯 目标正文提取标签（白名单优先）</b>：直接抓取标签内正文，其余思维链/代码块全自动丢弃</label>
+                    <input id="tiandao_target_tags" type="text" class="text_pole" placeholder="content,story,reply (若留空则走下方排除标签)" />
+                </div>
+                <div class="tiandao-field" style="margin-top: 6px;">
+                    <label>备用排除非正文标签（黑名单）：未匹配上述目标标签时剥离</label>
                     <input id="tiandao_strip_tags" type="text" class="text_pole" placeholder="thinking,think,report,options_engine,small_theater,status_bar" />
                 </div>
                 <div class="tiandao-btn-row">

@@ -104,3 +104,122 @@
     color: #a8d8b9;
     font-weight: bold;
 }
+
+/* 🌌 天道·溯微 实时悬浮看板样式 */
+#tiandao_floating_widget {
+    position: fixed;
+    top: 85px;
+    right: 25px;
+    z-index: 9999;
+    font-family: inherit;
+    user-select: none;
+}
+
+.tiandao-widget-pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 14px;
+    background: rgba(22, 24, 30, 0.88);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(224, 194, 128, 0.45);
+    border-radius: 20px;
+    color: #e0c280;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+    cursor: pointer;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.tiandao-widget-pill:hover {
+    transform: translateY(-2px);
+    border-color: #f3d48d;
+    box-shadow: 0 6px 20px rgba(224, 194, 128, 0.25);
+}
+
+.tiandao-pill-badge {
+    font-size: 0.78em;
+    background: rgba(224, 194, 128, 0.18);
+    color: #d1b474;
+    padding: 2px 7px;
+    border-radius: 10px;
+}
+
+.tiandao-widget-card {
+    position: absolute;
+    top: 42px;
+    right: 0;
+    width: 330px;
+    max-height: 520px;
+    background: rgba(18, 20, 26, 0.94);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border: 1px solid rgba(224, 194, 128, 0.35);
+    border-radius: 12px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.65);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    animation: tiandaoFadeIn 0.2s ease-out;
+}
+
+@keyframes tiandaoFadeIn {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.tiandao-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: rgba(255, 255, 255, 0.04);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    color: #e0c280;
+    font-weight: bold;
+    font-size: 0.92em;
+}
+
+.tiandao-card-body {
+    padding: 12px 14px;
+    overflow-y: auto;
+    font-size: 0.84em;
+    color: #ddd;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.tiandao-card-block {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    padding: 8px 10px;
+}
+
+.tiandao-block-title {
+    font-weight: bold;
+    color: #e0c280;
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.92em;
+}
+
+.tiandao-block-content {
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: #ccc;
+}
+
+.tiandao-card-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: rgba(0, 0, 0, 0.35);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    font-size: 0.8em;
+}

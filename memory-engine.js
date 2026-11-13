@@ -23,8 +23,12 @@ export const DEFAULT_SETTINGS = {
     temperature: 0.2,
     maxTokens: 2000,
 
-    // 正文提取与标签剥离设置
-    customStripTags: "thinking,think,report,options_engine,small_theater,status_bar",
+    // 正文提取设置 (白名单优先：指定标签时直接提取内部正文；未匹配时走黑名单排除)
+    targetContentTags: "content,story,reply", // 目标提取标签（逗号分隔，如 content, story, reply，匹配到则直接只提取内部正文）
+    customStripTags: "thinking,think,report,options_engine,small_theater,status_bar", // 备用排除标签
+
+    // 悬浮窗设置
+    showFloatingWidget: true, // 是否在聊天窗口显示实时记忆悬浮看板
 
     // 递归合并树参数
     mergeChunkSize: 5, // 每满 5 条向上合并为 1 条 (例如: 5条L0 -> 1条L1, 5条L1 -> 1条L2)
@@ -141,18 +145,33 @@ export function rollbackMemoryFromFloor(memoryData, cutoffStartFloor) {
 }
 
 /**
- * 清理模型输出的正文（剥离 <thinking>, <report>, <options_engine>, <small_theater> 及用户自定义标签，避免干扰总结）
+ * 提取与清理模型输出的正文：
+ * 1. 【目标标签优先（白名单）】：若设定了目标标签（如 content, story, reply 等），一旦在文本中匹配到对应标签，
+ *    直接且仅提取标签内部的真实剧情正文，天然过滤所有外部思考链与状态栏！
+ * 2. 【备用排除标签（黑名单）】：若未匹配到目标标签，则自动剥离指定排除标签（如 thinking, think, report 等）。
  */
-export function cleanMessageText(rawText, customStripTagsStr = "") {
+export function cleanMessageText(rawText, targetContentTagsStr = "", customStripTagsStr = "") {
     if (!rawText) return "";
     let text = String(rawText);
-    // 如果包含 <content>...</content>，优先提取 <content> 内部正文
-    const contentMatch = text.match(/<content>([\s\S]*?)<\/content>/i);
-    if (contentMatch && contentMatch[1].trim()) {
-        text = contentMatch[1].trim();
+
+    // 1. 优先白名单目标提取
+    const targetTags = String(targetContentTagsStr || "")
+        .split(/[,，\s]+/)
+        .map(t => t.trim().replace(/^<|>$/g, ""))
+        .filter(Boolean);
+
+    if (targetTags.length > 0) {
+        for (const tag of targetTags) {
+            const safeTag = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const reg = new RegExp(`<${safeTag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${safeTag}>`, "i");
+            const match = text.match(reg);
+            if (match && match[1] && match[1].trim()) {
+                return match[1].trim();
+            }
+        }
     }
 
-    // 默认剥离标签 + 用户自定义剥离标签
+    // 2. 备用黑名单剥离
     const defaultTags = ["thinking", "think", "report", "options_engine", "small_theater", "status_bar"];
     const customTags = String(customStripTagsStr || "")
         .split(/[,，\s]+/)
@@ -712,7 +731,7 @@ export async function backfillExistingChatHistory(
             // 仅跳过非天道隐藏的纯系统提示消息，天道自身隐藏的历史楼层仍需正常扫描
             if (m.is_system && !m.extra?.tiandao_hidden) continue;
             const speaker = m.is_user ? userName : (m.name || charName);
-            const cleaned = cleanMessageText(m.mes, settings.customStripTags);
+            const cleaned = cleanMessageText(m.mes, settings.targetContentTags, settings.customStripTags);
             if (cleaned) {
                 batchMsgs.push(`【第${j}楼 · ${speaker}】：\n${cleaned}`);
             }

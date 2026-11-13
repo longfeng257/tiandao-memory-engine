@@ -75,13 +75,13 @@ function updateStatusBar(text, isError = false) {
     }
 }
 
-function buildRecentContextQuery(chat, customStripTags) {
+function buildRecentContextQuery(chat, targetContentTags, customStripTags) {
     if (!Array.isArray(chat) || chat.length === 0) return "";
     const snippets = [];
     for (let i = chat.length - 1; i >= 0 && snippets.length < 2; i--) {
         const msg = chat[i];
         if (!msg || (msg.is_system && !msg.extra?.tiandao_hidden)) continue;
-        const cleaned = cleanMessageText(msg.mes, customStripTags);
+        const cleaned = cleanMessageText(msg.mes, targetContentTags, customStripTags);
         if (cleaned) {
             snippets.push(cleaned.slice(-300));
         }
@@ -100,7 +100,7 @@ async function refreshPromptInjection(customQuery = "") {
     }
 
     const memoryData = getChatMemory();
-    const queryText = customQuery || buildRecentContextQuery(ctx.chat || [], settings.customStripTags);
+    const queryText = customQuery || buildRecentContextQuery(ctx.chat || [], settings.targetContentTags, settings.customStripTags);
 
     let retrieved = [];
     if (settings.enableRetrieval && queryText) {
@@ -116,6 +116,9 @@ async function refreshPromptInjection(customQuery = "") {
         false,
         Number(settings.injectionRole ?? 0)
     );
+
+    // 实时更新悬浮窗内容
+    updateFloatingWidgetUI();
 }
 
 globalThis.tiandaoMemoryInterceptor = async function (chat, _contextSize, _abort, type) {
@@ -128,7 +131,7 @@ globalThis.tiandaoMemoryInterceptor = async function (chat, _contextSize, _abort
         }
 
         syncHiddenMessagesState();
-        const query = buildRecentContextQuery(chat, settings.customStripTags);
+        const query = buildRecentContextQuery(chat, settings.targetContentTags, settings.customStripTags);
         await refreshPromptInjection(query);
     } catch (e) {
         console.warn("[Tiandao Memory] Interceptor refresh error:", e);
@@ -170,6 +173,7 @@ function syncHiddenMessagesState(forceRestoreAll = false) {
         }
     }
     renderRecentTurnsList();
+    updateFloatingWidgetUI();
     return restoredCount;
 }
 
@@ -194,12 +198,12 @@ async function processSingleAiTurn(targetMessageId, isManual = false) {
     let startFloor = msgIdx;
     if (msgIdx > 0 && chat[msgIdx - 1] && chat[msgIdx - 1].is_user) {
         startFloor = msgIdx - 1;
-        const userCleaned = cleanMessageText(chat[msgIdx - 1].mes, settings.customStripTags);
+        const userCleaned = cleanMessageText(chat[msgIdx - 1].mes, settings.targetContentTags, settings.customStripTags);
         if (userCleaned) {
             lines.push(`【第${msgIdx - 1}楼 · ${userName}】：\n${userCleaned}`);
         }
     }
-    const aiCleaned = cleanMessageText(targetMsg.mes, settings.customStripTags);
+    const aiCleaned = cleanMessageText(targetMsg.mes, settings.targetContentTags, settings.customStripTags);
     if (aiCleaned) {
         lines.push(`【第${msgIdx}楼 · ${charName}】：\n${aiCleaned}`);
     }
@@ -227,6 +231,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false) {
     } finally {
         isSummarizingTurn = false;
         renderRecentTurnsList();
+        updateFloatingWidgetUI();
     }
 }
 
@@ -257,7 +262,6 @@ function renderRecentTurnsList() {
     const chat = ctx.chat || [];
     const html = [];
     
-    // 只渲染最近 10 轮 AI 的回复
     let count = 0;
     for (let i = chat.length - 1; i >= 0 && count < 10; i--) {
         const msg = chat[i];
@@ -273,10 +277,178 @@ function renderRecentTurnsList() {
     list.innerHTML = html.join("");
 }
 
-// 暴露给 window 用于点击事件
 window.tiandaoProcessTurn = async (idx) => {
     await processSingleAiTurn(idx, true);
 };
+
+// ==================== 🌌 实时记忆悬浮窗 (Floating Widget) 模块 ====================
+let isWidgetExpanded = false;
+
+function initFloatingWidget() {
+    let widget = document.getElementById("tiandao_floating_widget");
+    if (widget) return;
+
+    widget = document.createElement("div");
+    widget.id = "tiandao_floating_widget";
+    widget.innerHTML = `
+        <div id="tiandao_widget_pill" class="tiandao-widget-pill" title="天道·溯微长线记忆看板 (点击展开/折叠，可按住拖拽)">
+            <span>🌌 天道记忆</span>
+            <span id="tiandao_widget_badge" class="tiandao-pill-badge">就绪</span>
+        </div>
+        <div id="tiandao_widget_card" class="tiandao-widget-card" style="display: none;">
+            <div class="tiandao-card-header">
+                <span>🌌 溯微实时状态账本</span>
+                <span id="tiandao_widget_close_btn" style="cursor: pointer; opacity: 0.8; font-size: 1.1em;" title="折叠看板">&times;</span>
+            </div>
+            <div id="tiandao_widget_body" class="tiandao-card-body">
+                <!-- 动态内容 -->
+            </div>
+            <div class="tiandao-card-footer">
+                <span style="opacity: 0.7;" id="tiandao_widget_summary_info">L0: 0 | L1: 0 | L2: 0</span>
+                <div style="display: flex; gap: 6px;">
+                    <button id="tiandao_widget_refresh_last_btn" class="menu_button" style="padding: 2px 8px; font-size: 0.85em; width: auto;"><i class="fa-solid fa-rotate"></i> 重整本轮</button>
+                    <button id="tiandao_widget_full_view_btn" class="menu_button" style="padding: 2px 8px; font-size: 0.85em; width: auto;"><i class="fa-solid fa-book-open"></i> 账本</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(widget);
+
+    const pill = document.getElementById("tiandao_widget_pill");
+    const card = document.getElementById("tiandao_widget_card");
+    const closeBtn = document.getElementById("tiandao_widget_close_btn");
+    const fullViewBtn = document.getElementById("tiandao_widget_full_view_btn");
+    const refreshLastBtn = document.getElementById("tiandao_widget_refresh_last_btn");
+
+    pill.addEventListener("click", () => {
+        isWidgetExpanded = !isWidgetExpanded;
+        card.style.display = isWidgetExpanded ? "flex" : "none";
+        if (isWidgetExpanded) updateFloatingWidgetUI();
+    });
+
+    closeBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        isWidgetExpanded = false;
+        card.style.display = "none";
+    });
+
+    if (fullViewBtn) fullViewBtn.addEventListener("click", () => openMemoryViewerModal());
+    if (refreshLastBtn) refreshLastBtn.addEventListener("click", async () => {
+        const ctx = getSTContext();
+        const chat = ctx.chat || [];
+        if (chat.length > 0) await processSingleAiTurn(chat.length - 1, true);
+    });
+
+    // 支持自由拖拽悬浮窗
+    makeDraggable(widget, pill);
+    updateFloatingWidgetUI();
+}
+
+function makeDraggable(element, handle) {
+    let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+    let isDragging = false;
+
+    handle.onmousedown = dragMouseDown;
+
+    function dragMouseDown(e) {
+        if (e.target.closest("#tiandao_widget_close_btn")) return;
+        e.preventDefault();
+        pos3 = e.clientX;
+        pos4 = e.clientY;
+        isDragging = false;
+        document.onmouseup = closeDragElement;
+        document.onmousemove = elementDrag;
+    }
+
+    function elementDrag(e) {
+        e.preventDefault();
+        isDragging = true;
+        pos1 = pos3 - e.clientX;
+        pos2 = pos4 - e.clientY;
+        pos3 = e.clientX;
+        pos4 = e.clientY;
+        element.style.top = (element.offsetTop - pos2) + "px";
+        element.style.left = (element.offsetLeft - pos1) + "px";
+        element.style.right = "auto";
+    }
+
+    function closeDragElement() {
+        document.onmouseup = null;
+        document.onmousemove = null;
+    }
+}
+
+function updateFloatingWidgetUI() {
+    const settings = getSettings();
+    const widget = document.getElementById("tiandao_floating_widget");
+    if (!widget) return;
+
+    if (!settings.enabled || !settings.showFloatingWidget) {
+        widget.style.display = "none";
+        return;
+    }
+    widget.style.display = "block";
+
+    const memoryData = getChatMemory();
+    const ledger = memoryData.stateLedger || {};
+    const badge = document.getElementById("tiandao_widget_badge");
+    const body = document.getElementById("tiandao_widget_body");
+    const summaryInfo = document.getElementById("tiandao_widget_summary_info");
+
+    const l0Count = (memoryData.levels?.[0] || []).length;
+    const l1Count = (memoryData.levels?.[1] || []).length;
+    const l2Count = (memoryData.levels?.[2] || []).length;
+
+    if (badge) {
+        const lastFloor = memoryData.lastProcessedMessageId >= 0 ? `第${memoryData.lastProcessedMessageId}楼` : "未开始";
+        badge.textContent = lastFloor;
+    }
+
+    if (summaryInfo) {
+        summaryInfo.textContent = `L0(${l0Count}) L1(${l1Count}) L2(${l2Count}) | 池:${memoryData.archivePool?.length || 0}`;
+    }
+
+    if (!body) return;
+
+    const wearHtml = Object.entries(ledger.characterWear || {})
+        .map(([k, v]) => `<div><b>${k}</b>: ${v}</div>`)
+        .join("") || "暂无记录";
+
+    const removedHtml = (ledger.removedItemsLock || []).length > 0
+        ? ledger.removedItemsLock.map(x => `<div style="color: #fca5a5;">⚠️ ${x}</div>`).join("")
+        : "<div style='opacity:0.6;'>无摘除/脱下饰品</div>";
+
+    const propHtml = (ledger.inventoryAndProps || []).length > 0
+        ? ledger.inventoryAndProps.map(x => `<div>📦 ${x}</div>`).join("")
+        : "<div style='opacity:0.6;'>无重要道具</div>";
+
+    const todoHtml = (ledger.todosAndPromises || []).length > 0
+        ? ledger.todosAndPromises.map(x => `<div>📌 ${x}</div>`).join("")
+        : "<div style='opacity:0.6;'>暂无待办约定</div>";
+
+    body.innerHTML = `
+        <div class="tiandao-card-block">
+            <div class="tiandao-block-title"><i class="fa-solid fa-clock"></i> 时空地点</div>
+            <div class="tiandao-block-content" style="color:#f3d48d;">${ledger.timeAndPlace || "未知"}</div>
+        </div>
+        <div class="tiandao-card-block">
+            <div class="tiandao-block-title"><i class="fa-solid fa-shirt"></i> 当前人物穿戴</div>
+            <div class="tiandao-block-content">${wearHtml}</div>
+        </div>
+        <div class="tiandao-card-block" style="border-color: rgba(248, 113, 113, 0.25);">
+            <div class="tiandao-block-title" style="color: #fca5a5;"><i class="fa-solid fa-lock"></i> 已摘除饰品锁 (防初始回滚)</div>
+            <div class="tiandao-block-content">${removedHtml}</div>
+        </div>
+        <div class="tiandao-card-block">
+            <div class="tiandao-block-title"><i class="fa-solid fa-box"></i> 关键物品与随身道具</div>
+            <div class="tiandao-block-content">${propHtml}</div>
+        </div>
+        <div class="tiandao-card-block">
+            <div class="tiandao-block-title"><i class="fa-solid fa-list-check"></i> 待办与约定追踪</div>
+            <div class="tiandao-block-content">${todoHtml}</div>
+        </div>
+    `;
+}
 
 function openMemoryViewerModal() {
     const ctx = getSTContext();
@@ -403,9 +575,11 @@ function bindSettingsUI() {
     bindCheck("tiandao_enabled", "enabled", () => {
         refreshPromptInjection();
         syncHiddenMessagesState();
+        updateFloatingWidgetUI();
     });
     bindCheck("tiandao_auto_summarize", "autoSummarizePerTurn");
     bindInput("tiandao_summarize_timing", "summarizeTiming");
+    bindCheck("tiandao_show_widget", "showFloatingWidget", () => updateFloatingWidgetUI());
 
     bindCheck("tiandao_auto_hide", "autoHideOldMessages", (checked) => {
         const count = syncHiddenMessagesState(!checked);
@@ -426,6 +600,7 @@ function bindSettingsUI() {
     bindInput("tiandao_api_key", "apiKey");
     bindInput("tiandao_model", "model");
     bindInput("tiandao_temp", "temperature", true);
+    bindInput("tiandao_target_tags", "targetContentTags");
     bindInput("tiandao_strip_tags", "customStripTags");
 
     bindInput("tiandao_merge_chunk", "mergeChunkSize", true);
@@ -518,6 +693,7 @@ function bindSettingsUI() {
                 await saveChatMemory();
                 await refreshPromptInjection();
                 updateStatusBar("🗑️ 已清空本存档记忆账本");
+                updateFloatingWidgetUI();
             }
         });
 }
@@ -535,23 +711,27 @@ function bindSettingsUI() {
                 bindSettingsUI();
             }
         }
+        
+        // 初始化悬浮窗
+        initFloatingWidget();
+
         const ctx = getSTContext();
         const eventSource = ctx.eventSource || window.eventSource;
         const eventTypes = ctx.event_types || window.event_types || {};
 
         if (eventSource && eventTypes) {
             if (eventTypes.CHAT_CHANGED) eventSource.on(eventTypes.CHAT_CHANGED, async () => {
-                await refreshPromptInjection(); syncHiddenMessagesState(); renderRecentTurnsList();
+                await refreshPromptInjection(); syncHiddenMessagesState(); renderRecentTurnsList(); updateFloatingWidgetUI();
             });
             if (eventTypes.GENERATION_STARTED) eventSource.on(eventTypes.GENERATION_STARTED, async (type) => {
                 const settings = getSettings();
                 if (settings.summarizeTiming === "on_next_send") await settlePendingConfirmedTurnsBeforeGeneration(ctx.chat || [], type);
                 syncHiddenMessagesState();
-                await refreshPromptInjection(buildRecentContextQuery(ctx.chat || [], settings.customStripTags));
+                await refreshPromptInjection(buildRecentContextQuery(ctx.chat || [], settings.targetContentTags, settings.customStripTags));
             });
             if (eventTypes.CHARACTER_MESSAGE_RENDERED) eventSource.on(eventTypes.CHARACTER_MESSAGE_RENDERED, async (msgId) => {
                 const settings = getSettings();
-                syncHiddenMessagesState(); renderRecentTurnsList();
+                syncHiddenMessagesState(); renderRecentTurnsList(); updateFloatingWidgetUI();
                 if (settings.autoSummarizePerTurn && settings.summarizeTiming === "after_reply") await processSingleAiTurn(msgId);
             });
             if (eventTypes.MESSAGE_DELETED) eventSource.on(eventTypes.MESSAGE_DELETED, async () => {
@@ -560,7 +740,7 @@ function bindSettingsUI() {
                 if (memoryData.lastProcessedMessageId >= chat.length) {
                     if (rollbackMemoryFromFloor(memoryData, chat.length)) { await saveChatMemory(); await refreshPromptInjection(); }
                 }
-                syncHiddenMessagesState(); renderRecentTurnsList();
+                syncHiddenMessagesState(); renderRecentTurnsList(); updateFloatingWidgetUI();
             });
             if (eventTypes.MESSAGE_EDITED) eventSource.on(eventTypes.MESSAGE_EDITED, async (idx) => {
                 const memoryData = getChatMemory();
@@ -569,6 +749,7 @@ function bindSettingsUI() {
                     await saveChatMemory();
                     await processSingleAiTurn(idx, true);
                     renderRecentTurnsList();
+                    updateFloatingWidgetUI();
                 }
             });
             if (eventTypes.MESSAGE_SWIPED) eventSource.on(eventTypes.MESSAGE_SWIPED, async (idx) => {
@@ -580,9 +761,10 @@ function bindSettingsUI() {
                     await saveChatMemory();
                     await refreshPromptInjection();
                     renderRecentTurnsList();
+                    updateFloatingWidgetUI();
                 }
             });
         }
-        console.log("[Tiandao Memory Engine] v1.3.0 加载完毕！");
+        console.log("[Tiandao Memory Engine] v1.4.0 (悬浮窗看板 + 白名单标签抓取) 加载完毕！");
     } catch (err) { console.error("[Tiandao Memory Engine] 初始化异常:", err); }
 })();
