@@ -1640,6 +1640,17 @@
         height: 78vh;
         max-height: 78vh;
     }
+    /* 移动端展开后固定在视口中央，不再跟随胶囊坐标，也不参与拖拽。 */
+    #tiandao_floating_widget.tiandao-widget-expanded .tiandao-widget-card {
+        position: fixed !important;
+        inset: 0 !important;
+        width: min(345px, calc(100vw - 20px)) !important;
+        height: min(78vh, calc(100vh - 24px)) !important;
+        height: min(78dvh, calc(100dvh - 24px)) !important;
+        max-height: calc(100vh - 24px) !important;
+        max-height: calc(100dvh - 24px) !important;
+        margin: auto !important;
+    }
     .tiandao-card-header {
         padding: 7px 8px;
     }

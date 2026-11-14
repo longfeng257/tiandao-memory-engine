@@ -106,6 +106,15 @@ test("floating widget opens toward the side with enough viewport space", () => {
     assert.doesNotMatch(indexSource, /const openRightward = rect\.left < desiredWidth/);
 });
 
+test("mobile expanded widget is centered in the viewport and cannot be dragged offscreen", () => {
+    assert.match(indexSource, /const MOBILE_WIDGET_MEDIA = "\(max-width: 600px\)"/);
+    assert.match(indexSource, /canDrag: \(\) => !\(isWidgetExpanded && isMobileWidgetViewport\(\)\)/);
+    assert.match(indexSource, /const maxLeft = Math\.max\(minLeft, window\.innerWidth - width - minLeft\)/);
+    assert.match(indexSource, /const maxTop = Math\.max\(minTop, window\.innerHeight - height - minTop\)/);
+    assert.match(styleSource, /#tiandao_floating_widget\.tiandao-widget-expanded \.tiandao-widget-card\s*\{[\s\S]*?position:\s*fixed !important;[\s\S]*?inset:\s*0 !important;[\s\S]*?margin:\s*auto !important;/);
+    assert.match(styleSource, /height:\s*min\(78dvh, calc\(100dvh - 24px\)\) !important/);
+});
+
 test("appearance settings are isolated on their own page and persist neutral defaults", () => {
     assert.match(engineSource, /widgetFontScale:\s*100/);
     assert.match(engineSource, /widgetFontFamily:\s*"inherit"/);

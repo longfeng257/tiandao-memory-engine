@@ -1412,6 +1412,13 @@ window.tiandaoResummarizeStoryEntry = (lvl, idx) => {
 
 // ==================== 🌌 “溯微” 实时记忆悬浮窗 (Floating Widget) ====================
 let isWidgetExpanded = false;
+const MOBILE_WIDGET_MEDIA = "(max-width: 600px)";
+
+function isMobileWidgetViewport() {
+    return typeof window.matchMedia === "function"
+        ? window.matchMedia(MOBILE_WIDGET_MEDIA).matches
+        : window.innerWidth <= 600;
+}
 
 function initFloatingWidget() {
     let widget = document.getElementById("tiandao_floating_widget");
@@ -1980,9 +1987,14 @@ function initFloatingWidget() {
     }
 
     makeDraggable(widget, pill, { onDragMove: positionFloatingWidgetCard });
-    // 卡片头部空白处也可拖拽（按钮与输入框不受影响）
+    // 卡片头部空白处也可拖拽（按钮与输入框不受影响）；移动端展开后固定在视口中央。
     const cardHeaderEl = card.querySelector(".tiandao-card-header");
-    if (cardHeaderEl) makeDraggable(widget, cardHeaderEl, { onDragMove: positionFloatingWidgetCard });
+    if (cardHeaderEl) {
+        makeDraggable(widget, cardHeaderEl, {
+            onDragMove: positionFloatingWidgetCard,
+            canDrag: () => !(isWidgetExpanded && isMobileWidgetViewport()),
+        });
+    }
     bindSettingsUI();
     updateFloatingWidgetUI();
 }
@@ -1995,6 +2007,17 @@ function positionFloatingWidgetCard() {
     const widget = document.getElementById("tiandao_floating_widget");
     const card = document.getElementById("tiandao_widget_card");
     if (!widget || !card) return;
+
+    if (isMobileWidgetViewport()) {
+        card.classList.remove("tiandao-open-leftward", "tiandao-open-rightward", "tiandao-open-upward");
+        if (isWidgetExpanded) {
+            // 移动端展开面板由 CSS 固定在视口中央，清掉桌面端遗留的内联几何值。
+            ["left", "right", "top", "bottom", "width", "height", "max-height"]
+                .forEach(prop => card.style.removeProperty(prop));
+        }
+        return;
+    }
+
     if (isWidgetExpanded) return;
 
     const rect = widget.getBoundingClientRect();
@@ -2048,7 +2071,7 @@ function positionFloatingWidgetCard() {
     }
 }
 
-function makeDraggable(element, handle, { onDragMove = null } = {}) {
+function makeDraggable(element, handle, { onDragMove = null, canDrag = null } = {}) {
     let pointerId = null;
     let startX = 0, startY = 0, baseLeft = 0, baseTop = 0;
     let moved = false;
@@ -2059,7 +2082,7 @@ function makeDraggable(element, handle, { onDragMove = null } = {}) {
         target.closest("button, input, select, textarea, .tiandao-chip, summary, a");
 
     handle.addEventListener("pointerdown", (e) => {
-        if (e.button !== 0 || isInteractive(e.target)) return;
+        if (e.button !== 0 || isInteractive(e.target) || (canDrag && !canDrag(e))) return;
         pointerId = e.pointerId;
         moved = false;
         startX = e.clientX;
@@ -2088,8 +2111,12 @@ function makeDraggable(element, handle, { onDragMove = null } = {}) {
         const dragSurface = handle.closest(".tiandao-widget-card") || element;
         const width = dragSurface.offsetWidth || 120;
         const height = dragSurface.offsetHeight || 40;
-        const nextLeft = Math.min(Math.max(8, baseLeft + dx), window.innerWidth - width - 8);
-        const nextTop = Math.min(Math.max(8, baseTop + dy), window.innerHeight - height - 8);
+        const minLeft = 8;
+        const minTop = 8;
+        const maxLeft = Math.max(minLeft, window.innerWidth - width - minLeft);
+        const maxTop = Math.max(minTop, window.innerHeight - height - minTop);
+        const nextLeft = Math.min(Math.max(minLeft, baseLeft + dx), maxLeft);
+        const nextTop = Math.min(Math.max(minTop, baseTop + dy), maxTop);
         element.style.left = nextLeft + "px";
         element.style.top = nextTop + "px";
         if (onDragMove) onDragMove();
