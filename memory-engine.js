@@ -13,39 +13,108 @@ export const DEFAULT_SETTINGS = {
     autoSummarizePerTurn: true,
     summarizeTiming: "on_next_send", // "on_next_send": 等玩家发送下一条消息时再总结上一轮(重Roll零浪费) | "after_reply": AI回复完立即总结
     autoHideOldMessages: true,       // 默认开启：只向主模型发送最近 N 轮完整一问一答原文，超出的旧轮次自动隐藏只看插件总结
-    keepRecentRoundsCount: 3,        // 发送给主模型的最近完整一问一答轮数（默认3轮，即最近6条正文，超出部分自动隐藏）
+    keepRecentRoundsCount: "",       // 留空时按 3 轮处理
 
-    // 独立总结 API 设置 (OpenAI 兼容格式: DeepSeek / Gemini / 硅基流动 / OpenRouter / NewAPI 等)
-    apiUrl: "https://api.deepseek.com/v1",
+    // 独立总结 API 设置 (留空，由用户根据自身渠道填写，支持一键拉取模型)
+    apiUrl: "",
     apiKey: "",
-    model: "deepseek-chat",
-    temperature: 0.2,
+    model: "",
+    temperature: "",       // 留空时按 0.2 处理
     maxTokens: 2000,
 
-    // 正文提取设置 (白名单优先：指定标签时直接提取内部正文；未匹配时走黑名单排除)
-    targetContentTags: "content,story,reply", // 目标提取标签（逗号分隔，如 content, story, reply，匹配到则直接只提取内部正文）
-    customStripTags: "thinking,think,report,options_engine,small_theater,status_bar", // 备用排除标签
+    // 正文提取设置 (留空，提供智能 placeholder 提示)
+    targetContentTags: "", // 目标提取标签（逗号分隔，如 content, story, reply，匹配到则直接只提取内部正文）
+    customStripTags: "",   // 备用排除标签
 
     // 悬浮窗设置
-    showFloatingWidget: true, // 是否在聊天窗口显示实时记忆悬浮看板
+    widgetTheme: "porcelain", // 内置看板主题: porcelain=月白瓷 | matcha=抹茶乳霜
 
-    // 递归合并树参数
-    mergeChunkSize: 5, // 每满 5 轮向上合并为 1 条阶段脉络 (例如: 1~5轮 -> 1条L1, 5条L1 -> 1条L2)
-    maxLevel: 3,       // 最大递归层级 (L0 -> L1 -> L2 -> L3)
+    // 递归合并树参数（留空时按内置默认值处理）
+    mergeChunkSize: "", // 留空默认每满 5 轮向上合并为 1 条
+    maxLevel: "",       // 留空默认最大 3 层 (L0 -> L1 -> L2 -> L3)
 
     // 向量与关键词混合检索设置 (召回陈年小事)
     enableRetrieval: true,
-    retrievalTopK: 3,  // 每轮最多召回几条陈年细节小事
+    retrievalTopK: "", // 留空默认每轮召回 3 条
     useEmbeddingApi: false,
-    embeddingApiUrl: "https://api.siliconflow.cn/v1",
+    embeddingApiUrl: "",
     embeddingApiKey: "",
-    embeddingModel: "BAAI/bge-m3",
+    embeddingModel: "",
 
-    // 注入位置设置
+    // 注入位置设置（下拉选择，保留明确默认值）
     injectionPosition: 1, // 0: 聊天历史后(In-Prompt), 1: 聊天历史中(In-chat @ depth), 2: 主提示词前(Before Main Prompt)
-    injectionDepth: 4,
+    injectionDepth: "",   // 留空默认注入深度 4
     injectionRole: 0,     // 0: system, 1: user, 2: assistant
 };
+
+const LLM_REQUEST_TIMEOUT_MS = 60_000;
+const EMBEDDING_REQUEST_TIMEOUT_MS = 15_000;
+const MAX_ARCHIVE_EMBEDDINGS = 500;
+let embeddingFailureUntil = 0;
+
+function isSafeObjectKey(name) {
+    return typeof name === "string"
+        && name.length > 0
+        && !["__proto__", "prototype", "constructor"].includes(name);
+}
+
+/**
+ * 浏览器端带超时的 fetch。SillyTavern 的独立 API 或 Embedding 卡住时，
+ * 不能让总结队列永久挂起。
+ */
+export async function fetchWithTimeout(url, options = {}, timeoutMs = LLM_REQUEST_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(1000, timeoutMs));
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } catch (error) {
+        if (error?.name === "AbortError") {
+            throw new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
+ * 这些生成类型尚未定稿，不应在生成前结算上一轮。
+ */
+export function shouldSettleBeforeGeneration(type, dryRun = false) {
+    if (dryRun) return false;
+    return !["swipe", "regenerate", "continue", "quiet"].includes(String(type || ""));
+}
+
+/**
+ * 计算可由插件隐藏的消息上界。上界之后的消息必须保留原文；
+ * 同时绝不越过 lastProcessedMessageId，避免隐藏尚未归档的剧情。
+ */
+export function computeHiddenMessageCutoff(chat, keepRounds, lastProcessedMessageId) {
+    if (!Array.isArray(chat) || chat.length === 0) return 0;
+    const keep = Math.max(1, numOr(keepRounds, 3));
+    let aiCount = 0;
+    let cutoff = 0;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const msg = chat[i];
+        if (msg && !msg.is_user && (!msg.is_system || msg.extra?.tiandao_hidden)) {
+            aiCount++;
+            if (aiCount === keep) {
+                cutoff = (i > 0 && chat[i - 1]?.is_user) ? i - 1 : i;
+                break;
+            }
+        }
+    }
+    return Math.min(cutoff, numOr(lastProcessedMessageId, -1) + 1);
+}
+
+/**
+ * 数值设置留空时回退到内置默认值（避免 "" 被 Number() 误转为 0）
+ */
+export function numOr(value, fallback) {
+    if (value === "" || value === null || value === undefined) return fallback;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+}
 
 /**
  * 深拷贝辅助函数
@@ -77,6 +146,179 @@ export function createEmptyMemoryData() {
         },
         archivePool: [],
     };
+}
+
+export function normalizeMemoryData(memoryData) {
+    if (!memoryData || typeof memoryData !== "object") {
+        return createEmptyMemoryData();
+    }
+
+    const data = memoryData;
+    data.version = numOr(data.version, 3);
+    data.lastProcessedMessageId = Number.isFinite(Number(data.lastProcessedMessageId))
+        ? Number(data.lastProcessedMessageId)
+        : -1;
+    data.lastProcessedRound = Number.isFinite(Number(data.lastProcessedRound))
+        ? Number(data.lastProcessedRound)
+        : 0;
+
+    if (!data.stateLedger || typeof data.stateLedger !== "object") {
+        data.stateLedger = { time: "未知时间", characters: {}, todosAndPromises: [] };
+    }
+    if (typeof data.stateLedger.time !== "string" || !data.stateLedger.time.trim()) {
+        data.stateLedger.time = "未知时间";
+    }
+    if (!data.stateLedger.characters || typeof data.stateLedger.characters !== "object" || Array.isArray(data.stateLedger.characters)) {
+        data.stateLedger.characters = {};
+    }
+    if (!Array.isArray(data.stateLedger.todosAndPromises)) {
+        data.stateLedger.todosAndPromises = [];
+    }
+
+    data.stateLedger.characters = Object.fromEntries(
+        Object.entries(data.stateLedger.characters)
+            .filter(([name, info]) => isSafeObjectKey(name) && info && typeof info === "object")
+            .map(([name, info]) => [
+                name,
+                {
+                    location: typeof info.location === "string" ? info.location : "未知位置",
+                    statusAndAction: typeof info.statusAndAction === "string" ? info.statusAndAction : "平静",
+                    wear: typeof info.wear === "string" ? info.wear : "日常衣着",
+                    removedItemsLock: Array.isArray(info.removedItemsLock)
+                        ? info.removedItemsLock.filter(x => typeof x === "string" && x.trim()).slice(0, 10)
+                        : [],
+                    inventory: Array.isArray(info.inventory)
+                        ? info.inventory.filter(x => typeof x === "string" && x.trim()).slice(0, 8)
+                        : [],
+                },
+            ])
+    );
+    data.stateLedger.todosAndPromises = data.stateLedger.todosAndPromises
+        .filter(x => typeof x === "string" && x.trim())
+        .slice(0, 8);
+
+    const hadLevelZero = Boolean(
+        data.levels
+        && typeof data.levels === "object"
+        && !Array.isArray(data.levels)
+        && Array.isArray(data.levels[0])
+    );
+    if (!data.levels || typeof data.levels !== "object" || Array.isArray(data.levels)) {
+        data.levels = { 0: [], 1: [], 2: [], 3: [] };
+    }
+    const normalizedLevels = {};
+    for (const [key, list] of Object.entries(data.levels)) {
+        const level = Number(key);
+        if (!Number.isInteger(level) || level < 0) continue;
+        if (!Array.isArray(list)) continue;
+        normalizedLevels[level] = list
+            .filter(item => item && typeof item === "object")
+            .sort((a, b) => {
+                if (level === 0) {
+                    return numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+                        - numOr(b.startMessageId, parseRoundRange(b.roundRange).start);
+                }
+                return parseRoundRange(a.roundRange).start - parseRoundRange(b.roundRange).start;
+            });
+    }
+    data.levels = normalizedLevels;
+
+    if (!Array.isArray(data.archivePool)) {
+        data.archivePool = [];
+    }
+    data.archivePool = data.archivePool
+        .filter(item => item && typeof item === "object")
+        .map(item => {
+            if (item.level === undefined) item.level = 0;
+            return item;
+        })
+        .sort((a, b) => {
+            return numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+                - numOr(b.startMessageId, parseRoundRange(b.roundRange).start);
+        });
+
+    // 兼容旧数据：active L0 与 archivePool 可能只保留了一边。
+    // 注意：正常情况下 levels[0] 可以为空（全部已合并），不能把 archive 里的
+    // 历史 L0 无条件塞回活动窗口，否则每次读取都会重新触发合并。
+    const archiveById = new Map(data.archivePool.filter(x => x.id).map(x => [x.id, x]));
+    const hasSavedLevelZero = hadLevelZero;
+    const levelZero = hasSavedLevelZero ? data.levels[0] : [];
+    const hasHigherLevels = Object.entries(data.levels)
+        .some(([level, list]) => Number(level) > 0 && Array.isArray(list) && list.length > 0);
+    const repairedL0 = hasSavedLevelZero || hasHigherLevels
+        ? [...levelZero]
+        : data.archivePool.filter(item => item.level === 0);
+    for (const item of repairedL0) {
+        if (item && item.level === undefined) item.level = 0;
+    }
+    repairedL0.sort((a, b) => {
+        return numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+            - numOr(b.startMessageId, parseRoundRange(b.roundRange).start);
+    });
+    data.levels[0] = repairedL0;
+
+    const levelZeroById = new Map(repairedL0.filter(x => x.id).map(x => [x.id, x]));
+    data.archivePool = data.archivePool.map(item => levelZeroById.get(item.id) || archiveById.get(item.id) || item);
+    for (const item of repairedL0) {
+        if (item.id && !data.archivePool.some(x => x.id === item.id)) {
+            data.archivePool.push(item);
+        }
+    }
+
+    if (data.lastProcessedMessageId < 0 && data.archivePool.length > 0) {
+        data.lastProcessedMessageId = Math.max(...data.archivePool.map(item =>
+            numOr(item.endMessageId, parseRoundRange(item.roundRange).end)
+        ));
+    }
+    if (data.lastProcessedRound <= 0 && data.archivePool.length > 0) {
+        data.lastProcessedRound = Math.max(...data.archivePool.map(item =>
+            parseRoundRange(item.roundRange).end
+        ));
+    }
+
+    return data;
+}
+
+function cloneMemoryForUpdate(memoryData) {
+    const source = normalizeMemoryData(memoryData);
+    const levels = {};
+    for (const [level, list] of Object.entries(source.levels || {})) {
+        levels[level] = Array.isArray(list) ? list.slice() : [];
+    }
+    return {
+        ...source,
+        stateLedger: deepClone(source.stateLedger),
+        levels,
+        archivePool: source.archivePool.slice(),
+    };
+}
+
+function commitMemoryUpdate(target, working) {
+    target.version = working.version;
+    target.stateLedger = working.stateLedger;
+    target.levels = working.levels;
+    target.archivePool = working.archivePool;
+}
+
+function sampleArchiveEmbeddings(memoryData) {
+    const archivePool = memoryData?.archivePool || [];
+    if (archivePool.length <= MAX_ARCHIVE_EMBEDDINGS) return;
+    const sampleIndexes = new Set(
+        Array.from({ length: MAX_ARCHIVE_EMBEDDINGS }, (_, i) =>
+            Math.floor((i * (archivePool.length - 1)) / Math.max(1, MAX_ARCHIVE_EMBEDDINGS - 1))
+        )
+    );
+    memoryData.archivePool = archivePool.map((item, index) => {
+        if (!item?.embedding || sampleIndexes.has(index)) return item;
+        const copy = { ...item };
+        copy.embedding = null;
+        return copy;
+    });
+}
+
+function selectTopLevelEntries(list) {
+    if (!Array.isArray(list) || list.length <= 16) return list;
+    return [...list.slice(0, 4), ...list.slice(-12)];
 }
 
 /**
@@ -111,43 +353,87 @@ export function calculateRoundForMessageIndex(chat, messageIndex) {
  */
 export function rollbackMemoryFromMessageIndex(memoryData, cutoffMessageId) {
     if (!memoryData || typeof cutoffMessageId !== "number" || cutoffMessageId < 0) return false;
+    normalizeMemoryData(memoryData);
 
-    const l0List = memoryData.levels?.[0] || [];
     const archiveList = memoryData.archivePool || [];
-
+    if (archiveList.length === 0) {
+        const hasHigherLevels = Object.entries(memoryData.levels || {})
+            .some(([level, list]) => Number(level) > 0 && Array.isArray(list) && list.length > 0);
+        if (!hasHigherLevels) return false;
+        memoryData.levels = { 0: [] };
+        memoryData.stateLedger = { time: "未知时间", characters: {}, todosAndPromises: [] };
+        memoryData.lastProcessedMessageId = -1;
+        memoryData.lastProcessedRound = 0;
+        return true;
+    }
     const removedFromArchive = archiveList
         .filter(item => (item.endMessageId ?? parseRoundRange(item.roundRange).start) >= cutoffMessageId)
         .sort((a, b) => (a.startMessageId ?? 0) - (b.startMessageId ?? 0));
 
-    let rolledBack = false;
-    if (removedFromArchive.length > 0) {
-        rolledBack = true;
+    const remainingArchive = archiveList.filter(item =>
+        (item.endMessageId ?? parseRoundRange(item.roundRange).start) < cutoffMessageId
+    );
+    if (removedFromArchive.length === 0 && remainingArchive.length === archiveList.length) {
+        return false;
+    }
+
+    // 高层摘要没有保存逐楼 ID。只要该合并块包含被回滚的轮次，就将该层及更高层整体重建。
+    const removedRanges = removedFromArchive.map(item => parseRoundRange(item.roundRange));
+    const minRemovedRound = removedRanges.length > 0
+        ? Math.min(...removedRanges.map(r => r.start))
+        : parseRoundRange(remainingArchive.at(-1)?.roundRange || "0").end + 1;
+    const levels = {};
+    let coveredRound = 0;
+    for (const [level, list] of Object.entries(memoryData.levels || {})) {
+        const n = Number(level);
+        if (n === 0) {
+            levels[0] = [];
+            continue;
+        }
+        levels[n] = (Array.isArray(list) ? list : []).filter(item => {
+            const range = parseRoundRange(item.roundRange);
+            return range.end < minRemovedRound;
+        });
+        for (const item of levels[n]) {
+            coveredRound = Math.max(coveredRound, parseRoundRange(item.roundRange).end);
+        }
+    }
+    memoryData.levels = levels;
+
+    const l0Entries = remainingArchive
+        .filter(item => item.level === 0)
+        .sort((a, b) =>
+            numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+            - numOr(b.startMessageId, parseRoundRange(b.roundRange).start)
+        );
+    memoryData.archivePool = l0Entries;
+    // 已由保留的高层摘要覆盖的 L0 不再放回活动窗口，避免下次合并重复生成。
+    memoryData.levels[0] = l0Entries.filter(item =>
+        parseRoundRange(item.roundRange).start > coveredRound
+    );
+
+    const snapshotEntries = remainingArchive
+        .filter(item => item.postStateSnapshot && item !== l0Entries.at(-1));
+    const lastL0 = l0Entries.at(-1);
+    if (lastL0?.postStateSnapshot) {
+        memoryData.stateLedger = deepClone(lastL0.postStateSnapshot);
+    } else if (snapshotEntries.length > 0) {
+        memoryData.stateLedger = deepClone(snapshotEntries.at(-1).postStateSnapshot);
+    } else {
         const earliestRemoved = removedFromArchive[0];
-        if (earliestRemoved.preStateSnapshot) {
+        if (earliestRemoved?.preStateSnapshot) {
             memoryData.stateLedger = deepClone(earliestRemoved.preStateSnapshot);
-        } else {
-            const remainingBefore = archiveList
-                .filter(item => (item.endMessageId ?? 0) < cutoffMessageId && item.postStateSnapshot);
-            if (remainingBefore.length > 0) {
-                memoryData.stateLedger = deepClone(remainingBefore[remainingBefore.length - 1].postStateSnapshot);
-            }
+        } else if (l0Entries.length === 0) {
+            memoryData.stateLedger = { time: "未知时间", characters: {}, todosAndPromises: [] };
         }
     }
 
-    if (Array.isArray(memoryData.levels?.[0])) {
-        memoryData.levels[0] = l0List.filter(item => (item.endMessageId ?? parseRoundRange(item.roundRange).start) < cutoffMessageId);
-    }
-    if (Array.isArray(memoryData.archivePool)) {
-        memoryData.archivePool = archiveList.filter(item => (item.endMessageId ?? parseRoundRange(item.roundRange).start) < cutoffMessageId);
-    }
-
-    const remainingEnds = (memoryData.archivePool || []).map(item => item.endMessageId ?? 0);
+    const remainingEnds = l0Entries.map(item => numOr(item.endMessageId, -1));
     memoryData.lastProcessedMessageId = remainingEnds.length > 0 ? Math.max(...remainingEnds) : -1;
-    
-    const remainingRounds = (memoryData.archivePool || []).map(item => parseRoundRange(item.roundRange).end);
+    const remainingRounds = l0Entries.map(item => parseRoundRange(item.roundRange).end);
     memoryData.lastProcessedRound = remainingRounds.length > 0 ? Math.max(...remainingRounds) : 0;
 
-    return rolledBack;
+    return true;
 }
 
 /**
@@ -206,29 +492,37 @@ export async function callIndependentLLM(settings, messages) {
         ? baseUrl
         : `${baseUrl}/chat/completions`;
 
+    const modelName = (settings.model || "").trim();
+    if (!modelName) {
+        throw new Error("请在悬浮窗【溯微设置】中填写或选择总结模型 (Model)");
+    }
+
     const body = {
-        model: settings.model || "deepseek-chat",
+        model: modelName,
         messages: messages,
-        temperature: Number(settings.temperature ?? 0.2),
-        max_tokens: Number(settings.maxTokens ?? 2000),
+        temperature: numOr(settings.temperature, 0.2),
+        max_tokens: numOr(settings.maxTokens, 2000),
     };
 
-    const response = await fetch(endpoint, {
+    const response = await fetchWithTimeout(endpoint, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${settings.apiKey.trim()}`,
         },
         body: JSON.stringify(body),
-    });
+    }, LLM_REQUEST_TIMEOUT_MS);
 
     if (!response.ok) {
         const errText = await response.text().catch(() => "");
         throw new Error(`独立 API 请求失败 (${response.status}): ${errText.slice(0, 200)}`);
     }
 
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content || "";
+    const data = await response.json().catch(() => null);
+    const rawContent = data?.choices?.[0]?.message?.content;
+    const content = Array.isArray(rawContent)
+        ? rawContent.map(part => typeof part === "string" ? part : (part?.text || "")).join("")
+        : String(rawContent || "");
     return content.trim();
 }
 
@@ -247,7 +541,7 @@ export function safeParseJSON(text) {
             try {
                 return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
             } catch (e2) {
-                console.error("[Tiandao Memory] JSON parse failed:", e2, text);
+                console.error("[Tiandao Memory] JSON parse failed:", e2, String(text).slice(0, 200));
                 return null;
             }
         }
@@ -255,17 +549,107 @@ export function safeParseJSON(text) {
     }
 }
 
+function asString(value, fallback) {
+    return typeof value === "string" && value.trim() ? value : fallback;
+}
+
+function normalizeStringList(value, limit) {
+    if (!Array.isArray(value)) return [];
+    return value
+        .filter(x => typeof x === "string" && x.trim())
+        .map(x => x.trim())
+        .slice(0, limit);
+}
+
+/**
+ * 将模型输出的状态账本与旧账本合并。已摘除饰品锁采用并集策略，
+ * 只有模型明确返回 unlockedItems 时才允许解锁。
+ */
+export function mergeStateLedger(oldLedger, parsedLedger) {
+    const previous = oldLedger && typeof oldLedger === "object" ? oldLedger : {};
+    const previousChars = previous.characters && typeof previous.characters === "object"
+        ? previous.characters
+        : {};
+    const next = parsedLedger && typeof parsedLedger === "object" ? parsedLedger : {};
+    const nextChars = next.characters && typeof next.characters === "object" && !Array.isArray(next.characters)
+        ? next.characters
+        : null;
+
+    if (!nextChars) {
+        return {
+            time: asString(next.time, asString(previous.time, "未知时间")),
+            characters: deepClone(previousChars),
+            todosAndPromises: Array.isArray(next.todosAndPromises)
+                ? normalizeStringList(next.todosAndPromises, 8)
+                : normalizeStringList(previous.todosAndPromises, 8),
+        };
+    }
+
+    const mergedChars = {};
+    for (const [name, oldInfo] of Object.entries(previousChars)) {
+        if (!isSafeObjectKey(name) || !oldInfo || typeof oldInfo !== "object") continue;
+        const incoming = nextChars[name];
+        if (!incoming || typeof incoming !== "object") {
+            mergedChars[name] = deepClone({
+                location: asString(oldInfo.location, "未知位置"),
+                statusAndAction: asString(oldInfo.statusAndAction, "平静"),
+                wear: asString(oldInfo.wear, "日常衣着"),
+                removedItemsLock: normalizeStringList(oldInfo.removedItemsLock, 10),
+                inventory: normalizeStringList(oldInfo.inventory, 8),
+            });
+            continue;
+        }
+
+        const oldLocks = normalizeStringList(oldInfo.removedItemsLock, 10);
+        const newLocks = normalizeStringList(incoming.removedItemsLock, 10);
+        const unlocked = normalizeStringList(incoming.unlockedItems, 20).map(x => x.toLowerCase());
+        const locks = [...new Set([...oldLocks, ...newLocks])]
+            .filter(item => !unlocked.some(unlockedItem => item.toLowerCase().includes(unlockedItem)))
+            .slice(0, 10);
+        const oldInventory = normalizeStringList(oldInfo.inventory, 8);
+        const newInventory = normalizeStringList(incoming.inventory, 8);
+
+        mergedChars[name] = {
+            location: asString(incoming.location, asString(oldInfo.location, "未知位置")),
+            statusAndAction: asString(incoming.statusAndAction, asString(oldInfo.statusAndAction, "平静")),
+            wear: asString(incoming.wear, asString(oldInfo.wear, "日常衣着")),
+            removedItemsLock: locks,
+            inventory: Array.isArray(incoming.inventory) ? newInventory : oldInventory,
+        };
+    }
+
+    for (const [name, incoming] of Object.entries(nextChars)) {
+        if (!isSafeObjectKey(name) || mergedChars[name] || !incoming || typeof incoming !== "object") continue;
+        mergedChars[name] = {
+            location: asString(incoming.location, "未知位置"),
+            statusAndAction: asString(incoming.statusAndAction, "平静"),
+            wear: asString(incoming.wear, "日常衣着"),
+            removedItemsLock: normalizeStringList(incoming.removedItemsLock, 10),
+            inventory: normalizeStringList(incoming.inventory, 8),
+        };
+    }
+
+    return {
+        time: asString(next.time, asString(previous.time, "未知时间")),
+        characters: mergedChars,
+        todosAndPromises: Array.isArray(next.todosAndPromises)
+            ? normalizeStringList(next.todosAndPromises, 8)
+            : normalizeStringList(previous.todosAndPromises, 8),
+    };
+}
+
 /**
  * 调用 Embedding API 获取向量
  */
-export async function getEmbeddingVector(settings, inputText) {
+export async function getEmbeddingVector(settings, inputText, timeoutMs = EMBEDDING_REQUEST_TIMEOUT_MS) {
     if (!settings.useEmbeddingApi || !settings.embeddingApiUrl || !settings.embeddingApiKey) {
         return null;
     }
+    if (Date.now() < embeddingFailureUntil) return null;
     try {
         const baseUrl = settings.embeddingApiUrl.trim().replace(/\/+$/, "");
         const endpoint = baseUrl.endsWith("/embeddings") ? baseUrl : `${baseUrl}/embeddings`;
-        const res = await fetch(endpoint, {
+        const res = await fetchWithTimeout(endpoint, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -275,12 +659,17 @@ export async function getEmbeddingVector(settings, inputText) {
                 model: settings.embeddingModel || "BAAI/bge-m3",
                 input: inputText.slice(0, 1000),
             }),
-        });
-        if (!res.ok) return null;
+        }, timeoutMs);
+        if (!res.ok) {
+            embeddingFailureUntil = Date.now() + 60_000;
+            return null;
+        }
         const data = await res.json();
+        embeddingFailureUntil = 0;
         return data?.data?.[0]?.embedding || null;
     } catch (e) {
         console.warn("[Tiandao Memory] Embedding API fallback to local lexical search:", e);
+        embeddingFailureUntil = Date.now() + 60_000;
         return null;
     }
 }
@@ -292,14 +681,16 @@ export async function getEmbeddingVector(settings, inputText) {
  */
 export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
     const { roundNumber, startMessageId, endMessageId, userName, charName, dialogueText } = turnInfo;
-    const currentRound = Number(roundNumber || 1);
+    const parsedRound = Number(roundNumber);
+    const currentRound = Number.isFinite(parsedRound) && parsedRound > 0 ? parsedRound : 1;
+    normalizeMemoryData(memoryData);
+    const working = cloneMemoryForUpdate(memoryData);
 
-    if (memoryData.lastProcessedMessageId >= startMessageId) {
-        rollbackMemoryFromMessageIndex(memoryData, startMessageId);
+    if (working.lastProcessedMessageId >= startMessageId) {
+        rollbackMemoryFromMessageIndex(working, startMessageId);
     }
 
-    const preStateSnapshot = deepClone(memoryData.stateLedger);
-    const currentStateJson = JSON.stringify(memoryData.stateLedger, null, 2);
+    const currentStateJson = JSON.stringify(working.stateLedger, null, 2);
 
     const systemPrompt = `你是一个高精度的长线角色扮演状态追踪器与纯叙事记忆引擎。
 请阅读【上一轮各人物状态账本】与【最新一轮一问一答剧情】，输出严格的 JSON 格式结果。
@@ -318,6 +709,7 @@ export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
      * **removedItemsLock（核心防回滚锁·极其重要）**：
        - 只要该角色在剧情中摘下了某件饰品（如眼镜、耳环、发卡）或脱下了衣物（如外套、鞋袜），必须加入此数组！注明状态（例："金丝眼镜（已摘下放床头柜，当前未佩戴）"）。
        - **继承铁律**：上轮账本中该角色已有的已摘除饰品锁，只要本轮剧情未明确描写重新戴上，**必须原封不动保留**，严禁擅自清空！
+       - 只有剧情明确描写重新戴上某件物品时，才把该物品写入同角色的 unlockedItems 数组；不确定时不要写。
      * **inventory**：该角色随身携带的重要信物、道具、钥匙、手机或关键物品（随身道具，上限 6 条）。
 3. **todosAndPromises**：各角色间尚未完成的约定、日程或待办（已完成的事项移除，新约定加入）。
 
@@ -333,6 +725,7 @@ export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
         "statusAndAction": "神态动作与当前正在做的事",
         "wear": "当前衣着与佩戴",
         "removedItemsLock": ["已摘下/脱下未重新穿戴的饰品或衣物（未重戴绝不清除）"],
+        "unlockedItems": ["本轮明确重新戴上的物品；没有则留空数组"],
         "inventory": ["随身携带的关键道具/信物"]
       },
       "${userName}": {
@@ -340,6 +733,7 @@ export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
         "statusAndAction": "当前神态动作与行动",
         "wear": "当前衣着",
         "removedItemsLock": [],
+        "unlockedItems": [],
         "inventory": ["随身携带的道具"]
       }
     },
@@ -366,68 +760,46 @@ ${dialogueText}
     ]);
 
     const parsed = safeParseJSON(rawOutput);
-    if (!parsed || !parsed.l0_summary) {
+    if (!parsed || typeof parsed.l0_summary !== "string" || !parsed.l0_summary.trim()) {
         throw new Error("模型返回格式无法解析为有效摘要 JSON: " + rawOutput.slice(0, 150));
     }
 
-    if (parsed.stateLedger) {
-        const nextChars = parsed.stateLedger.characters || {};
-        const oldChars = memoryData.stateLedger.characters || {};
-        const mergedChars = {};
+    const summaryText = parsed.l0_summary.trim().slice(0, 1200);
+    const keywords = normalizeStringList(parsed.keywords, 8);
+    working.stateLedger = parsed.stateLedger
+        ? mergeStateLedger(working.stateLedger, parsed.stateLedger)
+        : working.stateLedger;
 
-        for (const [name, charData] of Object.entries(nextChars)) {
-            mergedChars[name] = {
-                location: charData.location || "未知位置",
-                statusAndAction: charData.statusAndAction || "平静",
-                wear: charData.wear || "日常衣着",
-                removedItemsLock: Array.isArray(charData.removedItemsLock) ? charData.removedItemsLock.slice(0, 10) : [],
-                inventory: Array.isArray(charData.inventory) ? charData.inventory.slice(0, 8) : [],
-            };
-        }
-
-        for (const [name, oldData] of Object.entries(oldChars)) {
-            if (!mergedChars[name] && oldData && (oldData.removedItemsLock || []).length > 0) {
-                mergedChars[name] = oldData;
-            }
-        }
-
-        memoryData.stateLedger = {
-            time: parsed.stateLedger.time || memoryData.stateLedger.time || "未知时间",
-            characters: mergedChars,
-            todosAndPromises: Array.isArray(parsed.stateLedger.todosAndPromises)
-                ? parsed.stateLedger.todosAndPromises.slice(0, 8)
-                : (memoryData.stateLedger.todosAndPromises || []),
-        };
-    }
-
-    const embedding = await getEmbeddingVector(settings, `${parsed.l0_summary} ${(parsed.keywords || []).join(" ")}`);
+    const embedding = await getEmbeddingVector(
+        settings,
+        `${summaryText} ${keywords.join(" ")}`
+    );
     const l0Entry = {
         id: `L0_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         level: 0,
         roundRange: String(currentRound),
         startMessageId: startMessageId,
         endMessageId: endMessageId,
-        text: parsed.l0_summary.trim(),
-        keywords: Array.isArray(parsed.keywords) ? parsed.keywords : [],
+        text: summaryText,
+        keywords: keywords,
         timestamp: Date.now(),
         embedding: embedding,
-        preStateSnapshot: preStateSnapshot,
-        postStateSnapshot: deepClone(memoryData.stateLedger),
+        // 每轮只保留执行后的状态快照。回滚时使用“cutoff 之前最后一个快照”，
+        // 避免为了保留 preStateSnapshot 把状态账本重复存两遍。
+        postStateSnapshot: deepClone(working.stateLedger),
     };
 
-    if (!memoryData.levels[0]) memoryData.levels[0] = [];
-    memoryData.levels[0].push(l0Entry);
-    memoryData.archivePool.push(l0Entry);
+    if (!working.levels[0]) working.levels[0] = [];
+    working.levels[0].push(l0Entry);
+    working.archivePool.push(l0Entry);
 
-    if (memoryData.archivePool.length > 10) {
-        for (let i = 0; i < memoryData.archivePool.length - 10; i++) {
-            delete memoryData.archivePool[i].preStateSnapshot;
-            delete memoryData.archivePool[i].postStateSnapshot;
-        }
+    await checkAndCascadeMerge(settings, working);
+
+    if (typeof turnInfo.shouldCommit === "function" && !turnInfo.shouldCommit()) {
+        return null;
     }
-
-    await checkAndCascadeMerge(settings, memoryData);
-
+    sampleArchiveEmbeddings(working);
+    commitMemoryUpdate(memoryData, working);
     return l0Entry;
 }
 
@@ -435,8 +807,11 @@ ${dialogueText}
  * 递归金字塔合并引擎（按轮次归并）
  */
 export async function checkAndCascadeMerge(settings, memoryData) {
-    const chunkSize = Math.max(2, Number(settings.mergeChunkSize || 5));
-    const maxLevel = Math.max(2, Number(settings.maxLevel || 3));
+    if (!memoryData.levels || typeof memoryData.levels !== "object") {
+        memoryData.levels = { 0: [] };
+    }
+    const chunkSize = Math.min(20, Math.max(2, numOr(settings.mergeChunkSize, 5)));
+    const maxLevel = Math.min(6, Math.max(2, numOr(settings.maxLevel, 3)));
 
     for (let lvl = 0; lvl < maxLevel; lvl++) {
         if (!Array.isArray(memoryData.levels[lvl])) {
@@ -449,6 +824,9 @@ export async function checkAndCascadeMerge(settings, memoryData) {
             const mergedRoundRange = `${firstRound}-${lastRound}`;
 
             const mergedText = await mergeSummariesAtLevel(settings, lvl, itemsToMerge, mergedRoundRange);
+            if (!mergedText) {
+                throw new Error(`L${lvl + 1} 合并返回为空，已保留原 L${lvl} 条目`);
+            }
 
             memoryData.levels[lvl].splice(0, chunkSize);
             if (!Array.isArray(memoryData.levels[lvl + 1])) {
@@ -463,6 +841,28 @@ export async function checkAndCascadeMerge(settings, memoryData) {
             });
         }
     }
+}
+
+/**
+ * 用 archivePool 中全部 L0 重建层级。用于手动编辑过 L0 文本后，
+ * 让受影响的高层摘要重新由新文本合成。
+ */
+export async function rebuildMemoryHierarchy(settings, memoryData, shouldCommit = null) {
+    normalizeMemoryData(memoryData);
+    const working = cloneMemoryForUpdate(memoryData);
+    const l0Entries = working.archivePool
+        .filter(item => item && item.level === 0)
+        .sort((a, b) =>
+            numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+            - numOr(b.startMessageId, parseRoundRange(b.roundRange).start)
+        );
+    working.levels = { 0: l0Entries.slice() };
+    for (const item of l0Entries) item.level = 0;
+    await checkAndCascadeMerge(settings, working);
+    sampleArchiveEmbeddings(working);
+    if (typeof shouldCommit === "function" && !shouldCommit()) return false;
+    commitMemoryUpdate(memoryData, working);
+    return true;
 }
 
 /**
@@ -489,7 +889,7 @@ async function mergeSummariesAtLevel(settings, currentLevel, items, mergedRoundR
         { role: "user", content: `请将以下时间线的各轮剧情摘要合并为一段连贯故事脉络：\n\n${listText}` },
     ]);
 
-    return merged.replace(/^```[\s\S]*?\n/, "").replace(/```$/, "").trim();
+    return merged.replace(/^```[\s\S]*?\n/, "").replace(/```$/, "").trim().slice(0, 4000);
 }
 
 /**
@@ -522,12 +922,14 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
     if (!settings.enableRetrieval || !queryText || !Array.isArray(memoryData.archivePool)) {
         return [];
     }
+    normalizeMemoryData(memoryData);
 
     const activeL0Ids = new Set((memoryData.levels[0] || []).map(x => x.id));
     const candidates = memoryData.archivePool.filter(item => !activeL0Ids.has(item.id));
     if (candidates.length === 0) return [];
 
-    const queryEmbedding = await getEmbeddingVector(settings, queryText);
+    // 生成链路只给查询向量一个很小的预算；超时后立即回退到本地词法检索。
+    const queryEmbedding = await getEmbeddingVector(settings, queryText, 2500);
     const queryBigrams = extractBigramsAndTokens(queryText);
 
     const scored = candidates.map(item => {
@@ -554,8 +956,12 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
         return { item, score };
     });
 
-    scored.sort((a, b) => b.score - a.score);
-    const topK = Math.max(1, Number(settings.retrievalTopK || 3));
+    scored.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return numOr(b.item.endMessageId, parseRoundRange(b.item.roundRange).end)
+            - numOr(a.item.endMessageId, parseRoundRange(a.item.roundRange).end);
+    });
+    const topK = Math.min(20, Math.max(1, numOr(settings.retrievalTopK, 3)));
     return scored
         .filter(x => x.score >= 0.12)
         .slice(0, topK)
@@ -594,24 +1000,32 @@ export function buildInjectedMemoryPrompt(memoryData, retrievedSnacks = []) {
     const maxLvl = Math.max(...Object.keys(memoryData.levels || {}).map(Number), 3);
 
     for (let lvl = maxLvl; lvl >= 1; lvl--) {
-        const list = memoryData.levels?.[lvl] || [];
-        if (list.length > 0) {
+        const list = [...(memoryData.levels?.[lvl] || [])].sort((a, b) => {
+            return numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+                - numOr(b.startMessageId, parseRoundRange(b.roundRange).start);
+        });
+        // 最高层保留开头与最近一段，避免极长聊天让顶部脉络无限膨胀。
+        const visibleList = lvl >= 3 ? selectTopLevelEntries(list) : list;
+        if (visibleList.length > 0) {
             const title = lvl === 1 ? "阶段剧情脉络 (近期)" : `长线剧情大阶段脉络`;
-            const lines = list.map(it => `• [第 ${it.roundRange} 轮阶段总览] ${it.text}`).join("\n");
+            const lines = visibleList.map(it => `• [第 ${it.roundRange} 轮阶段总览] ${String(it.text || "")}`).join("\n");
             timelineSections.push(`### ${title}\n${lines}`);
         }
     }
 
-    const l0List = memoryData.levels?.[0] || [];
+    const l0List = [...(memoryData.levels?.[0] || [])].sort((a, b) => {
+        return numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+            - numOr(b.startMessageId, parseRoundRange(b.roundRange).start);
+    });
     if (l0List.length > 0) {
-        const lines = l0List.map(it => `• [第 ${it.roundRange} 轮] ${it.text}`).join("\n");
+        const lines = l0List.map(it => `• [第 ${it.roundRange} 轮] ${String(it.text || "")}`).join("\n");
         timelineSections.push(`### 最近单轮剧情时间线\n${lines}`);
     }
 
     let retrievedSection = "";
     if (retrievedSnacks && retrievedSnacks.length > 0) {
         const rLines = retrievedSnacks
-            .map(it => `• [过往回忆·第 ${it.roundRange} 轮] ${it.text}`)
+            .map(it => `• [过往回忆·第 ${it.roundRange} 轮] ${String(it.text || "")}`)
             .join("\n");
         retrievedSection = `\n## 三、当前话题相关的过往回忆片段（按需唤醒）\n${rLines}\n`;
     }
@@ -639,16 +1053,19 @@ export function buildNarrativeStoryView(memoryData) {
     const chars = ledger.characters || {};
 
     const charList = Object.entries(chars).map(([name, info]) => {
-        const removed = (info.removedItemsLock || []).length > 0
-            ? `\n  - ⚠️ 已摘除饰品锁: ${info.removedItemsLock.join(", ")}`
-            : "";
-        const inv = (info.inventory || []).length > 0
-            ? `\n  - 随身道具: ${info.inventory.join(", ")}`
+        // 已摘除的饰品并入随身道具展示（标注“已摘下”），不再单独列出
+        const removedParts = (info.removedItemsLock || []).map(x => {
+            const text = String(x);
+            return /已摘|未佩戴|已脱/.test(text) ? text : `${text}（已摘下）`;
+        });
+        const allItems = [...(info.inventory || []), ...removedParts];
+        const inv = allItems.length > 0
+            ? `\n  - 随身道具: ${allItems.join(", ")}`
             : "";
         return `【${name}】
   - 所在地点: ${info.location || "未知"}
   - 状态与行动: ${info.statusAndAction || "正常"}
-  - 衣着穿戴: ${info.wear || "未记录"}${removed}${inv}`;
+  - 衣着穿戴: ${info.wear || "未记录"}${inv}`;
     }).join("\n\n");
 
     const lines = [];
@@ -664,13 +1081,21 @@ export function buildNarrativeStoryView(memoryData) {
     const allSummaries = [];
     const maxLvl = Math.max(...Object.keys(memoryData.levels || {}).map(Number), 3);
     for (let lvl = maxLvl; lvl >= 1; lvl--) {
-        const list = memoryData.levels?.[lvl] || [];
-        for (const it of list) {
-            allSummaries.push(`• [第 ${it.roundRange} 轮阶段总览]\n  ${it.text}`);
+        const list = [...(memoryData.levels?.[lvl] || [])].sort((a, b) => {
+            return numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+                - numOr(b.startMessageId, parseRoundRange(b.roundRange).start);
+        });
+        const visibleList = lvl >= 3 ? selectTopLevelEntries(list) : list;
+        for (const it of visibleList) {
+            allSummaries.push(`• [第 ${it.roundRange} 轮阶段总览]\n  ${String(it.text || "")}`);
         }
     }
-    for (const it of (memoryData.levels?.[0] || [])) {
-        allSummaries.push(`• [第 ${it.roundRange} 轮]\n  ${it.text}`);
+    const sortedL0 = [...(memoryData.levels?.[0] || [])].sort((a, b) => {
+        return numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+            - numOr(b.startMessageId, parseRoundRange(b.roundRange).start);
+    });
+    for (const it of sortedL0) {
+        allSummaries.push(`• [第 ${it.roundRange} 轮]\n  ${String(it.text || "")}`);
     }
 
     if (allSummaries.length === 0) {
@@ -750,11 +1175,12 @@ export async function backfillExistingChatHistory(
     charName,
     options = {}
 ) {
-    const { onProgress, onChunkSaved, shouldAbort } = options;
+    const { onProgress, onChunkSaved, shouldAbort, shouldCommitTurn } = options;
 
     if (!Array.isArray(chatMessages) || chatMessages.length === 0) {
         throw new Error("当前聊天没有可扫描的历史消息");
     }
+    normalizeMemoryData(memoryData);
 
     // 找出所有配对的有效 AI 回复楼层
     const aiMessageIndices = [];
@@ -769,8 +1195,9 @@ export async function backfillExistingChatHistory(
         return { processedCount: 0, aborted: false };
     }
 
-    const startAiIdx = Math.max(0, (memoryData.lastProcessedMessageId ?? -1));
-    const pendingAiIndices = aiMessageIndices.filter(i => i > startAiIdx);
+    const lastProcessedMessageId = memoryData.lastProcessedMessageId ?? -1;
+    const pendingAiIndices = aiMessageIndices.filter(i => i > lastProcessedMessageId);
+    const roundByMessageId = new Map(aiMessageIndices.map((idx, position) => [idx, position + 1]));
 
     if (pendingAiIndices.length === 0) {
         return { processedCount: 0, aborted: false };
@@ -785,7 +1212,7 @@ export async function backfillExistingChatHistory(
         }
 
         const msgIdx = pendingAiIndices[i];
-        const roundNumber = aiMessageIndices.indexOf(msgIdx) + 1;
+        const roundNumber = roundByMessageId.get(msgIdx) || 1;
 
         let startFloor = msgIdx;
         const batchMsgs = [];
@@ -801,14 +1228,18 @@ export async function backfillExistingChatHistory(
             if (typeof onProgress === "function") {
                 onProgress(i + 1, totalRounds, roundNumber);
             }
-            await summarizeSingleTurn(settings, memoryData, {
+            const result = await summarizeSingleTurn(settings, memoryData, {
                 roundNumber,
                 startMessageId: startFloor,
                 endMessageId: msgIdx,
                 userName,
                 charName,
                 dialogueText: batchMsgs.join("\n\n"),
+                shouldCommit: shouldCommitTurn,
             });
+            if (!result) {
+                return { processedCount, aborted: true };
+            }
         }
 
         memoryData.lastProcessedMessageId = msgIdx;

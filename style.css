@@ -1,333 +1,764 @@
 /* =========================================================
-   🌌 溯微 (Suwei) - 悬浮记忆引擎专用样式表
-   全面采用轻量高级暗色亚克力毛玻璃风，与酒馆原生 UI 完美契合
+   🌌 溯微 (Suwei) - 悬浮记忆引擎样式表
+   内置可切换双主题（月白瓷 / 抹茶乳霜），由 <html data-sw-theme> 驱动，
+   悬浮窗、状态栏与账本弹窗同步换肤。
    ========================================================= */
 
-/* 悬浮窗外层容器 */
+/* ---------- 主题 A · 月白瓷 (porcelain · 默认) ---------- */
+:root,
+:root[data-sw-theme="porcelain"] {
+    --sw-accent: #3f7d74;
+    --sw-accent-bright: #2f6259;
+    --sw-accent-line: rgba(63, 125, 116, 0.3);
+    --sw-accent-tint: rgba(63, 125, 116, 0.12);
+    --sw-pill-bg: #ffffff;
+    --sw-pill-border: rgba(63, 125, 116, 0.4);
+    --sw-pill-shadow: 0 6px 18px rgba(60, 80, 75, 0.18);
+    --sw-badge-bg: rgba(63, 125, 116, 0.1);
+    --sw-badge-border: rgba(63, 125, 116, 0.25);
+    --sw-card-bg: #fdfcfa;
+    --sw-card-border: #dcd8cc;
+    --sw-card-shadow: 0 18px 40px rgba(70, 80, 75, 0.18);
+    --sw-radius: 16px;
+    --sw-header-bg: #f6f4ef;
+    --sw-tabwell: #ecebe4;
+    --sw-tab-active-bg: #ffffff;
+    --sw-tab-active-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+    --sw-line: #e5e2d8;
+    --sw-status-bg: #eef4ef;
+    --sw-ok: #2e7d5b;
+    --sw-status-err: #b4483c;
+    --sw-status-err-bg: #f9e9e6;
+    --sw-banner-bg: #f0f5f1;
+    --sw-banner-border: #d5e2d8;
+    --sw-panel-bg: #f7f6f1;
+    --sw-text: #2c303a;
+    --sw-text-soft: #4b5563;
+    --sw-muted: #8a92a0;
+    --sw-placeholder: #a8adb8;
+    --sw-input-bg: #ffffff;
+    --sw-input-border: #d7d3c7;
+    --sw-input-radius: 8px;
+    --sw-focus-ring: 0 0 0 3px rgba(63, 125, 116, 0.14);
+    --sw-btn-bg: #ffffff;
+    --sw-btn-border: #d7d3c7;
+    --sw-btn-text: #4b5563;
+    --sw-btn-hover-bg: rgba(63, 125, 116, 0.12);
+    --sw-chip-bg: #f1efe8;
+    --sw-chip-border: #ddd9cd;
+    --sw-chip-text: #4b5563;
+    --sw-chip-sel-bg: #dcebe7;
+    --sw-chip-sel-border: #3f7d74;
+    --sw-chip-sel-text: #2f6259;
+    --sw-primary-bg: #3f7d74;
+    --sw-primary-text: #ffffff;
+    --sw-primary-shadow: 0 4px 12px rgba(63, 125, 116, 0.3);
+    --sw-warn-text: #b4483c;
+    --sw-warn-bg: #f9e9e6;
+    --sw-info-text: #3a6ea8;
+    --sw-info-bg: #e9f1fa;
+    --sw-info-border: rgba(58, 110, 168, 0.25);
+    --sw-footer-bg: #f2f0ea;
+    --sw-scrollbar: rgba(63, 125, 116, 0.35);
+    --sw-item-off: #8a92a0;
+}
+
+/* ---------- 主题 B · 抹茶乳霜 (matcha) ---------- */
+:root[data-sw-theme="matcha"] {
+    --sw-accent: #5c8a58;
+    --sw-accent-bright: #47704a;
+    --sw-accent-line: rgba(92, 138, 88, 0.3);
+    --sw-accent-tint: rgba(92, 138, 88, 0.12);
+    --sw-pill-bg: #ffffff;
+    --sw-pill-border: rgba(92, 138, 88, 0.45);
+    --sw-pill-shadow: 0 6px 18px rgba(80, 110, 75, 0.18);
+    --sw-badge-bg: rgba(92, 138, 88, 0.12);
+    --sw-badge-border: rgba(92, 138, 88, 0.28);
+    --sw-card-bg: #fbfdf7;
+    --sw-card-border: #d5e2cf;
+    --sw-card-shadow: 0 16px 36px rgba(80, 110, 75, 0.18);
+    --sw-radius: 18px;
+    --sw-header-bg: #f1f6ea;
+    --sw-tabwell: #e7efe0;
+    --sw-tab-active-bg: #ffffff;
+    --sw-tab-active-shadow: 0 1px 4px rgba(60, 90, 55, 0.12);
+    --sw-line: #e2ebd8;
+    --sw-status-bg: #ecf4e6;
+    --sw-ok: #3e7d46;
+    --sw-status-err: #b45f4d;
+    --sw-status-err-bg: #f7e8e2;
+    --sw-banner-bg: #eff5e8;
+    --sw-banner-border: #d8e5cf;
+    --sw-panel-bg: #f4f8ee;
+    --sw-text: #33402f;
+    --sw-text-soft: #55654f;
+    --sw-muted: #8a997f;
+    --sw-placeholder: #a9b69c;
+    --sw-input-bg: #ffffff;
+    --sw-input-border: #cfdcc6;
+    --sw-input-radius: 10px;
+    --sw-focus-ring: 0 0 0 3px rgba(92, 138, 88, 0.15);
+    --sw-btn-bg: #ffffff;
+    --sw-btn-border: #cfdcc6;
+    --sw-btn-text: #55654f;
+    --sw-btn-hover-bg: rgba(92, 138, 88, 0.12);
+    --sw-chip-bg: #edf3e4;
+    --sw-chip-border: #d5e2cf;
+    --sw-chip-text: #55654f;
+    --sw-chip-sel-bg: #dcebdb;
+    --sw-chip-sel-border: #5c8a58;
+    --sw-chip-sel-text: #47704a;
+    --sw-primary-bg: #5c8a58;
+    --sw-primary-text: #ffffff;
+    --sw-primary-shadow: 0 4px 12px rgba(92, 138, 88, 0.3);
+    --sw-warn-text: #b45f4d;
+    --sw-warn-bg: #f7e8e2;
+    --sw-info-text: #4a7a9b;
+    --sw-info-bg: #eaf3f5;
+    --sw-info-border: rgba(74, 122, 155, 0.25);
+    --sw-footer-bg: #eef3e2;
+    --sw-scrollbar: rgba(92, 138, 88, 0.35);
+    --sw-item-off: #8a997f;
+}
+
+/* ---------- 外层容器与胶囊 ---------- */
 #tiandao_floating_widget {
     position: fixed;
-    top: 85px;
+    top: 80px;
     right: 25px;
     z-index: 9999;
     font-family: inherit;
     user-select: none;
+    -webkit-font-smoothing: antialiased;
 }
 
-/* 胶囊状态栏按钮 (Pill) */
 .tiandao-widget-pill {
-    display: flex;
+    display: inline-flex;
     align-items: center;
-    gap: 8px;
-    padding: 7px 14px;
-    background: rgba(22, 24, 30, 0.88);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border: 1px solid rgba(224, 194, 128, 0.45);
-    border-radius: 20px;
-    color: #e0c280;
-    font-weight: 500;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+    gap: 9px;
+    padding: 7px 15px;
+    background: var(--sw-pill-bg);
+    border: 1px solid var(--sw-pill-border);
+    border-radius: 22px;
+    color: var(--sw-accent);
+    font-weight: 600;
+    box-shadow: var(--sw-pill-shadow);
     cursor: pointer;
-    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .tiandao-widget-pill:hover {
-    transform: translateY(-2px);
-    border-color: #f3d48d;
-    box-shadow: 0 6px 20px rgba(224, 194, 128, 0.25);
+    transform: translateY(-2px) scale(1.02);
+    border-color: var(--sw-accent);
+    box-shadow: var(--sw-pill-shadow), 0 0 0 3px var(--sw-accent-tint);
 }
 
-.tiandao-pill-badge {
-    font-size: 0.78em;
-    background: rgba(224, 194, 128, 0.18);
-    color: #d1b474;
-    padding: 2px 7px;
-    border-radius: 10px;
+.tiandao-widget-pill.tiandao-pill-paused {
+    color: var(--sw-muted);
+    border-color: var(--sw-card-border);
+    box-shadow: var(--sw-pill-shadow);
 }
 
-/* 展开卡片主容器 */
-.tiandao-widget-card {
-    position: absolute;
-    top: 42px;
-    right: 0;
-    width: 350px;
-    max-height: 580px;
-    background: rgba(18, 20, 26, 0.95);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    border: 1px solid rgba(224, 194, 128, 0.35);
-    border-radius: 12px;
-    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.7);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    animation: tiandaoFadeIn 0.2s ease-out;
+.tiandao-widget-pill.tiandao-pill-paused .tiandao-pill-title i,
+.tiandao-widget-pill.tiandao-pill-paused .tiandao-pill-badge {
+    color: var(--sw-muted);
 }
 
-@keyframes tiandaoFadeIn {
-    from { opacity: 0; transform: translateY(-8px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-
-/* 卡片顶部导航栏 */
-.tiandao-card-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 12px;
-    background: rgba(255, 255, 255, 0.04);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.tiandao-card-tabs {
-    display: flex;
-    gap: 4px;
-    background: rgba(0, 0, 0, 0.3);
-    padding: 2px;
-    border-radius: 8px;
-}
-
-.tiandao-tab-btn {
-    background: transparent;
-    border: none;
-    outline: none;
-    color: #aaa;
-    padding: 5px 12px;
-    font-size: 0.85em;
-    font-weight: 500;
-    border-radius: 6px;
-    cursor: pointer;
-    transition: all 0.15s ease;
+.tiandao-pill-title {
+    font-size: 0.92em;
+    font-weight: 700;
+    letter-spacing: 0.5px;
     display: inline-flex;
     align-items: center;
     gap: 6px;
 }
 
-.tiandao-tab-btn:hover {
-    color: #e0c280;
-    background: rgba(255, 255, 255, 0.05);
+.tiandao-pill-title i {
+    color: var(--sw-accent);
 }
 
-.tiandao-tab-btn.active {
-    background: rgba(224, 194, 128, 0.2);
-    color: #f3d48d;
-    font-weight: bold;
+.tiandao-pill-badge {
+    font-size: 0.76em;
+    background: var(--sw-badge-bg);
+    color: var(--sw-accent-bright);
+    padding: 2px 8px;
+    border-radius: 12px;
+    border: 1px solid var(--sw-badge-border);
+    font-weight: 500;
 }
 
-.tiandao-close-btn {
-    cursor: pointer;
-    opacity: 0.75;
-    font-size: 1.25em;
-    color: #ccc;
-    padding: 0 4px;
-    line-height: 1;
-    transition: opacity 0.15s;
-}
-
-.tiandao-close-btn:hover {
-    opacity: 1;
-    color: #ff8080;
-}
-
-/* 顶部即时状态栏 */
-.tiandao-status-bar {
-    font-size: 0.8em;
-    padding: 5px 12px;
-    background: rgba(0, 0, 0, 0.4);
-    color: #a8d8b9;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-/* 卡片主内容滑动区 */
-.tiandao-card-body {
-    padding: 10px 12px;
-    overflow-y: auto;
-    font-size: 0.84em;
-    color: #ddd;
-    line-height: 1.5;
-    flex: 1;
+/* ---------- 展开卡片主容器 ---------- */
+.tiandao-widget-card {
+    position: absolute;
+    top: 44px;
+    right: 0;
+    width: 360px;
+    max-height: 610px;
+    background: var(--sw-card-bg);
+    border: 1px solid var(--sw-card-border);
+    border-radius: var(--sw-radius);
+    box-shadow: var(--sw-card-shadow);
     display: flex;
     flex-direction: column;
+    overflow: hidden;
+    animation: tiandaoCardPop 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes tiandaoCardPop {
+    from { opacity: 0; transform: translateY(-10px) scale(0.97); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* 拖到屏幕边缘时卡片自动换向展开 */
+.tiandao-widget-card.tiandao-open-leftward {
+    right: 0;
+    left: auto;
+}
+
+.tiandao-widget-card.tiandao-open-rightward {
+    right: auto;
+    left: 0;
+}
+
+.tiandao-widget-card.tiandao-open-upward {
+    top: auto;
+    bottom: 44px;
+}
+
+/* ---------- 顶部导航（分段选择器） ---------- */
+.tiandao-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 12px;
+    background: var(--sw-header-bg);
+    border-bottom: 1px solid var(--sw-line);
+}
+
+.tiandao-segmented-control {
+    display: flex;
+    background: var(--sw-tabwell);
+    padding: 3px;
+    border-radius: 9px;
+    border: 1px solid var(--sw-line);
+    gap: 3px;
+}
+
+.tiandao-segment-btn {
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--sw-muted);
+    padding: 5px 11px;
+    font-size: 0.85em;
+    font-weight: 500;
+    border-radius: 7px;
+    cursor: pointer;
+    transition: all 0.18s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+}
+
+.tiandao-segment-btn:hover {
+    color: var(--sw-accent-bright);
+}
+
+.tiandao-segment-btn.active {
+    background: var(--sw-tab-active-bg);
+    color: var(--sw-accent-bright);
+    font-weight: 700;
+    box-shadow: var(--sw-tab-active-shadow);
+}
+
+.tiandao-card-close {
+    background: transparent;
+    border: none;
+    outline: none;
+    cursor: pointer;
+    color: var(--sw-muted);
+    font-size: 1.4em;
+    line-height: 1;
+    padding: 2px 6px;
+    border-radius: 5px;
+    transition: all 0.15s ease;
+}
+
+.tiandao-card-close:hover {
+    color: var(--sw-status-err);
+    background: var(--sw-warn-bg);
+}
+
+/* ---------- 状态栏 ---------- */
+.tiandao-status-bar {
+    font-size: 0.78em;
+    padding: 6px 12px;
+    background: var(--sw-status-bg);
+    color: var(--sw-ok);
+    border-bottom: 1px solid var(--sw-line);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.tiandao-status-bar .tiandao-status-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tiandao-status-bar.error {
+    color: var(--sw-status-err);
+    background: var(--sw-status-err-bg);
+}
+
+/* ---------- 内容滚动区 ---------- */
+.tiandao-card-body {
+    padding: 11px 13px;
+    overflow-y: auto;
+    font-size: 0.84em;
+    color: var(--sw-text);
+    line-height: 1.5;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overscroll-behavior: contain;
+}
+
+.tiandao-card-body::-webkit-scrollbar {
+    width: 6px;
+}
+
+.tiandao-card-body::-webkit-scrollbar-thumb {
+    background: var(--sw-scrollbar);
+    border-radius: 4px;
 }
 
 .tiandao-tab-page {
     width: 100%;
 }
 
-/* 状态账本卡片区块 */
-.tiandao-ledger-list {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-}
-
-.tiandao-card-block {
-    background: rgba(0, 0, 0, 0.28);
-    border: 1px solid rgba(255, 255, 255, 0.06);
-    border-radius: 8px;
-    padding: 8px 10px;
-}
-
-.tiandao-block-title {
-    font-weight: bold;
-    color: #e0c280;
-    margin-bottom: 4px;
+/* ---------- 故事时间横幅 ---------- */
+.tiandao-time-banner {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-size: 0.92em;
-}
-
-.tiandao-block-content {
-    white-space: pre-wrap;
-    word-break: break-all;
-    color: #ccc;
-}
-
-/* 设置项区块 */
-.tiandao-section {
-    background: rgba(0, 0, 0, 0.25);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    gap: 10px;
+    padding: 8px 12px;
+    background: var(--sw-banner-bg);
+    border: 1px solid var(--sw-banner-border);
     border-radius: 8px;
-    padding: 8px 10px;
+    margin-bottom: 10px;
+}
+
+.tiandao-time-label {
+    color: var(--sw-accent);
+    font-weight: 700;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.9em;
+    white-space: nowrap;
+}
+
+.tiandao-time-val {
+    color: var(--sw-text);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+    text-align: right;
+}
+
+/* ---------- 角色卡片 ---------- */
+.tiandao-char-card {
+    background: var(--sw-panel-bg);
+    border: 1px solid var(--sw-line);
+    border-left: 3px solid var(--sw-accent);
+    border-radius: 8px;
+    padding: 8px 11px;
     margin-bottom: 8px;
 }
 
-.tiandao-section-title {
-    font-weight: bold;
-    font-size: 0.9em;
-    margin-bottom: 6px;
-    color: #e0c280;
-    border-bottom: 1px solid rgba(224, 194, 128, 0.2);
-    padding-bottom: 4px;
-}
-
-.tiandao-divider {
-    border: none;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-    margin: 6px 0;
-}
-
-.tiandao-field {
-    display: flex;
-    flex-direction: column;
-    margin-bottom: 6px;
-}
-
-.tiandao-field label {
-    font-size: 0.8em;
-    opacity: 0.85;
-    margin-bottom: 2px;
-}
-
-.tiandao-row {
+.tiandao-char-card-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin: 4px 0;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+}
+
+.tiandao-char-name {
+    color: var(--sw-accent-bright);
+    font-weight: 700;
+    font-size: 0.95em;
+}
+
+.tiandao-char-loc {
+    color: var(--sw-muted);
+    font-size: 0.82em;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.tiandao-char-body {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    color: var(--sw-text-soft);
+}
+
+.tiandao-char-prop {
+    word-break: break-all;
+}
+
+.tiandao-char-prop b {
+    color: var(--sw-text);
+}
+
+.tiandao-char-prop.tag-info {
+    color: var(--sw-info-text);
+    background: var(--sw-info-bg);
+    border: 1px solid var(--sw-info-border);
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-top: 2px;
+}
+
+.tiandao-char-prop.tag-info b {
+    color: var(--sw-info-text);
+}
+
+/* 已摘下的饰品：并入随身道具，弱化显示 */
+.tiandao-item-off {
+    color: var(--sw-item-off);
+    opacity: 0.85;
+}
+
+/* ---------- 待办箱 ---------- */
+.tiandao-todo-box {
+    background: var(--sw-panel-bg);
+    border: 1px solid var(--sw-line);
+    border-radius: 8px;
+    padding: 9px 11px;
+}
+
+.tiandao-todo-title {
+    color: var(--sw-accent);
+    font-weight: 700;
+    font-size: 0.9em;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.tiandao-todo-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.tiandao-todo-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    color: var(--sw-text-soft);
+    font-size: 0.92em;
+    word-break: break-all;
+}
+
+.tiandao-empty-hint {
+    padding: 10px;
+    text-align: center;
+    color: var(--sw-muted);
     font-size: 0.85em;
 }
 
-/* 输入框、下拉框、复选框通用美化 */
+/* ---------- 设置面板 ---------- */
+.tiandao-card-panel {
+    background: var(--sw-panel-bg);
+    border: 1px solid var(--sw-line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+}
+
+.tiandao-panel-title {
+    font-weight: 700;
+    font-size: 0.9em;
+    color: var(--sw-accent);
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border-bottom: 1px solid var(--sw-accent-line);
+    padding-bottom: 5px;
+}
+
+.tiandao-panel-divider {
+    border-top: 1px solid var(--sw-line);
+    margin: 8px 0;
+}
+
+.tiandao-control-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.tiandao-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    font-size: 0.86em;
+}
+
+.tiandao-toggle-label {
+    color: var(--sw-text-soft);
+}
+
+.tiandao-form-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 0.85em;
+    margin: 3px 0;
+}
+
+.tiandao-field-label {
+    color: var(--sw-text-soft);
+    min-width: 0;
+}
+
+.tiandao-input-block {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 8px;
+}
+
+.tiandao-field-caption {
+    font-size: 0.79em;
+    color: var(--sw-muted);
+    margin-bottom: 4px;
+}
+
+/* ---------- 输入控件 ---------- */
+.tiandao-input-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.tiandao-input-icon {
+    position: absolute;
+    left: 9px;
+    color: var(--sw-muted);
+    font-size: 0.85em;
+    pointer-events: none;
+}
+
 .tiandao-input,
 .tiandao-select {
-    background: rgba(0, 0, 0, 0.35);
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    border-radius: 4px;
-    color: #eee;
-    padding: 4px 8px;
-    font-size: 0.88em;
+    width: 100%;
+    background: var(--sw-input-bg);
+    border: 1px solid var(--sw-input-border);
+    border-radius: var(--sw-input-radius);
+    color: var(--sw-text);
+    padding: 6px 10px;
+    font-size: 0.86em;
     outline: none;
-    transition: border-color 0.15s;
+    transition: all 0.18s ease;
     font-family: inherit;
     box-sizing: border-box;
 }
 
-.tiandao-input:focus,
-.tiandao-select:focus {
-    border-color: #e0c280;
+.tiandao-input.with-icon {
+    padding-left: 28px;
 }
 
-.tiandao-input {
-    width: 100%;
+.tiandao-input::placeholder {
+    color: var(--sw-placeholder);
+}
+
+.tiandao-input:focus,
+.tiandao-select:focus {
+    border-color: var(--sw-accent);
+    box-shadow: var(--sw-focus-ring);
 }
 
 .tiandao-select {
-    max-width: 65%;
+    width: auto;
+    max-width: 62%;
+    cursor: pointer;
 }
 
-.tiandao-switch-label {
+.tiandao-select option {
+    background: var(--sw-card-bg);
+    color: var(--sw-text);
+}
+
+.tiandao-input-sm {
+    width: 62px;
+    text-align: center;
+    padding: 4px 6px;
+}
+
+.tiandao-checkbox {
+    accent-color: var(--sw-accent);
+    cursor: pointer;
+    transform: scale(1.15);
+}
+
+/* ---------- 快捷模型标签 ---------- */
+.tiandao-quick-chips {
     display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 5px;
+}
+
+.tiandao-chip {
+    font-size: 0.74em;
+    background: var(--sw-chip-bg);
+    border: 1px solid var(--sw-chip-border);
+    color: var(--sw-chip-text);
+    padding: 2px 7px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.tiandao-chip:hover {
+    border-color: var(--sw-accent);
+    color: var(--sw-accent-bright);
+}
+
+.tiandao-chip.active {
+    background: var(--sw-chip-sel-bg);
+    border-color: var(--sw-chip-sel-border);
+    color: var(--sw-chip-sel-text);
+    font-weight: 600;
+}
+
+.tiandao-link-btn {
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--sw-accent);
+    font-size: 0.77em;
+    cursor: pointer;
+    padding: 0;
+    display: inline-flex;
     align-items: center;
-    gap: 6px;
-    margin: 4px 0;
-    cursor: pointer;
-    font-size: 0.85em;
+    gap: 4px;
+    opacity: 0.85;
+    transition: opacity 0.15s;
 }
 
-.tiandao-switch-label input[type="checkbox"] {
-    accent-color: #e0c280;
-    cursor: pointer;
-    transform: scale(1.05);
+.tiandao-link-btn:hover {
+    opacity: 1;
+    text-decoration: underline;
 }
 
-/* 折叠面板 (details) */
-.tiandao-details {
-    background: rgba(0, 0, 0, 0.2);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 8px;
-    margin-bottom: 8px;
+/* ---------- 折叠面板 ---------- */
+.tiandao-collapsible {
+    background: var(--sw-panel-bg);
+    border: 1px solid var(--sw-line);
+    border-radius: 10px;
+    margin-bottom: 10px;
     overflow: hidden;
 }
 
-.tiandao-details summary {
-    padding: 7px 10px;
+.tiandao-collapsible summary {
+    padding: 8px 12px;
     font-size: 0.86em;
-    font-weight: bold;
-    color: #e0c280;
+    font-weight: 700;
+    color: var(--sw-accent);
     cursor: pointer;
-    background: rgba(255, 255, 255, 0.02);
+    background: transparent;
     outline: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: background 0.15s;
 }
 
-.tiandao-details summary:hover {
-    background: rgba(255, 255, 255, 0.05);
+.tiandao-collapsible summary::-webkit-details-marker {
+    display: none;
 }
 
-.tiandao-section-sub {
-    padding: 8px 10px;
-    border-top: 1px solid rgba(255, 255, 255, 0.05);
+.tiandao-collapsible summary::after {
+    content: "›";
+    margin-left: auto;
+    font-size: 1.15em;
+    color: var(--sw-muted);
+    transition: transform 0.18s ease;
 }
 
-/* 按钮风格 */
+.tiandao-collapsible[open] summary::after {
+    transform: rotate(90deg);
+}
+
+.tiandao-collapsible summary:hover {
+    background: var(--sw-accent-tint);
+}
+
+.tiandao-collapsible-content {
+    padding: 10px 12px;
+    border-top: 1px solid var(--sw-line);
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+
+/* ---------- 按钮 ---------- */
 .tiandao-btn {
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    color: #eee;
-    padding: 4px 10px;
-    border-radius: 5px;
+    background: var(--sw-btn-bg);
+    border: 1px solid var(--sw-btn-border);
+    color: var(--sw-btn-text);
+    padding: 6px 12px;
+    border-radius: 7px;
     font-size: 0.84em;
     cursor: pointer;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 5px;
-    transition: all 0.15s ease;
+    gap: 6px;
+    transition: all 0.18s ease;
     user-select: none;
     box-sizing: border-box;
 }
 
 .tiandao-btn:hover {
-    background: rgba(224, 194, 128, 0.2);
-    border-color: #e0c280;
-    color: #f3d48d;
+    background: var(--sw-btn-hover-bg);
+    border-color: var(--sw-accent);
+    color: var(--sw-accent-bright);
+}
+
+.tiandao-btn-primary {
+    background: var(--sw-primary-bg);
+    border-color: var(--sw-primary-bg);
+    color: var(--sw-primary-text);
+    font-weight: 700;
+}
+
+.tiandao-btn-primary:hover {
+    background: var(--sw-accent-bright);
+    border-color: var(--sw-accent-bright);
+    color: var(--sw-primary-text);
+    box-shadow: var(--sw-primary-shadow);
 }
 
 .tiandao-btn-sm {
-    padding: 2px 7px;
+    padding: 3px 8px;
     font-size: 0.8em;
 }
 
@@ -336,80 +767,54 @@
 }
 
 .tiandao-btn-danger {
-    color: #fca5a5;
-    border-color: rgba(239, 68, 68, 0.3);
+    color: var(--sw-warn-text);
+    border-color: var(--sw-warn-text);
 }
 
 .tiandao-btn-danger:hover {
-    background: rgba(239, 68, 68, 0.2);
-    border-color: #ef4444;
-    color: #fee2e2;
+    background: var(--sw-warn-bg);
+    border-color: var(--sw-warn-text);
+    color: var(--sw-warn-text);
 }
 
-.tiandao-btn-grid {
+.tiandao-action-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 6px;
-    margin-top: 6px;
+    gap: 7px;
 }
 
-.tiandao-btn-row {
-    display: flex;
-    gap: 8px;
-}
-
-/* 最近轮次列表 */
-.tiandao-turns-list {
-    max-height: 180px;
-    overflow-y: auto;
-    font-size: 0.82em;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin-top: 4px;
-}
-
-.tiandao-turn-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 4px 6px;
-    background: rgba(255, 255, 255, 0.05);
-    border-radius: 4px;
-}
-
-.tiandao-turn-item:hover {
-    background: rgba(255, 255, 255, 0.09);
-}
-
-.tiandao-turn-btn {
-    cursor: pointer;
-    color: #a8d8b9;
-    font-weight: 500;
-}
-
-.tiandao-turn-btn:hover {
-    color: #86efac;
-    text-decoration: underline;
-}
-
-/* 卡片底栏 */
+/* ---------- 底栏 ---------- */
 .tiandao-card-footer {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 7px 12px;
-    background: rgba(0, 0, 0, 0.38);
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-    font-size: 0.78em;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--sw-footer-bg);
+    border-top: 1px solid var(--sw-line);
 }
 
-/* 模态弹窗样式 */
+.tiandao-footer-meta {
+    font-size: 0.77em;
+    color: var(--sw-muted);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tiandao-footer-actions {
+    display: flex;
+    gap: 6px;
+}
+
+/* ---------- 账本弹窗（随主题换肤） ---------- */
 .tiandao-modal-container {
     text-align: left;
     max-height: 70vh;
     overflow-y: auto;
     padding: 6px;
+    color: var(--sw-text);
 }
 
 .tiandao-modal-container textarea {
@@ -417,30 +822,235 @@
     min-height: 240px;
     font-family: inherit;
     font-size: 0.88em;
-    background: rgba(0, 0, 0, 0.35);
-    color: #eee;
-    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: var(--sw-input-bg);
+    color: var(--sw-text);
+    border: 1px solid var(--sw-input-border);
+    border-radius: 8px;
+    padding: 10px;
+    box-sizing: border-box;
+    outline: none;
+    line-height: 1.6;
+}
+
+.tiandao-modal-container textarea:focus {
+    border-color: var(--sw-accent);
+    box-shadow: var(--sw-focus-ring);
+}
+
+/* ---------- 移动端适配 ---------- */
+@media (max-width: 600px) {
+    #tiandao_floating_widget {
+        top: 60px;
+        right: 10px;
+    }
+    .tiandao-widget-pill {
+        padding: 5px 12px;
+        font-size: 0.84em;
+    }
+    .tiandao-widget-card {
+        width: min(345px, 94vw);
+        max-height: 78vh;
+    }
+    .tiandao-action-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* ---------- 二级页签（剧情 / 设置内部分页） ---------- */
+.tiandao-subtabs {
+    display: flex;
+    gap: 3px;
+    background: var(--sw-tabwell);
+    border: 1px solid var(--sw-line);
+    border-radius: 8px;
+    padding: 3px;
+    margin-bottom: 10px;
+}
+
+.tiandao-subtab {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--sw-muted);
+    padding: 5px 4px;
+    font-size: 0.82em;
+    font-weight: 500;
     border-radius: 6px;
-    padding: 8px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    white-space: nowrap;
+    font-family: inherit;
+}
+
+.tiandao-subtab:hover {
+    color: var(--sw-accent-bright);
+}
+
+.tiandao-subtab.active {
+    background: var(--sw-tab-active-bg);
+    color: var(--sw-accent-bright);
+    font-weight: 700;
+    box-shadow: var(--sw-tab-active-shadow);
+}
+
+.tiandao-settings-page,
+.tiandao-story-page {
+    width: 100%;
+}
+
+/* ---------- 剧情时间线 ---------- */
+.tiandao-pagehead {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.tiandao-pagecap {
+    color: var(--sw-accent);
+    font-weight: 700;
+    font-size: 0.9em;
+}
+
+.tiandao-pagehint {
+    color: var(--sw-muted);
+    font-size: 0.78em;
+}
+
+.tiandao-story-entry {
+    border-left: 3px solid var(--sw-accent-line);
+    background: var(--sw-panel-bg);
+    border-radius: 6px;
+    padding: 7px 10px;
+    margin-bottom: 7px;
+}
+
+.tiandao-story-entry.strong {
+    border-left-color: var(--sw-accent);
+}
+
+.tiandao-entry-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+    flex-wrap: wrap;
+}
+
+.tiandao-lvl {
+    font-size: 0.72em;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 4px;
+    letter-spacing: 0.5px;
+}
+
+.tiandao-lvl-2 {
+    background: var(--sw-accent);
+    color: var(--sw-primary-text);
+}
+
+.tiandao-lvl-1 {
+    background: var(--sw-chip-sel-bg);
+    color: var(--sw-chip-sel-text);
+    border: 1px solid var(--sw-accent-line);
+}
+
+.tiandao-lvl-0 {
+    background: var(--sw-chip-bg);
+    color: var(--sw-chip-text);
+    border: 1px solid var(--sw-chip-border);
+}
+
+.tiandao-round {
+    color: var(--sw-muted);
+    font-size: 0.78em;
+}
+
+.tiandao-entry-text {
+    font-size: 0.9em;
+    color: var(--sw-text-soft);
+    line-height: 1.65;
+    word-break: break-all;
+    white-space: pre-wrap;
+}
+
+/* ---------- 待办约定清单 ---------- */
+.tiandao-story-check {
+    position: relative;
+    padding-left: 18px;
+    font-size: 0.9em;
+    color: var(--sw-text-soft);
+    line-height: 1.85;
+    word-break: break-all;
+}
+
+.tiandao-story-check::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0.45em;
+    width: 9px;
+    height: 9px;
+    border-radius: 3px;
+    border: 1.5px solid var(--sw-accent);
+}
+
+/* ---------- 剧情总结内联编辑 ---------- */
+.tiandao-entry-edit-btn {
+    margin-left: auto;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--sw-muted);
+    cursor: pointer;
+    font-size: 0.78em;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: all 0.15s ease;
+    font-family: inherit;
+}
+
+.tiandao-entry-edit-btn:hover {
+    color: var(--sw-accent-bright);
+    background: var(--sw-accent-tint);
+}
+
+.tiandao-entry-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.tiandao-entry-editor-input {
+    width: 100%;
+    min-height: 96px;
+    background: var(--sw-input-bg);
+    color: var(--sw-text);
+    border: 1px solid var(--sw-input-border);
+    border-radius: 6px;
+    padding: 7px 9px;
+    font-family: inherit;
+    font-size: 0.9em;
+    line-height: 1.6;
+    outline: none;
+    resize: vertical;
     box-sizing: border-box;
 }
 
-/* 📱 手机端移动端体验优化 */
-@media (max-width: 600px) {
-    #tiandao_floating_widget {
-        top: 65px;
-        right: 12px;
-    }
-    .tiandao-widget-pill {
-        padding: 5px 10px;
-        font-size: 0.86em;
-    }
-    .tiandao-widget-card {
-        width: min(340px, 92vw);
-        max-height: 75vh;
-        right: 0;
-    }
-    .tiandao-btn-grid {
-        grid-template-columns: 1fr;
-    }
+.tiandao-entry-editor-input:focus {
+    border-color: var(--sw-accent);
+    box-shadow: var(--sw-focus-ring);
+}
+
+.tiandao-entry-editor-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
 }
