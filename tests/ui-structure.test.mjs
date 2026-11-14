@@ -111,8 +111,9 @@ test("mobile expanded widget is centered in the viewport and cannot be dragged o
     assert.match(indexSource, /canDrag: \(\) => !\(isWidgetExpanded && isMobileWidgetViewport\(\)\)/);
     assert.match(indexSource, /const maxLeft = Math\.max\(minLeft, window\.innerWidth - width - minLeft\)/);
     assert.match(indexSource, /const maxTop = Math\.max\(minTop, window\.innerHeight - height - minTop\)/);
-    assert.match(styleSource, /#tiandao_floating_widget\.tiandao-widget-expanded \.tiandao-widget-card\s*\{[\s\S]*?position:\s*fixed !important;[\s\S]*?inset:\s*0 !important;[\s\S]*?margin:\s*auto !important;/);
-    assert.match(styleSource, /height:\s*min\(78dvh, calc\(100dvh - 24px\)\) !important/);
+    assert.match(indexSource, /window\.visualViewport\?\.addEventListener\("resize", repositionFloatingWidget\)/);
+    assert.match(styleSource, /#tiandao_floating_widget\.tiandao-widget-expanded\s*\{[\s\S]*?inset:\s*0 !important;[\s\S]*?display:\s*flex !important;[\s\S]*?align-items:\s*center !important;[\s\S]*?justify-content:\s*center !important;/);
+    assert.match(styleSource, /#tiandao_floating_widget\.tiandao-widget-expanded \.tiandao-widget-card\s*\{[\s\S]*?position:\s*relative !important;[\s\S]*?inset:\s*auto !important;[\s\S]*?height:\s*min\(610px, calc\(100dvh - 24px\)\) !important;/);
 });
 
 test("appearance settings are isolated on their own page and persist neutral defaults", () => {

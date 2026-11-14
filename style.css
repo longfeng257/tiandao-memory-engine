@@ -1640,16 +1640,38 @@
         height: 78vh;
         max-height: 78vh;
     }
-    /* 移动端展开后固定在视口中央，不再跟随胶囊坐标，也不参与拖拽。 */
-    #tiandao_floating_widget.tiandao-widget-expanded .tiandao-widget-card {
+    /* 移动端展开后，由铺满视口的外层容器负责居中，卡片不再自行计算 fixed 坐标。 */
+    #tiandao_floating_widget.tiandao-widget-expanded {
         position: fixed !important;
+        top: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        left: 0 !important;
         inset: 0 !important;
+        width: auto !important;
+        height: auto !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        pointer-events: none;
+    }
+    #tiandao_floating_widget.tiandao-widget-expanded .tiandao-widget-card {
+        position: relative !important;
+        top: auto !important;
+        right: auto !important;
+        bottom: auto !important;
+        left: auto !important;
+        inset: auto !important;
         width: min(345px, calc(100vw - 20px)) !important;
-        height: min(78vh, calc(100vh - 24px)) !important;
-        height: min(78dvh, calc(100dvh - 24px)) !important;
+        max-width: calc(100vw - 20px) !important;
+        height: min(610px, calc(100vh - 24px)) !important;
+        height: min(610px, calc(100dvh - 24px)) !important;
         max-height: calc(100vh - 24px) !important;
         max-height: calc(100dvh - 24px) !important;
-        margin: auto !important;
+        margin: 0 !important;
+        box-sizing: border-box;
+        flex: 0 0 auto;
+        pointer-events: auto;
     }
     .tiandao-card-header {
         padding: 7px 8px;

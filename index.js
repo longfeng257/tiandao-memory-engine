@@ -2011,7 +2011,7 @@ function positionFloatingWidgetCard() {
     if (isMobileWidgetViewport()) {
         card.classList.remove("tiandao-open-leftward", "tiandao-open-rightward", "tiandao-open-upward");
         if (isWidgetExpanded) {
-            // 移动端展开面板由 CSS 固定在视口中央，清掉桌面端遗留的内联几何值。
+            // 移动端展开面板由铺满视口的外层容器居中，清掉桌面端遗留的内联几何值。
             ["left", "right", "top", "bottom", "width", "height", "max-height"]
                 .forEach(prop => card.style.removeProperty(prop));
         }
@@ -2939,7 +2939,10 @@ function bindSettingsUI() {
 (async function initTiandaoMemoryExtension() {
     try {
         initFloatingWidget();
-        window.addEventListener("resize", positionFloatingWidgetCard);
+        const repositionFloatingWidget = () => requestAnimationFrame(positionFloatingWidgetCard);
+        window.addEventListener("resize", repositionFloatingWidget);
+        window.addEventListener("orientationchange", repositionFloatingWidget);
+        window.visualViewport?.addEventListener("resize", repositionFloatingWidget);
 
         const ctx = getSTContext();
         const eventSource = ctx.eventSource || window.eventSource;
