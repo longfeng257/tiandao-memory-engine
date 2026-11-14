@@ -7,7 +7,7 @@
   "css": "style.css",
   "generate_interceptor": "tiandaoMemoryInterceptor",
   "author": "Tiandao",
-  "version": "1.9.0",
+  "version": "1.11.0",
   "homePage": "https://github.com/longfeng257/tiandao-memory-engine",
   "auto_update": true
 }

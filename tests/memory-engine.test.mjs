@@ -18,6 +18,10 @@ import {
     callIndependentLLM,
     isAiReplyMessage,
     calculateRoundForMessageIndex,
+    estimatePromptTokens,
+    checkAndCascadeMerge,
+    backfillExistingChatHistory,
+    resolveStateLedgerAfterEntry,
 } from "../memory-engine.js";
 
 function memoryWithRounds(lastRound = 5) {
@@ -50,10 +54,13 @@ function stubChatCompletion(summaryText, mergeFails = false) {
     globalThis.fetch = async (_url, options = {}) => {
         const body = JSON.parse(options.body || "{}");
         const isMerge = body.messages?.[0]?.content?.includes("叙事剧情时间线提炼引擎");
+        const isFarHistory = body.messages?.[0]?.content?.includes("编年史整理器");
         if (isMerge && mergeFails) {
             return new Response("merge failed", { status: 500 });
         }
-        const content = isMerge
+        const content = isFarHistory
+            ? "景和三年春，众人在旧城立下约定；数月后局势骤变。"
+            : isMerge
             ? "合并后的阶段剧情。"
             : JSON.stringify({
                 l0_summary: summaryText,
@@ -121,24 +128,24 @@ test("rollback keeps L0 already covered by surviving higher levels out of active
 });
 
 test("merge failure keeps memory unchanged and retry does not duplicate L0", async () => {
-    const data = memoryWithRounds(1);
+    const data = memoryWithRounds(7);
     stubChatCompletion("第二轮摘要", true);
     const turn = {
-        roundNumber: 2,
-        startMessageId: 2,
-        endMessageId: 3,
+        roundNumber: 8,
+        startMessageId: 14,
+        endMessageId: 15,
         userName: "我",
         charName: "小明",
-        dialogueText: "第二轮对话",
+        dialogueText: "第八轮对话",
     };
 
     await assert.rejects(() => summarizeSingleTurn(SETTINGS, data, turn), /API 请求失败/);
-    assert.deepEqual(data.levels[0].map(x => x.roundRange), ["1"]);
-    assert.equal(data.lastProcessedMessageId, 1);
+    assert.deepEqual(data.levels[0].map(x => x.roundRange), ["1", "2", "3", "4", "5", "6", "7"]);
+    assert.equal(data.lastProcessedMessageId, 13);
 
     await assert.rejects(() => summarizeSingleTurn(SETTINGS, data, turn), /API 请求失败/);
-    assert.deepEqual(data.levels[0].map(x => x.roundRange), ["1"]);
-    assert.equal(data.archivePool.filter(x => x.roundRange === "2").length, 0);
+    assert.deepEqual(data.levels[0].map(x => x.roundRange), ["1", "2", "3", "4", "5", "6", "7"]);
+    assert.equal(data.archivePool.filter(x => x.roundRange === "8").length, 0);
 });
 
 test("removed item locks are inherited unless explicitly unlocked", () => {
@@ -229,21 +236,201 @@ test("auto-hide never crosses unprocessed messages", () => {
 });
 
 test("rebuilding hierarchy uses edited L0 text", async () => {
-    const data = memoryWithRounds(4);
-    data.levels[1].push({
-        id: "old_L1",
-        level: 1,
-        roundRange: "1-4",
-        text: "旧的高层摘要",
-    });
+    const data = memoryWithRounds(40);
     data.levels[0][0].text = "编辑后的第一轮";
     stubChatCompletion("重建摘要");
 
     await rebuildMemoryHierarchy(SETTINGS, data);
-    assert.equal(data.levels[1].length, 0);
-    assert.equal(data.levels[2].length, 1);
-    assert.equal(data.levels[0].length, 0);
+    assert.ok(data.levels[0].length >= 6);
+    assert.ok(data.levels[1].length > 0);
+    assert.ok(data.levels[2].length > 0);
+    assert.ok(data.levels[3].length > 0);
+    assert.doesNotMatch(JSON.stringify(data.levels[1]), /旧的高层摘要/);
     assert.equal(data.archivePool[0].text, "编辑后的第一轮");
+});
+
+test("top memory level keeps anchors and recent entries without growing forever", () => {
+    const data = createEmptyMemoryData();
+    for (let round = 1; round <= 100; round += 5) {
+        data.levels[3].push({
+            id: `L3_${round}`,
+            level: 3,
+            roundRange: `${round}-${round + 4}`,
+            text: `阶段${round}`,
+        });
+    }
+
+    normalizeMemoryData(data);
+    assert.equal(data.levels[3].length, 16);
+    assert.equal(data.levels[3][0].roundRange, "1-5");
+    assert.equal(data.levels[3].at(-1).roundRange, "96-100");
+    assert.equal(data.fadedHistory.count, 4);
+    assert.equal(data.pendingFarHistory.length, 4);
+    assert.equal(data.fadedHistory.earliestRound, 21);
+    assert.equal(data.fadedHistory.latestRound, 40);
+});
+
+test("far history is folded into one story-time summary", async () => {
+    const data = createEmptyMemoryData();
+    data.pendingFarHistory = [
+        { roundRange: "1-5", text: "第一阶段的旧事", level: 3 },
+        { roundRange: "6-10", text: "第二阶段的旧事", level: 3 },
+    ];
+    stubChatCompletion("不应使用");
+
+    await checkAndCascadeMerge(SETTINGS, data);
+    assert.equal(data.pendingFarHistory.length, 0);
+    assert.match(data.farHistory.text, /景和三年春/);
+    assert.equal(data.farHistory.earliestRound, 1);
+    assert.equal(data.farHistory.latestRound, 10);
+});
+
+test("memory prompt respects the configured token budget", () => {
+    const data = createEmptyMemoryData();
+    data.stateLedger = {
+        time: "未知",
+        characters: {
+            玩家: {
+                canonicalName: "玩家",
+                aliases: [],
+                location: "极长地点名".repeat(300),
+                statusAndAction: "极长状态".repeat(800),
+                wear: "极长衣着".repeat(300),
+                removedItemsLock: [],
+                inventory: [],
+                present: true,
+            },
+        },
+        todosAndPromises: [],
+    };
+    for (let lvl = 1; lvl <= 3; lvl++) {
+        for (let i = 0; i < 16; i++) {
+            data.levels[lvl].push({
+                id: `L${lvl}_${i}`,
+                level: lvl,
+                roundRange: `${i + 1}`,
+                text: "长篇剧情摘要".repeat(80),
+            });
+        }
+    }
+    for (let i = 0; i < 8; i++) {
+        data.levels[0].push({
+            id: `L0_${i}`,
+            level: 0,
+            roundRange: `${i + 1}`,
+            text: "最近剧情摘要".repeat(30),
+        });
+    }
+
+    const prompt = buildInjectedMemoryPrompt(data, [], "", 1000);
+    assert.ok(estimatePromptTokens(prompt) <= 1000);
+});
+
+test("raw recent rounds are not duplicated as injected L0 summaries", () => {
+    const data = createEmptyMemoryData();
+    data.stateLedger = { time: "未知", characters: {}, todosAndPromises: [] };
+    for (let round = 1; round <= 8; round++) {
+        data.levels[0].push({
+            id: `L0_${round}`,
+            level: 0,
+            roundRange: String(round),
+            startMessageId: round * 2 - 2,
+            endMessageId: round * 2 - 1,
+            text: `第${round}轮摘要`,
+        });
+    }
+
+    const prompt = buildInjectedMemoryPrompt(data, [], "", 5000, {
+        recentRawRounds: 5,
+        currentRound: 8,
+    });
+    assert.match(prompt, /第1轮摘要/);
+    assert.match(prompt, /第3轮摘要/);
+    assert.doesNotMatch(prompt, /第4轮摘要/);
+    assert.doesNotMatch(prompt, /第8轮摘要/);
+});
+
+test("history backfill saves in batches instead of after every round", async () => {
+    const data = createEmptyMemoryData();
+    const chat = [];
+    for (let round = 1; round <= 6; round++) {
+        chat.push({ is_user: true, mes: `玩家 ${round}` });
+        chat.push({ is_user: false, name: "角色", mes: `回复 ${round}` });
+    }
+    stubChatCompletion("批量总结");
+    let saves = 0;
+    const result = await backfillExistingChatHistory(
+        { ...SETTINGS, mergeChunkSize: 20 },
+        data,
+        chat,
+        "玩家",
+        "角色",
+        {
+            saveEvery: 2,
+            onChunkSaved: async () => { saves++; },
+        },
+    );
+
+    assert.equal(result.processedCount, 6);
+    assert.equal(saves, 3);
+});
+
+test("state snapshots use keyframes plus deltas without losing rollback accuracy", async () => {
+    const data = memoryWithRounds(1);
+    stubChatCompletion("第二轮摘要");
+    await summarizeSingleTurn(SETTINGS, data, {
+        roundNumber: 2,
+        startMessageId: 2,
+        endMessageId: 3,
+        userName: "我",
+        charName: "小明",
+        dialogueText: "第二轮对话",
+    });
+
+    const second = data.archivePool.find(item => item.roundRange === "2");
+    assert.equal(second.postStateSnapshot, undefined);
+    assert.ok(second.postStateDelta);
+    const state = resolveStateLedgerAfterEntry(data, second);
+    assert.equal(state.characters.小明.location, "客厅");
+
+    assert.equal(rollbackMemoryFromMessageIndex(data, 2), true);
+    assert.equal(data.stateLedger.characters.小明, undefined);
+});
+
+test("legacy full snapshots are migrated to keyframes and deltas on load", () => {
+    const data = createEmptyMemoryData();
+    data.stateStorageVersion = 1;
+    for (let round = 1; round <= 3; round++) {
+        const entry = {
+            id: `L0_${round}`,
+            level: 0,
+            roundRange: String(round),
+            startMessageId: round * 2 - 2,
+            endMessageId: round * 2 - 1,
+            text: `第${round}轮`,
+            postStateSnapshot: {
+                time: `第${round}日`,
+                characters: {
+                    小明: {
+                        location: `地点${round}`,
+                        statusAndAction: "等待",
+                        wear: "长衣",
+                        removedItemsLock: [],
+                        inventory: [],
+                    },
+                },
+                todosAndPromises: [],
+            },
+        };
+        data.levels[0].push(entry);
+        data.archivePool.push(entry);
+    }
+
+    normalizeMemoryData(data);
+    assert.equal(data.archivePool[0].postStateSnapshot.time, "第1日");
+    assert.equal(data.archivePool[1].postStateSnapshot, undefined);
+    assert.ok(data.archivePool[1].postStateDelta);
+    assert.equal(resolveStateLedgerAfterEntry(data, data.archivePool[2]).characters.小明.location, "地点3");
 });
 
 test("safeParseJSON tolerates code fences, commentary and trailing commas", () => {
@@ -310,9 +497,10 @@ test("summary retries malformed model output without duplicating L0", async () =
 });
 
 test("empty strip tags mean no built-in tags are removed", () => {
-    const text = "<thinking>内部推理</thinking>正文内容";
+    const text = "<thinking>内部推理</thinking>正文内容<details>完整设定</details>";
     assert.equal(cleanMessageText(text, "", ""), text);
-    assert.equal(cleanMessageText(text, "", "thinking"), "正文内容");
+    assert.equal(cleanMessageText(text, "", "thinking"), "正文内容<details>完整设定</details>");
+    assert.equal(cleanMessageText(text, "", "thinking,details"), "正文内容");
 });
 
 test("injected ledger puts the user's own entry first", () => {
@@ -493,6 +681,35 @@ test("JSON mode falls back once when a provider rejects response_format", async 
     assert.equal(bodies.length, 2);
     assert.equal(bodies[0].response_format.type, "json_object");
     assert.equal(bodies[1].response_format, undefined);
+});
+
+test("summary API requests honor an external abort signal", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+        () => callIndependentLLM(SETTINGS, [{ role: "user", content: "测试" }], {
+            signal: controller.signal,
+        }),
+        error => error?.name === "AbortError" && /已停止/.test(error.message),
+    );
+});
+
+test("external stop rejects even when the transport ignores abort", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Promise(() => {});
+    const controller = new AbortController();
+    try {
+        const request = callIndependentLLM(SETTINGS, [{ role: "user", content: "测试" }], {
+            signal: controller.signal,
+        });
+        setTimeout(() => controller.abort(), 5);
+        await assert.rejects(
+            request,
+            error => error?.name === "AbortError" && /已停止/.test(error.message),
+        );
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
 });
 
 test("rate limit responses expose Retry-After to the retry loop", async () => {

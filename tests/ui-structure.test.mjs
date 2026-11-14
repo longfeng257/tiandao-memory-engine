@@ -26,6 +26,27 @@ test("status bar starts hidden and contains transient status logic", () => {
     assert.match(indexSource, /statusBarHideTimer = setTimeout/);
 });
 
+test("summary progress is a separate persistent task panel with stop and progress", () => {
+    assert.match(indexSource, /id="tiandao_summary_progress"[^>]*style="display:none;"/);
+    assert.match(indexSource, /id="tiandao_summary_progress_counter"/);
+    assert.match(indexSource, /id="tiandao_summary_progress_bar"/);
+    assert.match(indexSource, /id="tiandao_summary_progress_stop"/);
+    assert.match(indexSource, /function beginSummaryTask\(/);
+    assert.match(indexSource, /function requestSummaryTaskStop\(/);
+    assert.match(indexSource, /task\.controller\.abort\(\)/);
+    assert.match(indexSource, /finishSummaryTask\(task\)/);
+    assert.match(styleSource, /\.tiandao-summary-progress\s*\{/);
+    assert.match(styleSource, /\.tiandao-summary-progress-bar\s*\{/);
+});
+
+test("backfill and story rebuild pass cancellation signals into summary work", () => {
+    assert.match(indexSource, /backfillExistingChatHistory\([\s\S]{0,2200}shouldCommitTurn:[\s\S]{0,160}signal,/);
+    assert.match(indexSource, /runStoryResummarize[\s\S]{0,2200}beginSummaryTask/);
+    assert.match(indexSource, /rebuildMemoryHierarchy\([\s\S]{0,400}\{ signal \}/);
+    assert.match(indexSource, /resummarizeRoundInPlace\([\s\S]{0,500}signal/);
+    assert.match(indexSource, /isSummaryTaskCancelled\(task\)/);
+});
+
 test("story range exposes fill, view and rebuild modes plus recovery entry", () => {
     assert.match(indexSource, /id="tiandao_story_range_from"/);
     assert.match(indexSource, /id="tiandao_story_range_to"/);
@@ -75,6 +96,72 @@ test("expanded widget hides the pill and uses the card as its drag surface", () 
     assert.match(indexSource, /tiandao-widget-expanded/);
     assert.match(indexSource, /handle\.closest\("\.tiandao-widget-card"\)/);
     assert.match(styleSource, /\.tiandao-widget-expanded \.tiandao-widget-card/);
+});
+
+test("floating widget opens toward the side with enough viewport space", () => {
+    assert.match(indexSource, /const spaceRight = Math\.max\(0, vw - rect\.left - 10\)/);
+    assert.match(indexSource, /const spaceLeft = Math\.max\(0, rect\.right - 10\)/);
+    assert.match(indexSource, /const openRightward = spaceRight >= desiredWidth/);
+    assert.match(indexSource, /const horizontalShift = clampedLeft - proposedLeft/);
+    assert.doesNotMatch(indexSource, /const openRightward = rect\.left < desiredWidth/);
+});
+
+test("appearance settings are isolated on their own page and persist neutral defaults", () => {
+    assert.match(engineSource, /widgetFontScale:\s*100/);
+    assert.match(engineSource, /widgetFontFamily:\s*"inherit"/);
+    assert.match(indexSource, /data-page="appearance"/);
+    assert.match(indexSource, /id="tiandao_widget_theme"/);
+    assert.match(indexSource, /id="tiandao_font_family"/);
+    assert.match(indexSource, /id="tiandao_font_scale"/);
+    assert.match(indexSource, /id="tiandao_reset_appearance_btn"/);
+    assert.match(indexSource, /function applyWidgetAppearance\(\)/);
+    assert.match(styleSource, /--sw-font-scale/);
+    assert.match(styleSource, /:root\[data-sw-font="sans"\]/);
+});
+
+test("memory depth and safety token cap stay internal", () => {
+    assert.doesNotMatch(indexSource, /id="tiandao_max_level"/);
+    assert.doesNotMatch(indexSource, /id="tiandao_memory_budget"/);
+    assert.match(engineSource, /const MAX_MEMORY_LEVEL = 3/);
+    assert.match(engineSource, /tokenBudget = 5000/);
+    assert.match(engineSource, /function capTopLevelEntries\(/);
+});
+
+test("raw recent rounds default to five and recent L0 summaries are not duplicated", () => {
+    assert.match(engineSource, /keepRecentRoundsCount:\s*5/);
+    assert.match(indexSource, /numOr\(settings\.keepRecentRoundsCount, 5\)/);
+    assert.match(engineSource, /recentRawRounds/);
+    assert.match(engineSource, /rawWindowStart/);
+});
+
+test("long-chat performance paths avoid repeated full work", () => {
+    assert.match(engineSource, /saveEvery = 5/);
+    assert.match(engineSource, /\(i \+ 1\) % batchSaveSize === 0/);
+    assert.match(engineSource, /memorySearchTokenCache/);
+    assert.match(indexSource, /const storyVisible = document\.getElementById\("tiandao_tab_story_content"\)/);
+    assert.match(indexSource, /if \(storyVisible\) \{/);
+    assert.match(indexSource, /label: "重建高层记忆"/);
+    assert.match(indexSource, /rebuildMemoryHierarchy\([\s\S]{0,500}\{ signal \}/);
+});
+
+test("story timeline paginates twenty entries with older and newer controls", () => {
+    assert.match(indexSource, /const STORY_PAGE_SIZE = 20/);
+    assert.match(indexSource, /Math\.ceil\(entries\.length \/ STORY_PAGE_SIZE\)/);
+    assert.match(indexSource, /data-story-page="older"/);
+    assert.match(indexSource, /data-story-page="newer"/);
+    assert.match(indexSource, /storyPage \+= button\.dataset\.storyPage === "older" \? 1 : -1/);
+    assert.match(styleSource, /\.tiandao-story-pager\s*\{/);
+    assert.match(styleSource, /\.tiandao-story-page-btn\s*\{/);
+});
+
+test("pending automatic summaries queue instead of being dropped", () => {
+    assert.match(indexSource, /function enqueuePendingAiTurns\(chat, upToIndex, options = \{\}\)[\s\S]{0,2600}enqueueBackgroundSummary\(async \(\) => \{[\s\S]{0,300}beginSummaryTask/);
+    assert.doesNotMatch(indexSource, /function enqueuePendingAiTurns\(chat, upToIndex, options = \{\}\)[\s\S]{0,1000}if \(activeSummaryTask\) \{[\s\S]{0,200}return null;/);
+});
+
+test("legacy state snapshot migration is persisted after load", () => {
+    assert.match(indexSource, /previousStateStorageVersion = metadata\.tiandao_memory\.stateStorageVersion/);
+    assert.match(indexSource, /previousStateStorageVersion !== memoryData\.stateStorageVersion[\s\S]{0,120}scheduleChatSave\(\)/);
 });
 
 test("story range stays on one compact row", () => {

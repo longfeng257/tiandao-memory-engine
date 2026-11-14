@@ -11,6 +11,7 @@ import {
     calculateRoundForMessageIndex,
     retrieveRelevantArchivedMemories,
     buildInjectedMemoryPrompt,
+    estimatePromptTokens,
     mergeEditedMemoryWithEmbeddings,
     backfillExistingChatHistory,
     shouldSettleBeforeGeneration,
@@ -21,6 +22,7 @@ import {
     pruneStaleCharacters,
     parseRoundRange,
     isAiReplyMessage,
+    resolveStateLedgerAfterEntry,
 } from "./memory-engine.js";
 
 const EXTENSION_NAME = "tiandao-memory-engine";
@@ -39,6 +41,9 @@ const activeSummaryChats = new Set();
 let chatSaveTimer = null;
 let lastChatFingerprint = [];
 let statusBarHideTimer = null;
+let summaryTaskSequence = 0;
+let activeSummaryTask = null;
+let lastMemoryPromptTokens = 0;
 
 // 设置输入框登记表：支持“输入即保存”，并在按钮点击前强制落盘
 const settingsInputRegistry = [];
@@ -204,7 +209,7 @@ function getSettings() {
     // 兼容旧配置项迁移
     if (s.keepRecentRoundsCount === undefined) {
         const oldMessagesCount = s.keepRecentMessagesCount;
-        s.keepRecentRoundsCount = oldMessagesCount ? Math.max(1, Math.round(oldMessagesCount / 2)) : "";
+        s.keepRecentRoundsCount = oldMessagesCount ? Math.max(1, Math.round(oldMessagesCount / 2)) : 5;
     }
     for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
         if (s[k] === undefined) {
@@ -371,7 +376,11 @@ function getChatMemory() {
     if (!metadata.tiandao_memory) {
         metadata.tiandao_memory = createEmptyMemoryData();
     }
+    const previousStateStorageVersion = metadata.tiandao_memory.stateStorageVersion;
     const memoryData = normalizeMemoryData(metadata.tiandao_memory);
+    if (previousStateStorageVersion !== memoryData.stateStorageVersion) {
+        scheduleChatSave();
+    }
     cleanupPlaceholderCharacters(memoryData, ctx.name1 || "");
     return memoryData;
 }
@@ -403,13 +412,107 @@ function updateStatusBar(text, isError = false) {
     }, isError ? 9000 : 3500);
 }
 
+function beginSummaryTask({ label, total = 1, canCancel = true } = {}) {
+    if (activeSummaryTask) return null;
+    const task = {
+        id: `summary-task-${++summaryTaskSequence}`,
+        label: String(label || "总结剧情"),
+        current: 0,
+        total: Math.max(1, numOr(total, 1)),
+        roundNumber: 0,
+        detail: "准备开始",
+        canCancel: Boolean(canCancel),
+        cancelRequested: false,
+        controller: new AbortController(),
+        startedAt: Date.now(),
+    };
+    activeSummaryTask = task;
+    renderSummaryProgress();
+    return task;
+}
+
+function updateSummaryTask(task, patch = {}) {
+    if (!task || activeSummaryTask !== task) return;
+    Object.assign(task, patch);
+    if (patch.total !== undefined) task.total = Math.max(1, numOr(patch.total, 1));
+    if (patch.current !== undefined) task.current = Math.max(0, numOr(patch.current, 0));
+    renderSummaryProgress();
+}
+
+function finishSummaryTask(task) {
+    if (!task || activeSummaryTask !== task) return;
+    activeSummaryTask = null;
+    renderSummaryProgress();
+}
+
+function requestSummaryTaskStop() {
+    const task = activeSummaryTask;
+    if (!task || task.cancelRequested) return;
+    task.cancelRequested = true;
+    task.detail = "正在安全停止，当前请求会立即中断";
+    task.controller.abort();
+    renderSummaryProgress();
+    updateStatusBar("⏸️ 已请求停止总结");
+}
+
+function isSummaryTaskCancelled(task = activeSummaryTask) {
+    return Boolean(task?.cancelRequested || task?.controller?.signal?.aborted);
+}
+
+function renderSummaryProgress() {
+    const box = document.getElementById("tiandao_summary_progress");
+    if (!box) return;
+    const task = activeSummaryTask;
+    if (!task) {
+        box.style.display = "none";
+        return;
+    }
+
+    box.style.display = "flex";
+    const title = document.getElementById("tiandao_summary_progress_title");
+    const detail = document.getElementById("tiandao_summary_progress_detail");
+    const counter = document.getElementById("tiandao_summary_progress_counter");
+    const bar = document.getElementById("tiandao_summary_progress_bar");
+    const stopBtn = document.getElementById("tiandao_summary_progress_stop");
+
+    if (title) title.textContent = task.label;
+    if (detail) {
+        detail.textContent = task.cancelRequested
+            ? "正在安全停止，当前请求会立即中断"
+            : (task.detail || "正在总结");
+    }
+    if (counter) {
+        counter.textContent = task.total > 1 ? `${task.current}/${task.total}` : "";
+    }
+    if (bar) {
+        const percent = task.total > 0
+            ? Math.min(100, Math.max(0, (task.current / task.total) * 100))
+            : 0;
+        bar.style.width = `${percent}%`;
+    }
+    if (stopBtn) {
+        stopBtn.style.display = task.canCancel ? "inline-flex" : "none";
+        stopBtn.disabled = task.cancelRequested;
+        stopBtn.innerHTML = task.cancelRequested
+            ? '<i class="fa-solid fa-spinner fa-spin"></i><span>停止中</span>'
+            : '<i class="fa-solid fa-stop"></i><span>停止</span>';
+    }
+}
+
 /**
- * 应用内置看板主题（瓷白精修 / 书页叙事）：
- * 写在 <html data-sw-theme> 上，悬浮窗、状态栏与账本弹窗全部同步换肤
+ * 应用内置看板主题与字体外观：
+ * 写在 <html> 上，悬浮窗、状态栏与账本弹窗全部同步换肤和缩放
  */
-function applyWidgetTheme() {
-    const theme = getSettings().widgetTheme === "journal" ? "journal" : "porcelain";
+function applyWidgetAppearance() {
+    const settings = getSettings();
+    const theme = settings.widgetTheme === "journal" ? "journal" : "porcelain";
+    const fontFamily = ["inherit", "sans", "serif"].includes(settings.widgetFontFamily)
+        ? settings.widgetFontFamily
+        : "inherit";
+    const fontScale = Math.min(130, Math.max(85, numOr(settings.widgetFontScale, 100)));
     document.documentElement.dataset.swTheme = theme;
+    document.documentElement.dataset.swFont = fontFamily;
+    document.documentElement.style.setProperty("--sw-font-scale", String(fontScale / 100));
 }
 
 function buildRecentContextQuery(chat, targetContentTags, customStripTags) {
@@ -432,6 +535,7 @@ async function refreshPromptInjection(customQuery = "") {
     if (typeof ctx.setExtensionPrompt !== "function") return;
 
     if (!settings.enabled) {
+        lastMemoryPromptTokens = 0;
         ctx.setExtensionPrompt(
             PROMPT_KEY,
             "",
@@ -448,6 +552,7 @@ async function refreshPromptInjection(customQuery = "") {
         || Object.keys(memoryData.stateLedger?.characters || {}).length > 0
         || (memoryData.stateLedger?.todosAndPromises || []).length > 0;
     if (!hasMemory) {
+        lastMemoryPromptTokens = 0;
         ctx.setExtensionPrompt(PROMPT_KEY, "", numOr(settings.injectionPosition, 1), numOr(settings.injectionDepth, 4));
         updateFloatingWidgetUI();
         return;
@@ -460,7 +565,30 @@ async function refreshPromptInjection(customQuery = "") {
     }
     if (!isCurrentChat(chatKey)) return;
 
-    const promptText = buildInjectedMemoryPrompt(memoryData, retrieved, ctx.name1 || "");
+    const chat = ctx.chat || [];
+    let latestAiIndex = -1;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        if (isAiReplyMessage(chat[i], settings.includeNativeHidden)) {
+            latestAiIndex = i;
+            break;
+        }
+    }
+    const currentRound = latestAiIndex >= 0
+        ? calculateRoundForMessageIndex(chat, latestAiIndex, settings.includeNativeHidden)
+        : 0;
+    const promptText = buildInjectedMemoryPrompt(
+        memoryData,
+        retrieved,
+        ctx.name1 || "",
+        5000,
+        {
+            recentRawRounds: settings.autoHideOldMessages
+                ? Math.max(1, numOr(settings.keepRecentRoundsCount, 5))
+                : 0,
+            currentRound,
+        },
+    );
+    lastMemoryPromptTokens = estimatePromptTokens(promptText);
     ctx.setExtensionPrompt(
         PROMPT_KEY,
         promptText,
@@ -541,12 +669,13 @@ function refreshLedgerFromLatestL0(memoryData) {
             - numOr(b.endMessageId, parseRoundRange(b.roundRange).end)
         )
         .at(-1);
-    if (latest?.postStateSnapshot) {
-        memoryData.stateLedger = clonePlainData(latest.postStateSnapshot);
+    if (latest) {
+        const resolved = resolveStateLedgerAfterEntry(memoryData, latest);
+        if (resolved) memoryData.stateLedger = resolved;
     }
 }
 
-async function resummarizeRoundInPlace(settings, ctx, chat, msgIdx, memoryData, chatKey, epoch) {
+async function resummarizeRoundInPlace(settings, ctx, chat, msgIdx, memoryData, chatKey, epoch, signal = null) {
     const turn = buildTurnSummaryInput(chat, msgIdx, settings, ctx);
     if (!turn) return true;
     const target = (memoryData.archivePool || []).find(item =>
@@ -564,7 +693,11 @@ async function resummarizeRoundInPlace(settings, ctx, chat, msgIdx, memoryData, 
     const working = createEmptyMemoryData();
     working.levels = { 0: [] };
     working.archivePool = [];
-    working.stateLedger = clonePlainData(before.at(-1)?.postStateSnapshot || createEmptyMemoryData().stateLedger);
+    const previousEntry = before.at(-1);
+    working.stateLedger = clonePlainData(
+        (previousEntry ? resolveStateLedgerAfterEntry(memoryData, previousEntry) : null)
+        || createEmptyMemoryData().stateLedger
+    );
     working.lastProcessedMessageId = turn.startMessageId - 1;
     working.lastProcessedRound = Math.max(0, turn.roundNumber - 1);
 
@@ -573,7 +706,9 @@ async function resummarizeRoundInPlace(settings, ctx, chat, msgIdx, memoryData, 
         shouldCommit: () =>
             isCurrentChat(chatKey)
             && epoch === summaryEpoch
+            && !signal?.aborted
             && chat[msgIdx] && memoryData === getChatMemory(),
+        signal,
     });
     if (!replacement) return false;
     replaceL0Entry(memoryData, target, replacement);
@@ -607,39 +742,108 @@ function runStoryResummarize(turns, { button = null, requireConfirm = true, titl
     const memoryData = getChatMemory();
     const epoch = summaryEpoch;
     storyViewRange = null;
+    storyPage = 0;
     renderStoryTimeline();
+    const task = beginSummaryTask({
+        label: title,
+        total: turns.length,
+        canCancel: true,
+    });
+    if (!task) {
+        updateStatusBar("⏳ 已有总结任务正在进行，请先等待或点击停止", true);
+        return null;
+    }
+    const signal = task.controller.signal;
     if (button) button.disabled = true;
     activeSummaryChats.add(chatKey);
     updateFloatingWidgetUI();
 
     const job = enqueueBackgroundSummary(async () => {
+        let cancelled = false;
+        let completedRounds = 0;
         try {
             for (let i = 0; i < turns.length; i++) {
+                if (isSummaryTaskCancelled(task)) {
+                    cancelled = true;
+                    break;
+                }
                 if (!isCurrentChat(chatKey) || epoch !== summaryEpoch) return;
                 const turn = turns[i];
                 if (chat[turn.idx] !== turn.msg) continue;
-                updateStatusBar(`⏳ ${title} ${i + 1}/${turns.length} · 第 ${turn.round} 轮`);
-                const ok = await resummarizeRoundInPlace(
-                    getSettings(), ctx, chat, turn.idx, memoryData, chatKey, epoch
-                );
-                if (!ok) return;
+                updateSummaryTask(task, {
+                    current: i + 1,
+                    roundNumber: turn.round,
+                    detail: `正在重新总结第 ${turn.round} 轮`,
+                });
+                try {
+                    const ok = await resummarizeRoundInPlace(
+                        getSettings(),
+                        ctx,
+                        chat,
+                        turn.idx,
+                        memoryData,
+                        chatKey,
+                        epoch,
+                        signal,
+                    );
+                    if (!ok) {
+                        if (isSummaryTaskCancelled(task)) cancelled = true;
+                        break;
+                    }
+                    completedRounds++;
+                } catch (error) {
+                    if (signal.aborted || error?.name === "AbortError") {
+                        cancelled = true;
+                        break;
+                    }
+                    throw error;
+                }
+                if (isSummaryTaskCancelled(task)) {
+                    cancelled = true;
+                    break;
+                }
             }
+            if (cancelled) return;
             if (!isCurrentChat(chatKey) || epoch !== summaryEpoch || memoryData !== getChatMemory()) return;
+            updateSummaryTask(task, {
+                detail: "正在重建高层剧情摘要",
+                canCancel: true,
+            });
             const rebuilt = await rebuildMemoryHierarchy(
                 getSettings(),
                 memoryData,
                 () => isCurrentChat(chatKey) && epoch === summaryEpoch && memoryData === getChatMemory(),
+                { signal },
             );
-            if (!rebuilt) return;
+            if (!rebuilt) {
+                if (isSummaryTaskCancelled(task)) cancelled = true;
+                return;
+            }
             memoryData.lastSummaryError = null;
             await saveChatMemory();
             await refreshPromptInjection();
             updateFloatingWidgetUI();
             renderStoryTimeline();
             updateStatusBar(`✅ 已重新总结第 ${fromRound}-${toRound} 轮`);
+        } catch (error) {
+            if (signal.aborted || error?.name === "AbortError") {
+                cancelled = true;
+            } else {
+                throw error;
+            }
         } finally {
+            if (cancelled) {
+                await saveChatMemory().catch(() => {});
+                await refreshPromptInjection().catch(() => {});
+                updateFloatingWidgetUI();
+                renderStoryTimeline();
+                updateStatusBar(
+                    `⏸️ 已停止重新总结：完成 ${completedRounds}/${turns.length} 轮；未完成轮次保留原摘要`,
+                );
+            }
             activeSummaryChats.delete(chatKey);
             if (button) button.disabled = false;
+            finishSummaryTask(task);
             updateFloatingWidgetUI();
         }
     }, title);
@@ -681,7 +885,7 @@ function syncHiddenMessagesState(forceRestoreAll = false) {
     const memoryData = getChatMemory();
 
     const shouldHide = settings.enabled && settings.autoHideOldMessages && !forceRestoreAll;
-    const keepRounds = Math.max(1, numOr(settings.keepRecentRoundsCount, 3));
+    const keepRounds = Math.max(1, numOr(settings.keepRecentRoundsCount, 5));
 
     // 只隐藏已经归档的轮次。首次安装、清空记忆或重建期间，原文必须继续发送。
     const cutoffIndex = shouldHide
@@ -778,6 +982,19 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
     }
 
     activeSummaryChats.add(chatKey);
+    const ownsTask = !options.summaryTask;
+    const task = options.summaryTask || beginSummaryTask({
+        label: isManual ? "补总结剧情" : "自动总结剧情",
+        total: 1,
+        canCancel: true,
+    });
+    const signal = task?.controller?.signal || null;
+    updateSummaryTask(task, {
+        current: 1,
+        total: 1,
+        roundNumber,
+        detail: `正在总结第 ${roundNumber} 轮`,
+    });
     updateFloatingWidgetUI();
     try {
         updateStatusBar(`⏳ 正在总结第 ${roundNumber} 轮对话并更新状态账本...`);
@@ -790,17 +1007,24 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
             dialogueText: lines.join("\n\n"),
             onRetry: (attempt, total, error) => {
                 if (!isCurrentChat(chatKey)) return;
+                updateSummaryTask(task, {
+                    detail: `第 ${roundNumber} 轮解析失败，正在自动重试 (${attempt - 1}/${total - 1})`,
+                });
                 updateStatusBar(`⏳ 第 ${roundNumber} 轮解析失败，正在自动重试 (${attempt - 1}/${total - 1})：${String(error?.message || "等待重新解析").slice(0, 80)}`, true);
             },
             shouldCommit: () => isCurrentChat(chatKey)
                 && epoch === summaryEpoch
                 && (isManual || getSettings().enabled)
+                && !signal?.aborted
                 && getChatMemory() === memoryData
                 && chat[msgIdx] === targetMsg,
+            signal,
         });
         if (!result) {
             if (isCurrentChat(chatKey)) {
-                updateStatusBar("⏸️ 归档已取消：聊天已变化或切换了存档");
+                updateStatusBar(signal?.aborted
+                    ? "⏸️ 总结已停止"
+                    : "⏸️ 归档已取消：聊天已变化或切换了存档");
             }
             return false;
         }
@@ -819,6 +1043,10 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
         }
         return true;
     } catch (err) {
+        if (signal?.aborted || err?.name === "AbortError") {
+            if (isCurrentChat(chatKey)) updateStatusBar("⏸️ 总结已停止");
+            return false;
+        }
         console.error("[溯微] Summarize turn error:", err?.message || err);
         if (isCurrentChat(chatKey)) {
             memoryData.lastSummaryError = {
@@ -832,6 +1060,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
         return false;
     } finally {
         activeSummaryChats.delete(chatKey);
+        if (ownsTask) finishSummaryTask(task);
         updateFloatingWidgetUI();
     }
 }
@@ -855,22 +1084,55 @@ function enqueuePendingAiTurns(chat, upToIndex, options = {}) {
 
     const label = options.label || "补齐待归档轮次";
     const isManual = Boolean(options.isManual);
+    let task = null;
+    let stopped = false;
+    let processedAny = false;
     const job = enqueueBackgroundSummary(async () => {
-        for (const task of pending) {
-            if (!isCurrentChat(chatKey) || epoch !== summaryEpoch) return;
-            if (chat[task.idx] !== task.msg) continue;
-            if (memoryData.lastProcessedMessageId >= task.idx) continue;
-            const ok = await processSingleAiTurn(task.idx, isManual, {
-                ctx,
-                chat,
-                chatKey,
-                memoryData,
-                epoch,
-            });
-            if (!ok) return;
-        }
-        if (isCurrentChat(chatKey) && typeof options.onDone === "function") {
-            await options.onDone();
+        task = beginSummaryTask({
+            label,
+            total: pending.length,
+            canCancel: true,
+        });
+        if (!task) return;
+        try {
+            for (let i = 0; i < pending.length; i++) {
+                if (isSummaryTaskCancelled(task)) {
+                    stopped = true;
+                    return;
+                }
+                if (!isCurrentChat(chatKey) || epoch !== summaryEpoch) return;
+                const pendingTurn = pending[i];
+                if (chat[pendingTurn.idx] !== pendingTurn.msg) continue;
+                if (memoryData.lastProcessedMessageId >= pendingTurn.idx) continue;
+                updateSummaryTask(task, {
+                    current: i + 1,
+                    roundNumber: pendingTurn.round,
+                    detail: `正在总结第 ${pendingTurn.round} 轮`,
+                });
+                const ok = await processSingleAiTurn(pendingTurn.idx, isManual, {
+                    ctx,
+                    chat,
+                    chatKey,
+                    memoryData,
+                    epoch,
+                    summaryTask: task,
+                });
+                if (!ok) return;
+                if (isSummaryTaskCancelled(task)) {
+                    stopped = true;
+                    return;
+                }
+                processedAny = true;
+            }
+            if (processedAny && isCurrentChat(chatKey) && typeof options.onDone === "function") {
+                await options.onDone();
+            }
+        } finally {
+            if (stopped) {
+                await saveChatMemory().catch(() => {});
+                updateStatusBar(`⏸️ 已停止总结，已保存前 ${memoryData.lastProcessedRound || 0} 轮进度`);
+            }
+            finishSummaryTask(task);
         }
     }, label);
     return job;
@@ -1033,6 +1295,7 @@ function resummarizeStoryRange() {
     const mode = document.getElementById("tiandao_story_range_mode")?.value || "fill";
     if (mode === "view") {
         storyViewRange = (rawFrom === "" && rawTo === "") ? null : { from: fromRound, to: toRound };
+        storyPage = 0;
         renderStoryTimeline();
         updateStatusBar(storyViewRange
             ? `👁️ 正在显示第 ${fromRound}-${toRound} 轮的总结`
@@ -1154,7 +1417,7 @@ function initFloatingWidget() {
     let widget = document.getElementById("tiandao_floating_widget");
     if (widget) return;
 
-    applyWidgetTheme();
+    applyWidgetAppearance();
 
     widget = document.createElement("div");
     widget.id = "tiandao_floating_widget";
@@ -1175,6 +1438,24 @@ function initFloatingWidget() {
 
             <div id="tiandao_status_bar" class="tiandao-status-bar" style="display:none;">
                 <i class="fa-solid fa-circle-dot" style="font-size:0.75em; opacity:0.8;"></i> <span class="tiandao-status-text">当前状态：就绪</span>
+            </div>
+
+            <div id="tiandao_summary_progress" class="tiandao-summary-progress" style="display:none;" role="status" aria-live="polite">
+                <div class="tiandao-summary-progress-head">
+                    <div class="tiandao-summary-progress-copy">
+                        <div id="tiandao_summary_progress_title" class="tiandao-summary-progress-title">正在总结</div>
+                        <div id="tiandao_summary_progress_detail" class="tiandao-summary-progress-detail">准备开始</div>
+                    </div>
+                    <div class="tiandao-summary-progress-actions">
+                        <span id="tiandao_summary_progress_counter" class="tiandao-summary-progress-counter"></span>
+                        <button type="button" id="tiandao_summary_progress_stop" class="tiandao-summary-progress-stop">
+                            <i class="fa-solid fa-stop"></i><span>停止</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="tiandao-summary-progress-track" aria-hidden="true">
+                    <div id="tiandao_summary_progress_bar" class="tiandao-summary-progress-bar"></div>
+                </div>
             </div>
 
             <div id="tiandao_widget_body" class="tiandao-card-body">
@@ -1218,12 +1499,13 @@ function initFloatingWidget() {
                     <div id="tiandao_story_page_timeline" class="tiandao-story-page"></div>
                 </div>
 
-                <!-- Tab 3: 溯微设置（二级分页：运行 / API / 数据） -->
+                <!-- Tab 3: 溯微设置（二级分页：运行 / API / 数据 / 外观） -->
                 <div id="tiandao_tab_settings_content" class="tiandao-tab-page" style="display: none;">
                     <div class="tiandao-subtabs">
                         <button type="button" class="tiandao-subtab active" data-page="run"><i class="fa-solid fa-sliders"></i> 运行</button>
                         <button type="button" class="tiandao-subtab" data-page="api"><i class="fa-solid fa-plug"></i> API</button>
                         <button type="button" class="tiandao-subtab" data-page="data"><i class="fa-solid fa-database"></i> 数据</button>
+                        <button type="button" class="tiandao-subtab" data-page="appearance"><i class="fa-solid fa-palette"></i> 外观</button>
                     </div>
 
                     <!-- 设置分页 1 · 运行 -->
@@ -1253,13 +1535,6 @@ function initFloatingWidget() {
                                         <option value="after_reply">AI 回复完成后立即总结</option>
                                     </select>
                                 </div>
-                                <div class="tiandao-form-row">
-                                    <span class="tiandao-field-label">看板主题</span>
-                                    <select id="tiandao_widget_theme" class="tiandao-select">
-                                        <option value="porcelain">瓷白精修 · 清透纸感</option>
-                                        <option value="journal">书页叙事 · 暖纸墨痕</option>
-                                    </select>
-                                </div>
                             </div>
 
                             <div class="tiandao-panel-divider"></div>
@@ -1272,7 +1547,7 @@ function initFloatingWidget() {
                                 <div class="tiandao-form-row">
                                     <span class="tiandao-field-label">保留最近几轮一问一答</span>
                                     <div style="display:flex; align-items:center; gap:8px;">
-                                        <input id="tiandao_keep_recent" type="number" class="tiandao-input tiandao-input-sm" min="1" max="25" placeholder="3" />
+                                        <input id="tiandao_keep_recent" type="number" class="tiandao-input tiandao-input-sm" min="1" max="25" placeholder="5" />
                                         <button type="button" id="tiandao_restore_hidden_btn" class="tiandao-btn tiandao-btn-sm" title="恢复所有被溯微隐藏的历史轮次">
                                             <i class="fa-solid fa-eye"></i> 恢复全部
                                         </button>
@@ -1289,10 +1564,6 @@ function initFloatingWidget() {
                             <div class="tiandao-form-row">
                                 <span class="tiandao-field-label">向上合并步长 (满 K 轮合并为 1 条)</span>
                                 <input id="tiandao_merge_chunk" type="number" class="tiandao-input tiandao-input-sm" min="2" max="15" placeholder="5" />
-                            </div>
-                            <div class="tiandao-form-row">
-                                <span class="tiandao-field-label">最大递归层级数 (L0 ~ L_max)</span>
-                                <input id="tiandao_max_level" type="number" class="tiandao-input tiandao-input-sm" min="2" max="5" placeholder="3" />
                             </div>
                             <div class="tiandao-form-row">
                                 <span class="tiandao-field-label">提示词注入位置</span>
@@ -1435,6 +1706,9 @@ function initFloatingWidget() {
                             <div class="tiandao-input-block">
                                 <label class="tiandao-field-caption">备用排除标签（黑名单）</label>
                                 <input id="tiandao_strip_tags" type="text" class="tiandao-input" placeholder="" />
+                                <div class="tiandao-field-caption" style="margin:5px 0 0;">
+                                    两项都留空时，玩家输入与 AI 回复会完整进入单轮总结。只把思考过程、状态栏等非正文标签填入黑名单即可；楼层显示时间属于酒馆元数据，不等同于剧情内时间。
+                                </div>
                             </div>
 
                             <button type="button" id="tiandao_test_api_btn" class="tiandao-btn tiandao-btn-primary tiandao-btn-full" style="margin-top: 10px;">
@@ -1487,6 +1761,53 @@ function initFloatingWidget() {
                             </div>
                         </div>
                     </div>
+
+                    <!-- 设置分页 4 · 外观 -->
+                    <div class="tiandao-settings-page" data-page="appearance" style="display: none;">
+                        <div class="tiandao-card-panel">
+                            <div class="tiandao-panel-title">
+                                <i class="fa-solid fa-palette"></i> 界面外观
+                            </div>
+                            <div class="tiandao-appearance-preview" aria-hidden="true">
+                                <div class="tiandao-appearance-preview-title">溯微 · 剧情时间线</div>
+                                <div class="tiandao-appearance-preview-copy">第 128 轮 · 雨夜，檐下的灯火仍然亮着。</div>
+                            </div>
+                            <div class="tiandao-form-row">
+                                <span class="tiandao-field-label">看板主题</span>
+                                <select id="tiandao_widget_theme" class="tiandao-select">
+                                    <option value="porcelain">瓷白精修 · 清透纸感</option>
+                                    <option value="journal">书页叙事 · 暖纸墨痕</option>
+                                </select>
+                            </div>
+                            <div class="tiandao-form-row">
+                                <span class="tiandao-field-label">界面字体</span>
+                                <select id="tiandao_font_family" class="tiandao-select">
+                                    <option value="inherit">跟随酒馆</option>
+                                    <option value="sans">现代无衬线</option>
+                                    <option value="serif">书卷宋体</option>
+                                </select>
+                            </div>
+                            <div class="tiandao-input-block tiandao-font-scale-block">
+                                <div class="tiandao-range-heading">
+                                    <label class="tiandao-field-caption" for="tiandao_font_scale">字号大小</label>
+                                    <output id="tiandao_font_scale_value" class="tiandao-range-value" for="tiandao_font_scale">100%</output>
+                                </div>
+                                <input id="tiandao_font_scale" type="range" min="85" max="130" step="5" class="tiandao-range" />
+                                <div class="tiandao-range-ticks" aria-hidden="true">
+                                    <span>紧凑</span>
+                                    <span>默认</span>
+                                    <span>宽松</span>
+                                </div>
+                            </div>
+                            <div class="tiandao-panel-divider"></div>
+                            <button type="button" id="tiandao_reset_appearance_btn" class="tiandao-btn tiandao-btn-full">
+                                <i class="fa-solid fa-rotate-left"></i> 恢复默认外观
+                            </button>
+                            <div class="tiandao-field-caption tiandao-appearance-hint">
+                                只影响溯微悬浮窗与记忆弹窗，不改变酒馆本身的显示设置。
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -1509,6 +1830,8 @@ function initFloatingWidget() {
     const tabLedgerContent = document.getElementById("tiandao_tab_ledger_content");
     const tabStoryContent = document.getElementById("tiandao_tab_story_content");
     const tabSettingsContent = document.getElementById("tiandao_tab_settings_content");
+    document.getElementById("tiandao_summary_progress_stop")
+        ?.addEventListener("click", requestSummaryTaskStop);
 
     // 展开/折叠：展开后用卡片头作为拖拽锚点，胶囊本体暂时隐藏。
     const setWidgetExpanded = (expanded) => {
@@ -1552,6 +1875,7 @@ function initFloatingWidget() {
     tabStoryBtn.addEventListener("click", () => {
         switchMainTab(tabStoryBtn, tabStoryContent);
         renderStoryTimeline();
+        renderStoryRecoveryState();
     });
 
     const storyRangeBtn = document.getElementById("tiandao_story_range_btn");
@@ -1574,6 +1898,19 @@ function initFloatingWidget() {
     syncStoryRangeModeUi();
     const storyRecoverBtn = document.getElementById("tiandao_story_recover_btn");
     if (storyRecoverBtn) storyRecoverBtn.addEventListener("click", recoverPendingSummaries);
+    tabStoryContent.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-story-page]");
+        if (!button || button.disabled) return;
+        if (storyEditingKey) {
+            updateStatusBar("⚠️ 请先保存或取消正在编辑的剧情总结", true);
+            return;
+        }
+        storyPage += button.dataset.storyPage === "older" ? 1 : -1;
+        storyPage = Math.max(0, storyPage);
+        renderStoryTimeline();
+        const body = document.getElementById("tiandao_widget_body");
+        if (body) body.scrollTop = 0;
+    });
 
     tabSettingsBtn.addEventListener("click", () => {
         switchMainTab(tabSettingsBtn, tabSettingsContent);
@@ -1663,9 +2000,14 @@ function positionFloatingWidgetCard() {
     const rect = widget.getBoundingClientRect();
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-    const desiredWidth = Math.min(372, vw - 20);
+    const desiredWidth = Math.min(vw <= 600 ? 345 : 372, vw - 20);
 
-    const openRightward = rect.left < desiredWidth;
+    // 按左右两侧真正剩余的空间换向。右上角的胶囊右侧空间通常不足，
+    // 必须向左展开；不能只看胶囊到屏幕左边缘的距离。
+    const spaceRight = Math.max(0, vw - rect.left - 10);
+    const spaceLeft = Math.max(0, rect.right - 10);
+    const openRightward = spaceRight >= desiredWidth
+        && (spaceRight >= spaceLeft || spaceLeft < desiredWidth);
     const spaceBelow = vh - rect.bottom - 10;
     const spaceAbove = rect.top - 10;
     const openUpward = spaceBelow < Math.min(340, vh * 0.55) && spaceAbove > spaceBelow;
@@ -1673,10 +2015,37 @@ function positionFloatingWidgetCard() {
     card.classList.toggle("tiandao-open-leftward", !openRightward);
     card.classList.toggle("tiandao-open-rightward", openRightward);
     card.classList.toggle("tiandao-open-upward", openUpward);
+    card.style.width = desiredWidth + "px";
+
+    // 拖到屏幕中部时两侧都不足以完整容纳卡片，向可用的一侧回拉。
+    const proposedLeft = openRightward ? rect.left : rect.right - desiredWidth;
+    const maxLeft = Math.max(10, vw - desiredWidth - 10);
+    const clampedLeft = Math.min(Math.max(10, proposedLeft), maxLeft);
+    const horizontalShift = clampedLeft - proposedLeft;
+    if (openRightward) {
+        card.style.left = horizontalShift + "px";
+        card.style.right = "";
+    } else {
+        card.style.left = "";
+        card.style.right = (-horizontalShift) + "px";
+    }
+
     const viewportCap = vw <= 600 ? vh * 0.78 : vh;
     const fixedHeight = Math.max(200, Math.min(610, viewportCap, openUpward ? spaceAbove : spaceBelow));
     card.style.height = fixedHeight + "px";
     card.style.maxHeight = fixedHeight + "px";
+
+    const proposedTop = openUpward ? rect.bottom - fixedHeight : rect.top;
+    const maxTop = Math.max(10, vh - fixedHeight - 10);
+    const clampedTop = Math.min(Math.max(10, proposedTop), maxTop);
+    const verticalShift = clampedTop - proposedTop;
+    if (openUpward) {
+        card.style.top = "";
+        card.style.bottom = (-verticalShift) + "px";
+    } else {
+        card.style.top = verticalShift + "px";
+        card.style.bottom = "";
+    }
 }
 
 function makeDraggable(element, handle, { onDragMove = null } = {}) {
@@ -1750,11 +2119,12 @@ function updateFloatingWidgetUI() {
     const widget = document.getElementById("tiandao_floating_widget");
     if (!widget) return;
 
-    applyWidgetTheme();
+    applyWidgetAppearance();
 
     // 悬浮窗同时是唯一设置入口。暂停引擎时保留入口，避免用户无法再次开启。
     widget.style.display = "block";
     positionFloatingWidgetCard();
+    renderSummaryProgress();
 
     const memoryData = getChatMemory();
     const pill = document.getElementById("tiandao_widget_pill");
@@ -1790,15 +2160,23 @@ function updateFloatingWidgetUI() {
     }
 
     if (summaryInfo) {
-        summaryInfo.textContent = `L0(${l0Count}) L1(${l1Count}) L2(${l2Count}) L3(${l3Count}) · 回溯池:${memoryData.archivePool?.length || 0}`;
+        const tokenText = lastMemoryPromptTokens > 0
+            ? ` · 注入~${lastMemoryPromptTokens}tk`
+            : "";
+        const fadedCount = numOr(memoryData.fadedHistory?.count, 0);
+        const fadedText = fadedCount > 0 ? ` · 远史:${fadedCount}` : "";
+        summaryInfo.textContent = `L0(${l0Count}) L1(${l1Count}) L2(${l2Count}) L3(${l3Count}) · 回溯池:${memoryData.archivePool?.length || 0}${fadedText}${tokenText}`;
     }
 
     if (!bodyInner) return;
     bodyInner.innerHTML = buildLedgerHtml(memoryData);
 
-    // 「剧情」Tab 的时间线随数据实时刷新（纯展示无输入，重建安全）
-    renderStoryTimeline();
-    renderStoryRecoveryState(memoryData, pendingBacklog);
+    // 时间线较重，只在剧情页可见时重建，避免每轮总结都刷新隐藏页签。
+    const storyVisible = document.getElementById("tiandao_tab_story_content")?.style.display !== "none";
+    if (storyVisible) {
+        renderStoryTimeline();
+        renderStoryRecoveryState(memoryData, pendingBacklog);
+    }
 }
 
 /**
@@ -1903,10 +2281,28 @@ function buildLedgerHtml(memoryData) {
  * 每条总结带编辑按钮，可内联修改剧情文本
  */
 let storyViewRange = null;
+const STORY_PAGE_SIZE = 20;
+let storyPage = 0;
 
 function buildTimelineHtml(memoryData) {
-    const sections = [];
+    const entries = [];
     const levels = memoryData.levels || {};
+    const settings = getSettings();
+    const chat = getSTContext().chat || [];
+    let latestAiIndex = -1;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        if (isAiReplyMessage(chat[i], settings.includeNativeHidden)) {
+            latestAiIndex = i;
+            break;
+        }
+    }
+    const currentRound = latestAiIndex >= 0
+        ? calculateRoundForMessageIndex(chat, latestAiIndex, settings.includeNativeHidden)
+        : 0;
+    const rawKeep = settings.autoHideOldMessages
+        ? Math.max(1, numOr(settings.keepRecentRoundsCount, 5))
+        : 0;
+    const rawWindowStart = currentRound > 0 ? currentRound - rawKeep + 1 : Infinity;
     const maxLvl = Math.max(...Object.keys(levels).map(Number), 1);
     const inViewRange = (item) => {
         if (!storyViewRange) return true;
@@ -1915,9 +2311,22 @@ function buildTimelineHtml(memoryData) {
     };
 
     const pushEntry = (lvl, item, idx) => {
+        entries.push({ kind: "entry", lvl, item, idx });
+    };
+
+    const renderEntry = ({ kind, lvl, item, idx }) => {
+        if (kind === "far") {
+            return `<div class="tiandao-story-entry strong">
+                <div class="tiandao-entry-meta">
+                    <span class="tiandao-lvl tiandao-lvl-2">远史</span>
+                    <span class="tiandao-round">按剧情内时间整理</span>
+                </div>
+                <div class="tiandao-entry-text">${escapeHTML(item)}</div>
+            </div>`;
+        }
         const badgeClass = lvl >= 2 ? "tiandao-lvl-2" : (lvl === 1 ? "tiandao-lvl-1" : "tiandao-lvl-0");
         const kindText = lvl >= 2 ? "大阶段脉络" : (lvl === 1 ? "阶段脉络" : "单轮微摘要");
-        sections.push(`
+        return `
             <div class="tiandao-story-entry${lvl >= 2 ? " strong" : ""}" data-lvl="${lvl}" data-idx="${idx}">
                 <div class="tiandao-entry-meta">
                     <span class="tiandao-lvl ${badgeClass}">L${lvl}</span>
@@ -1930,27 +2339,63 @@ function buildTimelineHtml(memoryData) {
                     </button>
                 </div>
                 <div class="tiandao-entry-text">${escapeHTML(item.text)}</div>
-            </div>`);
+            </div>`;
     };
 
+    const farHistoryText = String(memoryData.farHistory?.text || "").trim();
+    if (farHistoryText && !storyViewRange) {
+        entries.push({ kind: "far", item: farHistoryText });
+    }
     for (let lvl = maxLvl; lvl >= 1; lvl--) {
         (levels[lvl] || []).forEach((it, idx) => {
             if (inViewRange(it)) pushEntry(lvl, it, idx);
         });
     }
     (levels[0] || []).forEach((it, idx) => {
+        const range = parseRoundRange(it?.roundRange);
+        if (rawKeep > 0 && rawWindowStart !== Infinity
+            && range.end >= rawWindowStart && range.start <= currentRound) {
+            return;
+        }
         if (inViewRange(it)) pushEntry(0, it, idx);
     });
 
-    const body = sections.length > 0
-        ? sections.join("")
+    const totalPages = Math.max(1, Math.ceil(entries.length / STORY_PAGE_SIZE));
+    storyPage = Math.min(Math.max(0, storyPage), totalPages - 1);
+    const pageEnd = entries.length - storyPage * STORY_PAGE_SIZE;
+    const pageStart = Math.max(0, pageEnd - STORY_PAGE_SIZE);
+    const pageEntries = entries.slice(pageStart, Math.max(pageStart, pageEnd));
+    const body = pageEntries.length > 0
+        ? pageEntries.map(renderEntry).join("")
         : `<div class='tiandao-empty-hint'>${storyViewRange ? "所选范围暂无剧情总结" : "暂无剧情总结 · 开启自动总结后，这里会按轮次逐步填充"}</div>`;
+    const pageRanges = pageEntries
+        .filter(entry => entry.kind === "entry")
+        .map(entry => parseRoundRange(entry.item.roundRange));
+    const pageRangeText = pageRanges.length > 0
+        ? (() => {
+            const first = Math.min(...pageRanges.map(range => range.start));
+            const last = Math.max(...pageRanges.map(range => range.end));
+            return first === last ? `第 ${first} 轮` : `第 ${first}-${last} 轮`;
+        })()
+        : "远史归档";
+    const pager = entries.length > STORY_PAGE_SIZE
+        ? `<div class="tiandao-story-pager">
+                <button type="button" class="tiandao-story-page-btn" data-story-page="older" title="较早的 20 条" ${storyPage >= totalPages - 1 ? "disabled" : ""}>
+                    <i class="fa-solid fa-chevron-left"></i>
+                </button>
+                <span class="tiandao-story-page-info">第 ${storyPage + 1}/${totalPages} 页 · ${pageRangeText}</span>
+                <button type="button" class="tiandao-story-page-btn" data-story-page="newer" title="较新的 20 条" ${storyPage <= 0 ? "disabled" : ""}>
+                    <i class="fa-solid fa-chevron-right"></i>
+                </button>
+            </div>`
+        : "";
 
     return `
         <div class="tiandao-pagehead">
             <span class="tiandao-pagecap">剧情时间线（由远及近）</span>
             <span class="tiandao-pagehint">${storyViewRange ? `显示第 ${storyViewRange.from}-${storyViewRange.to} 轮` : "点击 ✏ 可修改每条剧情总结"}</span>
         </div>
+        ${pager}
         ${body}`;
 }
 
@@ -2075,19 +2520,42 @@ window.tiandaoSaveStoryEntry = async (lvl, idx) => {
         enqueueBackgroundSummary(async () => {
             if (!isCurrentChat(chatKey) || epoch !== summaryEpoch) return;
             if (isBackfilling && activeBackfillChatKey === chatKey) return;
-            const rebuilt = await rebuildMemoryHierarchy(
-                getSettings(),
-                memoryData,
-                () => isCurrentChat(chatKey)
-                    && epoch === summaryEpoch
-                    && getChatMemory() === memoryData,
-            );
-            if (!rebuilt) return;
-            if (!isCurrentChat(chatKey) || getChatMemory() !== memoryData) return;
-            await saveChatMemory();
-            await refreshPromptInjection();
-            updateFloatingWidgetUI();
-            updateStatusBar(`✅ 已修改第 ${item.roundRange} 轮，并重建高层摘要`);
+            const task = beginSummaryTask({
+                label: "重建高层记忆",
+                total: 1,
+                canCancel: true,
+            });
+            if (!task) return;
+            const signal = task.controller.signal;
+            try {
+                updateSummaryTask(task, {
+                    current: 0,
+                    detail: "正在重建 L1～L3 与远史摘要",
+                });
+                const rebuilt = await rebuildMemoryHierarchy(
+                    getSettings(),
+                    memoryData,
+                    () => isCurrentChat(chatKey)
+                        && epoch === summaryEpoch
+                        && getChatMemory() === memoryData
+                        && !signal.aborted,
+                    { signal },
+                );
+                if (!rebuilt) return;
+                if (!isCurrentChat(chatKey) || getChatMemory() !== memoryData) return;
+                await saveChatMemory();
+                await refreshPromptInjection();
+                updateFloatingWidgetUI();
+                updateStatusBar(`✅ 已修改第 ${item.roundRange} 轮，并重建高层摘要`);
+            } catch (error) {
+                if (signal.aborted || error?.name === "AbortError") {
+                    updateStatusBar("⏸️ 已停止重建高层记忆，原始编辑已保存");
+                    return;
+                }
+                throw error;
+            } finally {
+                finishSummaryTask(task);
+            }
         }, "重建记忆层级");
         updateStatusBar(`✅ 已修改第 ${item.roundRange} 轮，正在后台重建高层摘要...`);
     } else {
@@ -2127,6 +2595,7 @@ function importMemoryJsonFile(file) {
             storyEditingKey = null;
             storyEditingId = null;
             storyViewRange = null;
+            storyPage = 0;
             const normalizedImport = normalizeMemoryData(imported);
             const merged = normalizeMemoryData(mergeEditedMemoryWithEmbeddings(getChatMemory(), normalizedImport));
             const ctx = getSTContext();
@@ -2186,7 +2655,24 @@ function bindSettingsUI() {
     bindCheck("tiandao_auto_summarize", "autoSummarizePerTurn");
     bindInput("tiandao_summary_retry", "summaryRetryCount", true);
     bindInput("tiandao_summarize_timing", "summarizeTiming");
-    bindInput("tiandao_widget_theme", "widgetTheme", false, () => applyWidgetTheme());
+    bindInput("tiandao_widget_theme", "widgetTheme", false, () => applyWidgetAppearance());
+    bindInput("tiandao_font_family", "widgetFontFamily", false, () => applyWidgetAppearance());
+    const fontScaleInput = document.getElementById("tiandao_font_scale");
+    const fontScaleValue = document.getElementById("tiandao_font_scale_value");
+    const syncFontScalePreview = (value = fontScaleInput?.value) => {
+        const scale = Math.min(130, Math.max(85, numOr(value, 100)));
+        if (fontScaleValue) fontScaleValue.textContent = `${Math.round(scale)}%`;
+        if (fontScaleInput) fontScaleInput.value = String(scale);
+        document.documentElement.style.setProperty("--sw-font-scale", String(scale / 100));
+    };
+    bindInput("tiandao_font_scale", "widgetFontScale", true, (value) => {
+        syncFontScalePreview(value);
+        applyWidgetAppearance();
+    });
+    if (fontScaleInput) {
+        syncFontScalePreview();
+        fontScaleInput.addEventListener("input", () => syncFontScalePreview());
+    }
     bindCheck("tiandao_use_json_mode", "useJsonMode");
     bindCheck("tiandao_include_native_hidden", "includeNativeHidden");
 
@@ -2195,13 +2681,13 @@ function bindSettingsUI() {
         if (!checked) {
             updateStatusBar(`👁️ 已关闭自动隐藏，恢复显示 ${count} 条历史原文`);
         } else {
-            updateStatusBar(`🙈 已开启原文裁剪：仅发送最近 ${numOr(settings.keepRecentRoundsCount, 3)} 轮一问一答原文`);
+            updateStatusBar(`🙈 已开启原文裁剪：仅发送最近 ${numOr(settings.keepRecentRoundsCount, 5)} 轮一问一答原文`);
         }
     });
     bindInput("tiandao_keep_recent", "keepRecentRoundsCount", true, (val) => {
         syncHiddenMessagesState();
         if (settings.autoHideOldMessages) {
-            updateStatusBar(`📏 已更新保留轮数：当前仅发送最近 ${numOr(val, 3)} 轮一问一答原文`);
+            updateStatusBar(`📏 已更新保留轮数：当前仅发送最近 ${numOr(val, 5)} 轮一问一答原文`);
         }
     });
 
@@ -2221,7 +2707,6 @@ function bindSettingsUI() {
     refreshApiProfileSelect();
 
     bindInput("tiandao_merge_chunk", "mergeChunkSize", true);
-    bindInput("tiandao_max_level", "maxLevel", true);
     bindInput("tiandao_inject_pos", "injectionPosition", true, () => refreshPromptInjection());
     bindInput("tiandao_inject_depth", "injectionDepth", true, () => refreshPromptInjection());
     bindInput("tiandao_inject_role", "injectionRole", true, () => refreshPromptInjection());
@@ -2268,11 +2753,36 @@ function bindSettingsUI() {
         }
     });
 
+    const resetAppearanceBtn = document.getElementById("tiandao_reset_appearance_btn");
+    if (resetAppearanceBtn) resetAppearanceBtn.addEventListener("click", () => {
+        const current = getSettings();
+        current.widgetTheme = DEFAULT_SETTINGS.widgetTheme;
+        current.widgetFontScale = DEFAULT_SETTINGS.widgetFontScale;
+        current.widgetFontFamily = DEFAULT_SETTINGS.widgetFontFamily;
+        for (const [id, key] of [
+            ["tiandao_widget_theme", "widgetTheme"],
+            ["tiandao_font_family", "widgetFontFamily"],
+            ["tiandao_font_scale", "widgetFontScale"],
+        ]) {
+            const el = document.getElementById(id);
+            if (el) el.value = String(current[key]);
+        }
+        syncFontScalePreview(current.widgetFontScale);
+        applyWidgetAppearance();
+        saveSettings();
+        updateStatusBar("✅ 已恢复默认外观");
+    });
+
     const backfillBtn = document.getElementById("tiandao_backfill_btn");
     if (backfillBtn) backfillBtn.addEventListener("click", async () => {
         if (isBackfilling) {
             abortBackfillFlag = true;
+            requestSummaryTaskStop();
             updateStatusBar("⏸️ 正在安全停止历史回溯...");
+            return;
+        }
+        if (activeSummaryTask || activeSummaryChats.size > 0) {
+            updateStatusBar("⏳ 已有总结任务正在进行，请先等待或点击停止", true);
             return;
         }
         const ctx = getSTContext();
@@ -2287,23 +2797,45 @@ function bindSettingsUI() {
         summaryEpoch++;
         const backfillChatKey = getChatKey();
         activeBackfillChatKey = backfillChatKey;
+        const task = beginSummaryTask({
+            label: "补总结旧历史",
+            total: 1,
+            canCancel: true,
+        });
+        const signal = task?.controller?.signal || null;
         backfillBtn.innerHTML = `<i class="fa-solid fa-stop"></i> 暂停扫描`;
         try {
             const userName = ctx.name1 || "User";
             const charName = ctx.name2 || "Character";
             const result = await backfillExistingChatHistory(getSettings(), memoryData, chat, userName, charName, {
-                onProgress: (cur, total, roundNumber) => updateStatusBar(`⏳ 扫描旧历史 (${cur}/${total}) · 第 ${roundNumber} 轮...`),
-                onRetry: (attempt, total, error, roundNumber) => updateStatusBar(
-                    `⏳ 第 ${roundNumber} 轮解析失败，自动重试 (${attempt - 1}/${total - 1})：${String(error?.message || "等待重新解析").slice(0, 80)}`,
-                    true,
-                ),
+                onProgress: (cur, total, roundNumber) => {
+                    updateSummaryTask(task, {
+                        current: cur,
+                        total,
+                        roundNumber,
+                        detail: `正在总结第 ${roundNumber} 轮`,
+                    });
+                    updateStatusBar(`⏳ 扫描旧历史 (${cur}/${total}) · 第 ${roundNumber} 轮...`);
+                },
+                onRetry: (attempt, total, error, roundNumber) => {
+                    updateSummaryTask(task, {
+                        detail: `第 ${roundNumber} 轮解析失败，正在自动重试 (${attempt - 1}/${total - 1})`,
+                    });
+                    updateStatusBar(
+                        `⏳ 第 ${roundNumber} 轮解析失败，自动重试 (${attempt - 1}/${total - 1})：${String(error?.message || "等待重新解析").slice(0, 80)}`,
+                        true,
+                    );
+                },
                 onChunkSaved: async () => {
                     if (!isCurrentChat(backfillChatKey)) return;
                     await saveChatMemory();
                     await refreshPromptInjection();
                 },
-                shouldAbort: () => abortBackfillFlag || !isCurrentChat(backfillChatKey),
+                shouldAbort: () => abortBackfillFlag
+                    || isSummaryTaskCancelled(task)
+                    || !isCurrentChat(backfillChatKey),
                 shouldCommitTurn: () => isCurrentChat(backfillChatKey),
+                signal,
             });
             if (!isCurrentChat(backfillChatKey)) return;
             memoryData.lastSummaryError = null;
@@ -2312,6 +2844,12 @@ function bindSettingsUI() {
                 ? `⏸️ 已暂停，当前已处理 ${result.processedCount} 轮；再次点击可继续。`
                 : `✅ 存量历史按轮次扫描构建完成！`);
         } catch (e) {
+            if (signal?.aborted || e?.name === "AbortError") {
+                memoryData.lastSummaryError = null;
+                await saveChatMemory().catch(() => {});
+                updateStatusBar(`⏸️ 已停止历史回溯，已保存进度。`);
+                return;
+            }
             memoryData.lastSummaryError = {
                 message: String(e?.message || "历史回溯中断").slice(0, 300),
                 roundNumber: numOr(memoryData.lastProcessedRound, 0) + 1,
@@ -2325,6 +2863,7 @@ function bindSettingsUI() {
             isBackfilling = false;
             activeBackfillChatKey = null;
             backfillBtn.innerHTML = `<i class="fa-solid fa-clock-rotate-left"></i> 一键扫描旧历史`;
+            finishSummaryTask(task);
         }
     });
 
@@ -2348,6 +2887,7 @@ function bindSettingsUI() {
             storyEditingKey = null;
             storyEditingId = null;
             storyViewRange = null;
+            storyPage = 0;
             syncHiddenMessagesState(true);
             metadata.tiandao_memory = createEmptyMemoryData();
             await saveChatMemory();
@@ -2490,6 +3030,6 @@ function bindSettingsUI() {
             });
         }
         updateFloatingWidgetUI();
-        console.log("[溯微] v1.9.0 (缺口补齐·JSON 模式·失败恢复·身份稳定) 加载完毕！");
+        console.log("[溯微] v1.11.0 (状态增量快照·自动任务队列) 加载完毕！");
     } catch (err) { console.error("[溯微] 初始化异常:", err); }
 })();

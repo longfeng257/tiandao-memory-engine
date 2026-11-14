@@ -7,6 +7,8 @@
 /* ---------- 主题 A · 瓷白精修 (porcelain · 默认) ---------- */
 :root,
 :root[data-sw-theme="porcelain"] {
+    --sw-app-font: inherit;
+    --sw-app-serif: "Songti SC", "Noto Serif SC", serif;
     --sw-accent: #2f6b61;
     --sw-accent-bright: #204f48;
     --sw-accent-line: rgba(47, 107, 97, 0.28);
@@ -65,6 +67,8 @@
 
 /* ---------- 主题 B · 书页叙事 (journal) ---------- */
 :root[data-sw-theme="journal"] {
+    --sw-app-font: inherit;
+    --sw-app-serif: "Songti SC", "Noto Serif SC", serif;
     --sw-accent: #8a4f35;
     --sw-accent-bright: #693723;
     --sw-accent-line: rgba(138, 79, 53, 0.28);
@@ -121,13 +125,24 @@
     --sw-item-off: #a6927e;
 }
 
+:root[data-sw-font="sans"] {
+    --sw-app-font: "Noto Sans SC", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    --sw-app-serif: var(--sw-app-font);
+}
+
+:root[data-sw-font="serif"] {
+    --sw-app-font: "Songti SC", "Noto Serif SC", "Source Han Serif SC", serif;
+    --sw-app-serif: var(--sw-app-font);
+}
+
 /* ---------- 外层容器与胶囊 ---------- */
 #tiandao_floating_widget {
     position: fixed;
     top: 80px;
     right: 25px;
     z-index: 9999;
-    font-family: inherit;
+    font-family: var(--sw-app-font, inherit);
+    font-size: calc(1em * var(--sw-font-scale, 1));
     user-select: none;
     -webkit-font-smoothing: antialiased;
 }
@@ -326,6 +341,96 @@
     background: var(--sw-status-err-bg);
 }
 
+/* ---------- 总结任务进度（独立于顶部瞬时状态条） ---------- */
+.tiandao-summary-progress {
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 12px;
+    background: var(--sw-info-bg);
+    border-bottom: 1px solid var(--sw-info-border);
+    color: var(--sw-info-text);
+}
+
+.tiandao-summary-progress-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.tiandao-summary-progress-copy {
+    min-width: 0;
+    flex: 1;
+}
+
+.tiandao-summary-progress-title {
+    font-size: 0.82em;
+    font-weight: 700;
+}
+
+.tiandao-summary-progress-detail {
+    margin-top: 1px;
+    font-size: 0.74em;
+    color: var(--sw-text-soft);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tiandao-summary-progress-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    flex: 0 0 auto;
+}
+
+.tiandao-summary-progress-counter {
+    color: var(--sw-info-text);
+    font-size: 0.76em;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.tiandao-summary-progress-stop {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: 1px solid var(--sw-info-border);
+    border-radius: 6px;
+    background: var(--sw-card-bg);
+    color: var(--sw-info-text);
+    padding: 3px 7px;
+    font-family: inherit;
+    font-size: 0.72em;
+    cursor: pointer;
+}
+
+.tiandao-summary-progress-stop:hover:not(:disabled) {
+    border-color: var(--sw-info-text);
+    background: var(--sw-input-bg);
+}
+
+.tiandao-summary-progress-stop:disabled {
+    cursor: wait;
+    opacity: 0.7;
+}
+
+.tiandao-summary-progress-track {
+    height: 4px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--sw-info-border);
+}
+
+.tiandao-summary-progress-bar {
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--sw-info-text);
+    transition: width 0.2s ease;
+}
+
 /* ---------- 内容滚动区 ---------- */
 .tiandao-card-body {
     padding: 11px 13px;
@@ -433,7 +538,7 @@
     border-radius: 50%;
     background: var(--sw-chip-sel-bg);
     color: var(--sw-accent-bright);
-    font-family: "Songti SC", "Noto Serif SC", serif;
+    font-family: var(--sw-app-serif);
     font-size: 0.82em;
     font-weight: 700;
 }
@@ -442,7 +547,7 @@
     color: var(--sw-accent-bright);
     font-weight: 700;
     font-size: 0.95em;
-    font-family: "Songti SC", "Noto Serif SC", serif;
+    font-family: var(--sw-app-serif);
 }
 
 .tiandao-char-loc {
@@ -599,7 +704,7 @@
 
 :root[data-sw-theme="journal"] .tiandao-time-val {
     color: var(--sw-text);
-    font-family: "Songti SC", "Noto Serif SC", serif;
+    font-family: var(--sw-app-serif);
     font-size: 1.15em;
     text-align: left;
 }
@@ -694,7 +799,7 @@
     border: 1px solid var(--sw-accent);
     border-radius: 50%;
     color: var(--sw-accent);
-    font-family: "Songti SC", "Noto Serif SC", serif;
+    font-family: var(--sw-app-serif);
     font-size: 0.65em;
 }
 
@@ -706,7 +811,7 @@
 }
 
 :root[data-sw-theme="journal"] .tiandao-pagecap {
-    font-family: "Songti SC", "Noto Serif SC", serif;
+    font-family: var(--sw-app-serif);
     font-size: 0.98em;
 }
 
@@ -731,7 +836,7 @@
 
 :root[data-sw-theme="journal"] .tiandao-panel-title,
 :root[data-sw-theme="journal"] .tiandao-collapsible summary {
-    font-family: "Songti SC", "Noto Serif SC", serif;
+    font-family: var(--sw-app-serif);
 }
 
 :root[data-sw-theme="journal"] .tiandao-card-footer {
@@ -829,6 +934,71 @@
 
 .tiandao-api-profile-hint {
     margin: 2px 0 0;
+}
+
+.tiandao-appearance-preview {
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    background: var(--sw-card-bg);
+    border: 1px solid var(--sw-banner-border);
+    border-left: 3px solid var(--sw-accent);
+    border-radius: 8px;
+}
+
+.tiandao-appearance-preview-title {
+    color: var(--sw-accent-bright);
+    font-family: var(--sw-app-serif);
+    font-size: 0.92em;
+    font-weight: 700;
+    margin-bottom: 3px;
+}
+
+.tiandao-appearance-preview-copy {
+    color: var(--sw-text-soft);
+    font-size: 0.86em;
+    line-height: 1.6;
+}
+
+.tiandao-font-scale-block {
+    margin: 9px 0 0;
+}
+
+.tiandao-range-heading {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.tiandao-range-heading .tiandao-field-caption {
+    margin: 0;
+}
+
+.tiandao-range-value {
+    color: var(--sw-accent-bright);
+    font-size: 0.8em;
+    font-weight: 700;
+}
+
+.tiandao-range {
+    width: 100%;
+    height: 20px;
+    margin: 2px 0 0;
+    padding: 0;
+    accent-color: var(--sw-accent);
+    cursor: pointer;
+}
+
+.tiandao-range-ticks {
+    display: flex;
+    justify-content: space-between;
+    color: var(--sw-muted);
+    font-size: 0.7em;
+}
+
+.tiandao-appearance-hint {
+    margin: 7px 0 0;
+    text-align: center;
 }
 
 .tiandao-field-caption {
@@ -1095,6 +1265,7 @@
     overflow-y: auto;
     padding: 6px;
     color: var(--sw-text);
+    font-family: var(--sw-app-font, inherit);
 }
 
 .tiandao-modal-container textarea {
@@ -1189,6 +1360,50 @@
 
 .tiandao-story-error-text i {
     margin-top: 2px;
+}
+
+.tiandao-story-pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin-bottom: 9px;
+    padding: 5px 8px;
+    border: 1px solid var(--sw-line);
+    border-radius: 7px;
+    background: var(--sw-panel-bg);
+}
+
+.tiandao-story-page-btn {
+    width: 26px;
+    height: 26px;
+    display: inline-grid;
+    place-items: center;
+    flex: 0 0 auto;
+    border: 1px solid var(--sw-btn-border);
+    border-radius: 6px;
+    background: var(--sw-btn-bg);
+    color: var(--sw-accent);
+    font-family: inherit;
+    font-size: 0.76em;
+    cursor: pointer;
+}
+
+.tiandao-story-page-btn:hover:not(:disabled) {
+    border-color: var(--sw-accent);
+    background: var(--sw-btn-hover-bg);
+}
+
+.tiandao-story-page-btn:disabled {
+    cursor: default;
+    opacity: 0.35;
+}
+
+.tiandao-story-page-info {
+    color: var(--sw-muted);
+    font-size: 0.76em;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
 }
 
 .tiandao-story-range-bar {
