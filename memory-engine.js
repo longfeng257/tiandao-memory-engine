@@ -14,20 +14,25 @@ export const DEFAULT_SETTINGS = {
     summarizeTiming: "on_next_send", // "on_next_send": 等玩家发送下一条消息时再总结上一轮(重Roll零浪费) | "after_reply": AI回复完立即总结
     autoHideOldMessages: true,       // 默认开启：只向主模型发送最近 N 轮完整一问一答原文，超出的旧轮次自动隐藏只看插件总结
     keepRecentRoundsCount: "",       // 留空时按 3 轮处理
+    includeNativeHidden: false,      // 旧档迁移时可包含 SillyTavern 原生隐藏的 AI 楼层
 
     // 独立总结 API 设置 (留空，由用户根据自身渠道填写，支持一键拉取模型)
     apiUrl: "",
     apiKey: "",
     model: "",
     temperature: "",       // 留空时按 0.2 处理
-    maxTokens: 2000,
+    maxTokens: 4000,
+    useJsonMode: true,     // 支持 response_format 的渠道优先使用 JSON 模式，不支持时自动回退
+    summaryRetryCount: "", // 留空时按自动重试 2 次处理（不含首次请求）
+    apiProfiles: [],       // 可切换的独立 API 配置档案；API Key 仅保存在酒馆扩展设置中
+    activeApiProfileId: "",
 
-    // 正文提取设置 (留空，提供智能 placeholder 提示)
-    targetContentTags: "", // 目标提取标签（逗号分隔，如 content, story, reply，匹配到则直接只提取内部正文）
-    customStripTags: "",   // 备用排除标签
+    // 正文提取设置：留空即完全不启用对应规则
+    targetContentTags: "", // 目标提取标签（逗号分隔，匹配到则只提取内部正文）
+    customStripTags: "",   // 备用排除标签（留空则不内置任何排除标签）
 
     // 悬浮窗设置
-    widgetTheme: "porcelain", // 内置看板主题: porcelain=月白瓷 | matcha=抹茶乳霜
+    widgetTheme: "porcelain", // 内置看板主题: porcelain=瓷白精修 | journal=书页叙事
 
     // 递归合并树参数（留空时按内置默认值处理）
     mergeChunkSize: "", // 留空默认每满 5 轮向上合并为 1 条
@@ -51,6 +56,7 @@ const LLM_REQUEST_TIMEOUT_MS = 60_000;
 const EMBEDDING_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_ARCHIVE_EMBEDDINGS = 500;
 let embeddingFailureUntil = 0;
+const jsonModeUnsupported = new Set();
 
 function isSafeObjectKey(name) {
     return typeof name === "string"
@@ -89,14 +95,18 @@ export function shouldSettleBeforeGeneration(type, dryRun = false) {
  * 计算可由插件隐藏的消息上界。上界之后的消息必须保留原文；
  * 同时绝不越过 lastProcessedMessageId，避免隐藏尚未归档的剧情。
  */
-export function computeHiddenMessageCutoff(chat, keepRounds, lastProcessedMessageId) {
+export function isAiReplyMessage(msg, includeNativeHidden = false) {
+    return Boolean(msg && !msg.is_user && (!msg.is_system || msg.extra?.tiandao_hidden || includeNativeHidden));
+}
+
+export function computeHiddenMessageCutoff(chat, keepRounds, lastProcessedMessageId, includeNativeHidden = false) {
     if (!Array.isArray(chat) || chat.length === 0) return 0;
     const keep = Math.max(1, numOr(keepRounds, 3));
     let aiCount = 0;
     let cutoff = 0;
     for (let i = chat.length - 1; i >= 0; i--) {
         const msg = chat[i];
-        if (msg && !msg.is_user && (!msg.is_system || msg.extra?.tiandao_hidden)) {
+        if (isAiReplyMessage(msg, includeNativeHidden)) {
             aiCount++;
             if (aiCount === keep) {
                 cutoff = (i > 0 && chat[i - 1]?.is_user) ? i - 1 : i;
@@ -145,6 +155,7 @@ export function createEmptyMemoryData() {
             3: [],
         },
         archivePool: [],
+        lastSummaryError: null,
     };
 }
 
@@ -161,6 +172,15 @@ export function normalizeMemoryData(memoryData) {
     data.lastProcessedRound = Number.isFinite(Number(data.lastProcessedRound))
         ? Number(data.lastProcessedRound)
         : 0;
+    if (!data.lastSummaryError || typeof data.lastSummaryError !== "object") {
+        data.lastSummaryError = null;
+    } else {
+        data.lastSummaryError = {
+            message: String(data.lastSummaryError.message || "总结失败").slice(0, 300),
+            roundNumber: numOr(data.lastSummaryError.roundNumber, 0),
+            at: numOr(data.lastSummaryError.at, 0),
+        };
+    }
 
     if (!data.stateLedger || typeof data.stateLedger !== "object") {
         data.stateLedger = { time: "未知时间", characters: {}, todosAndPromises: [] };
@@ -181,6 +201,8 @@ export function normalizeMemoryData(memoryData) {
             .map(([name, info]) => [
                 name,
                 {
+                    canonicalName: asString(info.canonicalName, name),
+                    aliases: normalizeStringList(info.aliases, 8).filter(alias => alias !== name),
                     location: typeof info.location === "string" ? info.location : "未知位置",
                     statusAndAction: typeof info.statusAndAction === "string" ? info.statusAndAction : "平静",
                     wear: typeof info.wear === "string" ? info.wear : "日常衣着",
@@ -190,6 +212,8 @@ export function normalizeMemoryData(memoryData) {
                     inventory: Array.isArray(info.inventory)
                         ? info.inventory.filter(x => typeof x === "string" && x.trim()).slice(0, 8)
                         : [],
+                    present: info.present === false ? false : true,
+                    lastSeenRound: numOr(info.lastSeenRound, 0),
                 },
             ])
     );
@@ -279,6 +303,80 @@ export function normalizeMemoryData(memoryData) {
     return data;
 }
 
+const PLACEHOLDER_CHARACTER_KEYS = new Set(["user", "char", "character", "玩家", "主角"]);
+
+function isPlaceholderCharacterKey(name) {
+    return PLACEHOLDER_CHARACTER_KEYS.has(String(name || "").trim().toLowerCase());
+}
+
+/**
+ * 一次性清理旧版本遗留的 User/Char/Character 占位人物键。
+ * 有真实人物键时删除占位项；玩家昵称可安全对应时，把 User 迁移到真实昵称。
+ */
+export function cleanupPlaceholderCharacters(memoryData, userName = "") {
+    if (!memoryData || typeof memoryData !== "object") return false;
+    normalizeMemoryData(memoryData);
+    const chars = memoryData.stateLedger?.characters || {};
+    const name = String(userName || "").trim();
+    let changed = false;
+
+    const userPlaceholder = Object.keys(chars).find(key => key.toLowerCase() === "user");
+    if (userPlaceholder && name && userPlaceholder !== name) {
+        if (!chars[name]) {
+            chars[name] = {
+                ...chars[userPlaceholder],
+                canonicalName: name,
+                aliases: [...new Set([...(chars[userPlaceholder].aliases || []), userPlaceholder])],
+            };
+            delete chars[userPlaceholder];
+            changed = true;
+        } else {
+            delete chars[userPlaceholder];
+            changed = true;
+        }
+    }
+
+    const realKeys = Object.keys(chars).filter(key => !isPlaceholderCharacterKey(key));
+    if (realKeys.length > 0) {
+        for (const key of Object.keys(chars)) {
+            if (isPlaceholderCharacterKey(key)) {
+                delete chars[key];
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+/**
+ * 控制极长聊天中的账本规模：仅在人物数超过硬上限时，
+ * 优先保留玩家、在场人物和最近出现的人物。
+ */
+export function pruneStaleCharacters(memoryData, currentRound = 0, options = {}) {
+    if (!memoryData || typeof memoryData !== "object") return false;
+    normalizeMemoryData(memoryData);
+    const chars = memoryData.stateLedger?.characters || {};
+    const entries = Object.entries(chars);
+    const maxCharacters = Math.max(10, numOr(options.maxCharacters, 60));
+    if (entries.length <= maxCharacters) return false;
+
+    const keepNames = new Set((options.keepNames || []).map(x => String(x || "").trim()).filter(Boolean));
+    entries.sort(([nameA, infoA], [nameB, infoB]) => {
+        const aKeep = keepNames.has(nameA) ? 1 : 0;
+        const bKeep = keepNames.has(nameB) ? 1 : 0;
+        if (aKeep !== bKeep) return bKeep - aKeep;
+        const aPresent = infoA?.present === false ? 0 : 1;
+        const bPresent = infoB?.present === false ? 0 : 1;
+        if (aPresent !== bPresent) return bPresent - aPresent;
+        return numOr(infoB?.lastSeenRound, 0) - numOr(infoA?.lastSeenRound, 0);
+    });
+
+    for (const [name] of entries.slice(maxCharacters)) {
+        delete chars[name];
+    }
+    return true;
+}
+
 function cloneMemoryForUpdate(memoryData) {
     const source = normalizeMemoryData(memoryData);
     const levels = {};
@@ -336,16 +434,35 @@ export function parseRoundRange(roundRange) {
  * 根据聊天记录计算某条 AI 消息对应的真实“第几轮 (Round)”
  * 规则：一问一答算一轮（统计该消息及之前出现的非 user、非纯 system 回复总数）
  */
-export function calculateRoundForMessageIndex(chat, messageIndex) {
+export function calculateRoundForMessageIndex(chat, messageIndex, includeNativeHidden = false) {
     if (!Array.isArray(chat) || messageIndex < 0 || messageIndex >= chat.length) return 1;
     let round = 0;
     for (let i = 0; i <= messageIndex; i++) {
         const msg = chat[i];
-        if (msg && !msg.is_user && (!msg.is_system || msg.extra?.tiandao_hidden)) {
+        if (isAiReplyMessage(msg, includeNativeHidden)) {
             round++;
         }
     }
     return Math.max(1, round);
+}
+
+/**
+ * 汇总尚未归档的 AI 轮次。upToIndex 用于“本轮回合之前先补齐旧轮次”，
+ * 避免 after_reply 模式在失败后直接跨到新回复。
+ */
+export function collectPendingAiTurns(chat, lastProcessedMessageId = -1, upToIndex = Infinity, includeNativeHidden = false) {
+    if (!Array.isArray(chat)) return [];
+    const start = Math.max(0, numOr(lastProcessedMessageId, -1) + 1);
+    const end = Math.min(chat.length - 1, Number.isFinite(Number(upToIndex)) ? Number(upToIndex) : chat.length - 1);
+    const pending = [];
+    let round = 0;
+    for (let idx = 0; idx <= end; idx++) {
+        const msg = chat[idx];
+        if (!isAiReplyMessage(msg, includeNativeHidden)) continue;
+        round++;
+        if (idx >= start) pending.push({ idx, round, msg });
+    }
+    return pending;
 }
 
 /**
@@ -459,12 +576,11 @@ export function cleanMessageText(rawText, targetContentTagsStr = "", customStrip
         }
     }
 
-    const defaultTags = ["thinking", "think", "report", "options_engine", "small_theater", "status_bar"];
     const customTags = String(customStripTagsStr || "")
         .split(/[,，\s]+/)
         .map(t => t.trim().replace(/^<|>$/g, ""))
         .filter(Boolean);
-    const allTags = Array.from(new Set([...defaultTags, ...customTags]));
+    const allTags = Array.from(new Set(customTags));
 
     for (const tag of allTags) {
         const safeTag = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -479,7 +595,18 @@ export function cleanMessageText(rawText, targetContentTagsStr = "", customStrip
 /**
  * 调用独立配置的 OpenAI 兼容 Chat Completions API
  */
-export async function callIndependentLLM(settings, messages) {
+function parseRetryAfterMs(response) {
+    const rawMs = response?.headers?.get?.("retry-after-ms");
+    if (rawMs && Number.isFinite(Number(rawMs))) return Math.max(0, Number(rawMs));
+    const raw = response?.headers?.get?.("retry-after");
+    if (!raw) return 0;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+    const date = Date.parse(raw);
+    return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+}
+
+export async function callIndependentLLM(settings, messages, options = {}) {
     const baseUrl = (settings.apiUrl || "").trim().replace(/\/+$/, "");
     if (!baseUrl) {
         throw new Error("未配置独立总结 API 地址 (API URL)");
@@ -501,21 +628,43 @@ export async function callIndependentLLM(settings, messages) {
         model: modelName,
         messages: messages,
         temperature: numOr(settings.temperature, 0.2),
-        max_tokens: numOr(settings.maxTokens, 2000),
+        max_tokens: numOr(settings.maxTokens, 4000),
     };
+    const jsonModeKey = `${endpoint}|${modelName}`;
+    const jsonModeRequested = options.jsonMode === undefined
+        ? settings.useJsonMode !== false
+        : Boolean(options.jsonMode);
+    const useJsonMode = jsonModeRequested && !jsonModeUnsupported.has(jsonModeKey);
 
-    const response = await fetchWithTimeout(endpoint, {
+    const requestOptions = {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${settings.apiKey.trim()}`,
         },
-        body: JSON.stringify(body),
+    };
+    let response = await fetchWithTimeout(endpoint, {
+        ...requestOptions,
+        body: JSON.stringify(useJsonMode
+            ? { ...body, response_format: { type: "json_object" } }
+            : body),
     }, LLM_REQUEST_TIMEOUT_MS);
+
+    // 部分 OpenAI 兼容渠道不支持 response_format；仅在格式相关错误时静默回退。
+    if (!response.ok && useJsonMode && [400, 404, 422].includes(response.status)) {
+        jsonModeUnsupported.add(jsonModeKey);
+        response = await fetchWithTimeout(endpoint, {
+            ...requestOptions,
+            body: JSON.stringify(body),
+        }, LLM_REQUEST_TIMEOUT_MS);
+    }
 
     if (!response.ok) {
         const errText = await response.text().catch(() => "");
-        throw new Error(`独立 API 请求失败 (${response.status}): ${errText.slice(0, 200)}`);
+        const error = new Error(`独立 API 请求失败 (${response.status}): ${errText.slice(0, 200)}`);
+        error.status = response.status;
+        error.retryAfterMs = parseRetryAfterMs(response);
+        throw error;
     }
 
     const data = await response.json().catch(() => null);
@@ -526,27 +675,69 @@ export async function callIndependentLLM(settings, messages) {
     return content.trim();
 }
 
+function tryParseJsonObject(candidate) {
+    const attempts = [candidate];
+    // 兼容模型常见的轻微 JSON 瑕疵：尾逗号、中文引号包裹的键。
+    attempts.push(candidate
+        .replace(/,\s*([}\]])/g, "$1")
+        .replace(/[“”]([^“”\n]+)[“”]\s*:/g, '"$1":'));
+    for (const attempt of attempts) {
+        try {
+            const parsed = JSON.parse(attempt);
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+        } catch (_) { /* 尝试下一种修复方式 */ }
+    }
+    return null;
+}
+
 /**
- * 从独立 API 返回文本中安全解析 JSON
+ * 从独立 API 返回文本中安全解析 JSON。
+ * 兼容 Markdown 代码块、前后说明文字以及少量尾逗号等常见格式漂移。
  */
 export function safeParseJSON(text) {
     if (!text) return null;
-    let cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-    try {
-        return JSON.parse(cleaned);
-    } catch {
-        const firstBrace = cleaned.indexOf("{");
-        const lastBrace = cleaned.lastIndexOf("}");
-        if (firstBrace !== -1 && lastBrace > firstBrace) {
-            try {
-                return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
-            } catch (e2) {
-                console.error("[Tiandao Memory] JSON parse failed:", e2, String(text).slice(0, 200));
-                return null;
+    const source = String(text).trim();
+    const cleaned = source.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+
+    const direct = tryParseJsonObject(cleaned);
+    if (direct) return direct;
+
+    let firstBrace = cleaned.indexOf("{");
+    while (firstBrace !== -1) {
+        let depth = 0;
+        let inString = false;
+        let escaped = false;
+        for (let i = firstBrace; i < cleaned.length; i++) {
+            const ch = cleaned[i];
+            if (inString) {
+                if (escaped) {
+                    escaped = false;
+                } else if (ch === "\\") {
+                    escaped = true;
+                } else if (ch === '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (ch === '"') {
+                inString = true;
+            } else if (ch === "{") {
+                depth++;
+            } else if (ch === "}") {
+                depth--;
+                if (depth === 0) {
+                    const candidate = cleaned.slice(firstBrace, i + 1);
+                    const parsed = tryParseJsonObject(candidate);
+                    if (parsed) return parsed;
+                    break;
+                }
             }
         }
-        return null;
+        firstBrace = cleaned.indexOf("{", firstBrace + 1);
     }
+
+    console.error(`[Tiandao Memory] JSON parse failed (${String(text).length} chars)`);
+    return null;
 }
 
 function asString(value, fallback) {
@@ -561,11 +752,70 @@ function normalizeStringList(value, limit) {
         .slice(0, limit);
 }
 
+function characterAliases(name, info) {
+    return new Set([
+        name,
+        info?.canonicalName,
+        ...(Array.isArray(info?.aliases) ? info.aliases : []),
+    ].map(x => String(x || "").trim()).filter(Boolean));
+}
+
+function findCharacterKey(previousChars, incomingName, incomingInfo) {
+    if (isSafeObjectKey(incomingName) && previousChars[incomingName]) return incomingName;
+    const incomingAliases = new Set([...characterAliases(incomingName, incomingInfo)].map(x => x.toLowerCase()));
+    for (const [previousName, previousInfo] of Object.entries(previousChars)) {
+        if (!isSafeObjectKey(previousName) || !previousInfo || typeof previousInfo !== "object") continue;
+        const previousAliases = new Set([...characterAliases(previousName, previousInfo)].map(x => x.toLowerCase()));
+        for (const alias of incomingAliases) {
+            if (previousAliases.has(alias)) return previousName;
+        }
+    }
+    return null;
+}
+
+function mergeCharacterRecord(previousName, oldInfo, incoming, incomingName, roundNumber) {
+    const oldLocks = normalizeStringList(oldInfo?.removedItemsLock, 10);
+    const newLocks = normalizeStringList(incoming?.removedItemsLock, 10);
+    const unlocked = normalizeStringList(incoming?.unlockedItems, 20).map(x => x.toLowerCase());
+    const locks = [...new Set([...oldLocks, ...newLocks])]
+        .filter(item => !unlocked.some(unlockedItem => item.toLowerCase().includes(unlockedItem)))
+        .slice(0, 10);
+    const oldInventory = normalizeStringList(oldInfo?.inventory, 8);
+    const newInventory = normalizeStringList(incoming?.inventory, 8);
+    const canonicalName = asString(oldInfo?.canonicalName, previousName) || incomingName;
+    const aliases = [...new Set([
+        ...normalizeStringList(oldInfo?.aliases, 8),
+        ...normalizeStringList(incoming?.aliases, 8),
+        incomingName,
+        previousName,
+    ])].filter(alias => alias && alias !== canonicalName);
+    const seenRound = numOr(roundNumber, 0);
+    const present = incoming
+        ? incoming.present !== false
+        : oldInfo?.present !== false;
+    const lastSeenRound = present && seenRound > 0
+        ? seenRound
+        : numOr(oldInfo?.lastSeenRound, 0);
+
+    return {
+        canonicalName,
+        aliases: aliases.slice(0, 8),
+        location: asString(incoming?.location, asString(oldInfo?.location, "未知位置")),
+        statusAndAction: asString(incoming?.statusAndAction, asString(oldInfo?.statusAndAction, "平静")),
+        wear: asString(incoming?.wear, asString(oldInfo?.wear, "日常衣着")),
+        removedItemsLock: locks,
+        inventory: Array.isArray(incoming?.inventory) ? newInventory : oldInventory,
+        present,
+        lastSeenRound,
+    };
+}
+
 /**
  * 将模型输出的状态账本与旧账本合并。已摘除饰品锁采用并集策略，
- * 只有模型明确返回 unlockedItems 时才允许解锁。
+ * 只有模型明确返回 unlockedItems 时才允许解锁。角色通过 canonicalName/aliases
+ * 做稳定匹配，避免同一人物换称号或昵称后生成重复卡片。
  */
-export function mergeStateLedger(oldLedger, parsedLedger) {
+export function mergeStateLedger(oldLedger, parsedLedger, roundNumber = 0) {
     const previous = oldLedger && typeof oldLedger === "object" ? oldLedger : {};
     const previousChars = previous.characters && typeof previous.characters === "object"
         ? previous.characters
@@ -586,47 +836,28 @@ export function mergeStateLedger(oldLedger, parsedLedger) {
     }
 
     const mergedChars = {};
-    for (const [name, oldInfo] of Object.entries(previousChars)) {
-        if (!isSafeObjectKey(name) || !oldInfo || typeof oldInfo !== "object") continue;
-        const incoming = nextChars[name];
-        if (!incoming || typeof incoming !== "object") {
-            mergedChars[name] = deepClone({
-                location: asString(oldInfo.location, "未知位置"),
-                statusAndAction: asString(oldInfo.statusAndAction, "平静"),
-                wear: asString(oldInfo.wear, "日常衣着"),
-                removedItemsLock: normalizeStringList(oldInfo.removedItemsLock, 10),
-                inventory: normalizeStringList(oldInfo.inventory, 8),
-            });
-            continue;
-        }
+    const consumedPreviousKeys = new Set();
 
-        const oldLocks = normalizeStringList(oldInfo.removedItemsLock, 10);
-        const newLocks = normalizeStringList(incoming.removedItemsLock, 10);
-        const unlocked = normalizeStringList(incoming.unlockedItems, 20).map(x => x.toLowerCase());
-        const locks = [...new Set([...oldLocks, ...newLocks])]
-            .filter(item => !unlocked.some(unlockedItem => item.toLowerCase().includes(unlockedItem)))
-            .slice(0, 10);
-        const oldInventory = normalizeStringList(oldInfo.inventory, 8);
-        const newInventory = normalizeStringList(incoming.inventory, 8);
-
-        mergedChars[name] = {
-            location: asString(incoming.location, asString(oldInfo.location, "未知位置")),
-            statusAndAction: asString(incoming.statusAndAction, asString(oldInfo.statusAndAction, "平静")),
-            wear: asString(incoming.wear, asString(oldInfo.wear, "日常衣着")),
-            removedItemsLock: locks,
-            inventory: Array.isArray(incoming.inventory) ? newInventory : oldInventory,
-        };
+    // 先按稳定身份匹配本轮返回的个体，命中别名时沿用旧键名。
+    for (const [incomingName, incoming] of Object.entries(nextChars)) {
+        if (!isSafeObjectKey(incomingName) || !incoming || typeof incoming !== "object") continue;
+        const matchedKey = findCharacterKey(previousChars, incomingName, incoming);
+        const previousName = matchedKey || incomingName;
+        if (matchedKey) consumedPreviousKeys.add(matchedKey);
+        mergedChars[previousName] = mergeCharacterRecord(
+            previousName,
+            matchedKey ? previousChars[matchedKey] : null,
+            incoming,
+            incomingName,
+            roundNumber,
+        );
     }
 
-    for (const [name, incoming] of Object.entries(nextChars)) {
-        if (!isSafeObjectKey(name) || mergedChars[name] || !incoming || typeof incoming !== "object") continue;
-        mergedChars[name] = {
-            location: asString(incoming.location, "未知位置"),
-            statusAndAction: asString(incoming.statusAndAction, "平静"),
-            wear: asString(incoming.wear, "日常衣着"),
-            removedItemsLock: normalizeStringList(incoming.removedItemsLock, 10),
-            inventory: normalizeStringList(incoming.inventory, 8),
-        };
+    // 本轮未返回的旧人物保留最后状态，避免模型遗漏导致状态凭空消失。
+    for (const [name, oldInfo] of Object.entries(previousChars)) {
+        if (!isSafeObjectKey(name) || !oldInfo || typeof oldInfo !== "object") continue;
+        if (consumedPreviousKeys.has(name) || mergedChars[name]) continue;
+        mergedChars[name] = mergeCharacterRecord(name, oldInfo, null, name, 0);
     }
 
     return {
@@ -693,25 +924,37 @@ export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
     const currentStateJson = JSON.stringify(working.stateLedger, null, 2);
 
     const systemPrompt = `你是一个高精度的长线角色扮演状态追踪器与纯叙事记忆引擎。
-请阅读【上一轮各人物状态账本】与【最新一轮一问一答剧情】，输出严格的 JSON 格式结果。
+请阅读【上一轮实体状态账本】与【最新一轮剧情原文】，输出严格的 JSON 格式结果。
+
+身份识别原则（极其重要）：
+- “玩家昵称”只是输入者署名，“角色卡名”只是当前卡片的名称；二者都不等于剧情内人物的姓名。
+- 多人卡、群像卡、大世界卡的角色卡名可能代表世界、组织或多个角色，严禁把卡名硬套给某一个出场人物。
+- 玩家可能以具体角色、旁白、系统、上帝视角或完全不在场的观察者身份参与。玩家不一定是角色，也不需要每轮都出现在账本中。
+- 如果玩家本轮以某个具体角色身份行动，请把玩家控制的那个角色放在 characters 对象的第一位；如果玩家是旁白/系统/上帝视角，则不要为了排序而强行添加玩家条目。
+- 只记录剧情中真实出场、且拥有独立行动/物理状态的个体，并优先使用剧情内最稳定、最明确的称呼作为键名。
+- 不要使用“User”“Char”“Character”“玩家”“主角”等占位称呼作为人物名；使用剧情中的真实称呼。
+- 若同一人物有本名、称号、昵称或别名，请沿用上一轮账本的键名，并在 aliases 中记录本轮出现的其他称呼；canonicalName 保持最稳定的本名。
+- present 表示本轮该个体是否仍在场；暂时离开但仍会回归的人物保留条目并标记 present=false，不要直接删除。
 
 核心要求：
 1. **纯叙事时间线微摘要 (l0_summary)**：
    - 必须采用故事时间线口吻（拒绝任何代码感或“第X楼”等机械字眼）。
-   - 范例：“[某年某月某日上午] 在客厅里，${charName}脱下外套并随手放在沙发上，与${userName}商定了明天的行程，心情逐渐放松...”
+   - 范例：“[某年某月某日上午] 在客厅里，在场角色脱下外套并随手放在沙发上，与同行者商定了明天的行程，心情逐渐放松...”
+   - 用剧情中的实际人物称呼叙述，不要套用“Char/User”占位名。
    - 精炼保留时间流逝、地点、剧情推进、情感互动细节与关键动作（80~140字）。
    - 提取 3~5 个关键词 (keywords)。
-2. **按人物分别追踪物理状态 (characters)**：
-   - 为出场的各个角色（包括主角 ${userName}、女/男主 ${charName}、以及其他重要在场配角）分别建立对象：
-     * **location**：该角色当前具体所在的地点/房间。
+2. **按实际出场个体追踪物理状态 (characters)**：
+   - 只为本轮真实在场、且可辨认的具体角色/实体分别建立对象。旁白、系统提示、上帝视角观察者若没有独立物理状态，不要建立人物卡。
+   - 同一人物沿用上一轮账本中的键名；上一轮账本中的条目若本轮未明确离场，应继续增量更新，不要无故删除。
+     * **location**：该个体当前具体所在的地点/房间。
      * **statusAndAction**：当前神态动作、心理状态或正在进行的行动。
      * **wear**：当前身上的衣着与穿戴（根据剧情穿脱实时更新）。
      * **removedItemsLock（核心防回滚锁·极其重要）**：
-       - 只要该角色在剧情中摘下了某件饰品（如眼镜、耳环、发卡）或脱下了衣物（如外套、鞋袜），必须加入此数组！注明状态（例："金丝眼镜（已摘下放床头柜，当前未佩戴）"）。
-       - **继承铁律**：上轮账本中该角色已有的已摘除饰品锁，只要本轮剧情未明确描写重新戴上，**必须原封不动保留**，严禁擅自清空！
-       - 只有剧情明确描写重新戴上某件物品时，才把该物品写入同角色的 unlockedItems 数组；不确定时不要写。
-     * **inventory**：该角色随身携带的重要信物、道具、钥匙、手机或关键物品（随身道具，上限 6 条）。
-3. **todosAndPromises**：各角色间尚未完成的约定、日程或待办（已完成的事项移除，新约定加入）。
+       - 只要该个体在剧情中摘下了某件饰品（如眼镜、耳环、发卡）或脱下了衣物（如外套、鞋袜），必须加入此数组！注明状态（例："金丝眼镜（已摘下放床头柜，当前未佩戴）"）。
+       - **继承铁律**：上轮账本中该个体已有的已摘除饰品锁，只要本轮剧情未明确描写重新戴上，**必须原封不动保留**，严禁擅自清空！
+       - 只有剧情明确描写重新戴上某件物品时，才把该物品写入同一个个体的 unlockedItems 数组；不确定时不要写。
+     * **inventory**：该个体随身携带的重要信物、道具、钥匙、手机或关键物品（随身道具，上限 6 条）。
+3. **todosAndPromises**：尚未完成的约定、日程或待办（已完成的事项移除，新约定加入）。不要强行把约定归到某个角色名下。
 
 请严格按以下 JSON 结构返回：
 {
@@ -720,21 +963,16 @@ export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
   "stateLedger": {
     "time": "具体日期与时间段（例：春季某日上午）",
     "characters": {
-      "${charName}": {
+      "剧情内实际称呼": {
+        "canonicalName": "该个体最稳定的本名",
+        "aliases": ["本轮出现的别名/称号/昵称"],
         "location": "当前具体地点",
         "statusAndAction": "神态动作与当前正在做的事",
         "wear": "当前衣着与佩戴",
         "removedItemsLock": ["已摘下/脱下未重新穿戴的饰品或衣物（未重戴绝不清除）"],
         "unlockedItems": ["本轮明确重新戴上的物品；没有则留空数组"],
-        "inventory": ["随身携带的关键道具/信物"]
-      },
-      "${userName}": {
-        "location": "当前具体地点",
-        "statusAndAction": "当前神态动作与行动",
-        "wear": "当前衣着",
-        "removedItemsLock": [],
-        "unlockedItems": [],
-        "inventory": ["随身携带的道具"]
+        "inventory": ["随身携带的关键道具/信物"],
+        "present": true
       }
     },
     "todosAndPromises": [
@@ -744,30 +982,73 @@ export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
 }`;
 
     const userPrompt = `【当前剧情轮次】：第 ${currentRound} 轮
-【主要在场人物】：User = ${userName}, Char = ${charName}
+【发言标识，仅用于区分输入与回复，不代表剧情身份】：
+- 玩家输入署名：${userName || "未设置"}
+- 本条回复的发言者/角色卡名：${charName || "未设置"}
 
-【上一轮人物状态账本 (请在此基础上增量更新，切勿丢失各角色的已摘除饰品锁)】：
+【上一轮实体状态账本 (请在此基础上增量更新，切勿丢失已摘除饰品锁)】：
 ${currentStateJson}
 
-【第 ${currentRound} 轮一问一答剧情】：
+【第 ${currentRound} 轮剧情原文】：
 ${dialogueText}
 
-请直接输出更新后的 JSON：`;
+请先根据剧情本身判断实际出场个体，再直接输出更新后的 JSON：`;
 
-    const rawOutput = await callIndependentLLM(settings, [
+    const messages = [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
-    ]);
+    ];
+    const maxAttempts = 1 + Math.min(5, Math.max(0, Math.floor(numOr(settings.summaryRetryCount, 2))));
+    let parsed = null;
+    let lastError = null;
 
-    const parsed = safeParseJSON(rawOutput);
-    if (!parsed || typeof parsed.l0_summary !== "string" || !parsed.l0_summary.trim()) {
-        throw new Error("模型返回格式无法解析为有效摘要 JSON: " + rawOutput.slice(0, 150));
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            if (attempt > 1) {
+                const backoffMs = Math.min(4000, 500 * 2 ** (attempt - 2));
+                const retryAfterMs = Math.min(60_000, Math.max(0, numOr(lastError?.retryAfterMs, 0)));
+                const delayMs = Math.max(backoffMs, retryAfterMs);
+                if (typeof turnInfo.onRetry === "function") {
+                    turnInfo.onRetry(attempt, maxAttempts, lastError);
+                }
+                await new Promise(resolve => setTimeout(resolve, delayMs));
+            }
+
+            const retryMessages = attempt === 1
+                ? messages
+                : [
+                    { role: "system", content: systemPrompt },
+                    {
+                        role: "user",
+                        content: `${userPrompt}\n\n【格式纠正】上一次返回无法解析为有效摘要 JSON。请重新阅读原文，只输出一个合法 JSON 对象，不要 Markdown 代码块、不要额外解释，并确保包含 l0_summary、keywords、stateLedger。上一次错误：${String(lastError?.message || "格式无法解析").slice(0, 300)}`,
+                    },
+                ];
+            const rawOutput = await callIndependentLLM(settings, retryMessages);
+            parsed = safeParseJSON(rawOutput);
+            if (parsed && typeof parsed.l0_summary === "string" && parsed.l0_summary.trim()) {
+                break;
+            }
+            parsed = null;
+            lastError = new Error(`模型返回格式无法解析为有效摘要 JSON（响应长度 ${String(rawOutput).length}）`);
+        } catch (error) {
+            lastError = error;
+            const message = String(error?.message || error);
+            const status = Number(error?.status);
+            if (/未配置/.test(message) || [400, 401, 403, 404, 422].includes(status)) {
+                throw error;
+            }
+        }
+    }
+
+    if (!parsed) {
+        const retried = maxAttempts > 1 ? `（已自动重试 ${maxAttempts - 1} 次）` : "";
+        throw new Error(`${lastError?.message || "模型返回格式无法解析为有效摘要 JSON"}${retried}`);
     }
 
     const summaryText = parsed.l0_summary.trim().slice(0, 1200);
     const keywords = normalizeStringList(parsed.keywords, 8);
     working.stateLedger = parsed.stateLedger
-        ? mergeStateLedger(working.stateLedger, parsed.stateLedger)
+        ? mergeStateLedger(working.stateLedger, parsed.stateLedger, currentRound)
         : working.stateLedger;
 
     const embedding = await getEmbeddingVector(
@@ -887,7 +1168,7 @@ async function mergeSummariesAtLevel(settings, currentLevel, items, mergedRoundR
     const merged = await callIndependentLLM(settings, [
         { role: "system", content: systemPrompt },
         { role: "user", content: `请将以下时间线的各轮剧情摘要合并为一段连贯故事脉络：\n\n${listText}` },
-    ]);
+    ], { jsonMode: false });
 
     return merged.replace(/^```[\s\S]*?\n/, "").replace(/```$/, "").trim().slice(0, 4000);
 }
@@ -971,13 +1252,26 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
 /**
  * 组装给主模型的记忆注入块（纯轮次时间线 + 各人物物理状态）
  */
-export function buildInjectedMemoryPrompt(memoryData, retrievedSnacks = []) {
+export function buildInjectedMemoryPrompt(memoryData, retrievedSnacks = [], primaryName = "") {
     if (!memoryData) return "";
     const ledger = memoryData.stateLedger || {};
     const chars = ledger.characters || {};
 
     const charBlocks = [];
-    for (const [name, info] of Object.entries(chars)) {
+    const entries = Object.entries(chars);
+    entries.sort(([nameA], [nameB]) => {
+        const aFirst = Boolean(primaryName) && nameA === primaryName;
+        const bFirst = Boolean(primaryName) && nameB === primaryName;
+        if (aFirst !== bFirst) return aFirst ? -1 : 1;
+        const aPresent = chars[nameA]?.present === false ? 0 : 1;
+        const bPresent = chars[nameB]?.present === false ? 0 : 1;
+        if (aPresent !== bPresent) return bPresent - aPresent;
+        const aSeen = numOr(chars[nameA]?.lastSeenRound, 0);
+        const bSeen = numOr(chars[nameB]?.lastSeenRound, 0);
+        if (aSeen !== bSeen) return bSeen - aSeen;
+        return 0;
+    });
+    for (const [name, info] of entries) {
         if (!info) continue;
         const removed = (info.removedItemsLock || []).length > 0
             ? `\n    - 已摘除/脱下饰品(锁): ${info.removedItemsLock.join("; ")} [未描写重戴前严禁出现!]`
@@ -985,8 +1279,12 @@ export function buildInjectedMemoryPrompt(memoryData, retrievedSnacks = []) {
         const inv = (info.inventory || []).length > 0
             ? `\n    - 随身携带道具: ${info.inventory.join("; ")}`
             : "";
+        const aliasText = (info.aliases || []).length > 0
+            ? `\n    - 别名/称号: ${info.aliases.join("; ")}`
+            : "";
+        const presence = info.present === false ? "（暂离场）" : "";
 
-        charBlocks.push(`- **【${name}】**
+        charBlocks.push(`- **【${name}】**${presence}${aliasText}
     - 当前地点: ${info.location || "未知"}
     - 状态与行动: ${info.statusAndAction || "无"}
     - 当前穿戴: ${info.wear || "常规穿戴"}${removed}${inv}`);
@@ -1031,12 +1329,12 @@ export function buildInjectedMemoryPrompt(memoryData, retrievedSnacks = []) {
     }
 
     return `<tiandao_memory_system>
-# 溯微剧情时间线与人物动态状态（最高事实基准）
+# 溯微剧情时间线与出场个体动态状态（最高事实基准）
 
-## 一、当前各人物实时物理状态账本（绝对优先于角色卡初始设定）
+## 一、当前各出场个体实时物理状态账本（绝对优先于角色卡初始设定）
 - **当前故事时间**: ${ledger.time || "未知"}
-${charBlocks.join("\n\n") || "（暂无出场人物状态）"}
-- **各角色未完成约定与待办**:
+${charBlocks.join("\n\n") || "（暂无出场个体状态）"}
+- **未完成约定与待办**:
 ${todoLines}
 
 ## 二、剧情时间线叙事脉络（由远及近·按轮数推进）
@@ -1062,7 +1360,9 @@ export function buildNarrativeStoryView(memoryData) {
         const inv = allItems.length > 0
             ? `\n  - 随身道具: ${allItems.join(", ")}`
             : "";
-        return `【${name}】
+        const alias = (info.aliases || []).length > 0 ? `（别名: ${info.aliases.join(", ")}）` : "";
+        const presence = info.present === false ? "（暂离场）" : "";
+        return `【${name}】${presence}${alias}
   - 所在地点: ${info.location || "未知"}
   - 状态与行动: ${info.statusAndAction || "正常"}
   - 衣着穿戴: ${info.wear || "未记录"}${inv}`;
@@ -1175,7 +1475,7 @@ export async function backfillExistingChatHistory(
     charName,
     options = {}
 ) {
-    const { onProgress, onChunkSaved, shouldAbort, shouldCommitTurn } = options;
+    const { onProgress, onChunkSaved, onRetry, shouldAbort, shouldCommitTurn } = options;
 
     if (!Array.isArray(chatMessages) || chatMessages.length === 0) {
         throw new Error("当前聊天没有可扫描的历史消息");
@@ -1186,7 +1486,7 @@ export async function backfillExistingChatHistory(
     const aiMessageIndices = [];
     for (let idx = 0; idx < chatMessages.length; idx++) {
         const m = chatMessages[idx];
-        if (m && !m.is_user && (!m.is_system || m.extra?.tiandao_hidden)) {
+        if (isAiReplyMessage(m, settings.includeNativeHidden)) {
             aiMessageIndices.push(idx);
         }
     }
@@ -1235,6 +1535,9 @@ export async function backfillExistingChatHistory(
                 userName,
                 charName,
                 dialogueText: batchMsgs.join("\n\n"),
+                onRetry: typeof onRetry === "function"
+                    ? (attempt, total, error) => onRetry(attempt, total, error, roundNumber)
+                    : null,
                 shouldCommit: shouldCommitTurn,
             });
             if (!result) {

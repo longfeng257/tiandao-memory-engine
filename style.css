@@ -1,124 +1,124 @@
 /* =========================================================
    🌌 溯微 (Suwei) - 悬浮记忆引擎样式表
-   内置可切换双主题（月白瓷 / 抹茶乳霜），由 <html data-sw-theme> 驱动，
+   内置可切换双主题（瓷白精修 / 书页叙事），由 <html data-sw-theme> 驱动，
    悬浮窗、状态栏与账本弹窗同步换肤。
    ========================================================= */
 
-/* ---------- 主题 A · 月白瓷 (porcelain · 默认) ---------- */
+/* ---------- 主题 A · 瓷白精修 (porcelain · 默认) ---------- */
 :root,
 :root[data-sw-theme="porcelain"] {
-    --sw-accent: #3f7d74;
-    --sw-accent-bright: #2f6259;
-    --sw-accent-line: rgba(63, 125, 116, 0.3);
-    --sw-accent-tint: rgba(63, 125, 116, 0.12);
+    --sw-accent: #2f6b61;
+    --sw-accent-bright: #204f48;
+    --sw-accent-line: rgba(47, 107, 97, 0.28);
+    --sw-accent-tint: rgba(47, 107, 97, 0.1);
     --sw-pill-bg: #ffffff;
-    --sw-pill-border: rgba(63, 125, 116, 0.4);
-    --sw-pill-shadow: 0 6px 18px rgba(60, 80, 75, 0.18);
-    --sw-badge-bg: rgba(63, 125, 116, 0.1);
-    --sw-badge-border: rgba(63, 125, 116, 0.25);
-    --sw-card-bg: #fdfcfa;
-    --sw-card-border: #dcd8cc;
-    --sw-card-shadow: 0 18px 40px rgba(70, 80, 75, 0.18);
+    --sw-pill-border: #bdd1ca;
+    --sw-pill-shadow: 0 5px 18px rgba(41, 65, 56, 0.14);
+    --sw-badge-bg: #e6f1ec;
+    --sw-badge-border: #c9dfd6;
+    --sw-card-bg: #fbfaf6;
+    --sw-card-border: #d9d5ca;
+    --sw-card-shadow: 0 20px 46px rgba(42, 55, 49, 0.2), 0 2px 8px rgba(42, 55, 49, 0.08);
     --sw-radius: 16px;
-    --sw-header-bg: #f6f4ef;
-    --sw-tabwell: #ecebe4;
-    --sw-tab-active-bg: #ffffff;
-    --sw-tab-active-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
-    --sw-line: #e5e2d8;
-    --sw-status-bg: #eef4ef;
-    --sw-ok: #2e7d5b;
+    --sw-header-bg: #f2efe7;
+    --sw-tabwell: #e9e5dc;
+    --sw-tab-active-bg: #fffdf8;
+    --sw-tab-active-shadow: 0 1px 3px rgba(52, 66, 59, 0.12);
+    --sw-line: #e5e1d8;
+    --sw-status-bg: #edf4ef;
+    --sw-ok: #2d7657;
     --sw-status-err: #b4483c;
     --sw-status-err-bg: #f9e9e6;
-    --sw-banner-bg: #f0f5f1;
-    --sw-banner-border: #d5e2d8;
-    --sw-panel-bg: #f7f6f1;
-    --sw-text: #2c303a;
-    --sw-text-soft: #4b5563;
-    --sw-muted: #8a92a0;
-    --sw-placeholder: #a8adb8;
+    --sw-banner-bg: #eef4f0;
+    --sw-banner-border: #d5e2dc;
+    --sw-panel-bg: #f5f3ed;
+    --sw-text: #2a332f;
+    --sw-text-soft: #48544e;
+    --sw-muted: #7b877f;
+    --sw-placeholder: #9aa39e;
     --sw-input-bg: #ffffff;
-    --sw-input-border: #d7d3c7;
-    --sw-input-radius: 8px;
-    --sw-focus-ring: 0 0 0 3px rgba(63, 125, 116, 0.14);
+    --sw-input-border: #d7d2c6;
+    --sw-input-radius: 7px;
+    --sw-focus-ring: 0 0 0 3px rgba(47, 107, 97, 0.13);
     --sw-btn-bg: #ffffff;
-    --sw-btn-border: #d7d3c7;
-    --sw-btn-text: #4b5563;
-    --sw-btn-hover-bg: rgba(63, 125, 116, 0.12);
-    --sw-chip-bg: #f1efe8;
-    --sw-chip-border: #ddd9cd;
-    --sw-chip-text: #4b5563;
-    --sw-chip-sel-bg: #dcebe7;
-    --sw-chip-sel-border: #3f7d74;
-    --sw-chip-sel-text: #2f6259;
-    --sw-primary-bg: #3f7d74;
+    --sw-btn-border: #d7d2c6;
+    --sw-btn-text: #48544e;
+    --sw-btn-hover-bg: #efece4;
+    --sw-chip-bg: #f0ede5;
+    --sw-chip-border: #d8d3c7;
+    --sw-chip-text: #48544e;
+    --sw-chip-sel-bg: #dfece7;
+    --sw-chip-sel-border: #2f6b61;
+    --sw-chip-sel-text: #204f48;
+    --sw-primary-bg: #2f6b61;
     --sw-primary-text: #ffffff;
-    --sw-primary-shadow: 0 4px 12px rgba(63, 125, 116, 0.3);
+    --sw-primary-shadow: 0 4px 12px rgba(47, 107, 97, 0.28);
     --sw-warn-text: #b4483c;
     --sw-warn-bg: #f9e9e6;
-    --sw-info-text: #3a6ea8;
-    --sw-info-bg: #e9f1fa;
-    --sw-info-border: rgba(58, 110, 168, 0.25);
-    --sw-footer-bg: #f2f0ea;
-    --sw-scrollbar: rgba(63, 125, 116, 0.35);
-    --sw-item-off: #8a92a0;
+    --sw-info-text: #35687a;
+    --sw-info-bg: #eaf2f6;
+    --sw-info-border: #cfe0e7;
+    --sw-footer-bg: #f5f2eb;
+    --sw-scrollbar: rgba(47, 107, 97, 0.28);
+    --sw-item-off: #9aa39e;
 }
 
-/* ---------- 主题 B · 抹茶乳霜 (matcha) ---------- */
-:root[data-sw-theme="matcha"] {
-    --sw-accent: #5c8a58;
-    --sw-accent-bright: #47704a;
-    --sw-accent-line: rgba(92, 138, 88, 0.3);
-    --sw-accent-tint: rgba(92, 138, 88, 0.12);
-    --sw-pill-bg: #ffffff;
-    --sw-pill-border: rgba(92, 138, 88, 0.45);
-    --sw-pill-shadow: 0 6px 18px rgba(80, 110, 75, 0.18);
-    --sw-badge-bg: rgba(92, 138, 88, 0.12);
-    --sw-badge-border: rgba(92, 138, 88, 0.28);
-    --sw-card-bg: #fbfdf7;
-    --sw-card-border: #d5e2cf;
-    --sw-card-shadow: 0 16px 36px rgba(80, 110, 75, 0.18);
-    --sw-radius: 18px;
-    --sw-header-bg: #f1f6ea;
-    --sw-tabwell: #e7efe0;
-    --sw-tab-active-bg: #ffffff;
-    --sw-tab-active-shadow: 0 1px 4px rgba(60, 90, 55, 0.12);
-    --sw-line: #e2ebd8;
-    --sw-status-bg: #ecf4e6;
-    --sw-ok: #3e7d46;
-    --sw-status-err: #b45f4d;
-    --sw-status-err-bg: #f7e8e2;
-    --sw-banner-bg: #eff5e8;
-    --sw-banner-border: #d8e5cf;
-    --sw-panel-bg: #f4f8ee;
-    --sw-text: #33402f;
-    --sw-text-soft: #55654f;
-    --sw-muted: #8a997f;
-    --sw-placeholder: #a9b69c;
-    --sw-input-bg: #ffffff;
-    --sw-input-border: #cfdcc6;
-    --sw-input-radius: 10px;
-    --sw-focus-ring: 0 0 0 3px rgba(92, 138, 88, 0.15);
-    --sw-btn-bg: #ffffff;
-    --sw-btn-border: #cfdcc6;
-    --sw-btn-text: #55654f;
-    --sw-btn-hover-bg: rgba(92, 138, 88, 0.12);
-    --sw-chip-bg: #edf3e4;
-    --sw-chip-border: #d5e2cf;
-    --sw-chip-text: #55654f;
-    --sw-chip-sel-bg: #dcebdb;
-    --sw-chip-sel-border: #5c8a58;
-    --sw-chip-sel-text: #47704a;
-    --sw-primary-bg: #5c8a58;
-    --sw-primary-text: #ffffff;
-    --sw-primary-shadow: 0 4px 12px rgba(92, 138, 88, 0.3);
-    --sw-warn-text: #b45f4d;
-    --sw-warn-bg: #f7e8e2;
-    --sw-info-text: #4a7a9b;
-    --sw-info-bg: #eaf3f5;
-    --sw-info-border: rgba(74, 122, 155, 0.25);
-    --sw-footer-bg: #eef3e2;
-    --sw-scrollbar: rgba(92, 138, 88, 0.35);
-    --sw-item-off: #8a997f;
+/* ---------- 主题 B · 书页叙事 (journal) ---------- */
+:root[data-sw-theme="journal"] {
+    --sw-accent: #8a4f35;
+    --sw-accent-bright: #693723;
+    --sw-accent-line: rgba(138, 79, 53, 0.28);
+    --sw-accent-tint: rgba(138, 79, 53, 0.09);
+    --sw-pill-bg: #fbf4e8;
+    --sw-pill-border: #ccb391;
+    --sw-pill-shadow: 0 6px 22px rgba(76, 51, 33, 0.16);
+    --sw-badge-bg: #efe1ce;
+    --sw-badge-border: #d6bfa0;
+    --sw-card-bg: #faf3e7;
+    --sw-card-border: #d9c7af;
+    --sw-card-shadow: 0 24px 55px rgba(71, 48, 31, 0.2), 0 2px 8px rgba(71, 48, 31, 0.09);
+    --sw-radius: 14px;
+    --sw-header-bg: #f4e9d6;
+    --sw-tabwell: #eedfc9;
+    --sw-tab-active-bg: #fbf5ea;
+    --sw-tab-active-shadow: 0 1px 2px rgba(89, 58, 39, 0.12);
+    --sw-line: #e5d6c2;
+    --sw-status-bg: #f4e9d9;
+    --sw-ok: #627348;
+    --sw-status-err: #a64632;
+    --sw-status-err-bg: #f7e4dc;
+    --sw-banner-bg: #f3e6d2;
+    --sw-banner-border: #ddc7aa;
+    --sw-panel-bg: #f5ecdc;
+    --sw-text: #3c3027;
+    --sw-text-soft: #5c4a3d;
+    --sw-muted: #8e7967;
+    --sw-placeholder: #a6927e;
+    --sw-input-bg: #fffaf0;
+    --sw-input-border: #d5c0a2;
+    --sw-input-radius: 6px;
+    --sw-focus-ring: 0 0 0 3px rgba(138, 79, 53, 0.12);
+    --sw-btn-bg: #fbf4e8;
+    --sw-btn-border: #d5c0a2;
+    --sw-btn-text: #5c4a3d;
+    --sw-btn-hover-bg: #f0e2ce;
+    --sw-chip-bg: #f0e4d3;
+    --sw-chip-border: #d8c4a9;
+    --sw-chip-text: #5c4a3d;
+    --sw-chip-sel-bg: #eddfca;
+    --sw-chip-sel-border: #8a4f35;
+    --sw-chip-sel-text: #693723;
+    --sw-primary-bg: #8a4f35;
+    --sw-primary-text: #fffaf2;
+    --sw-primary-shadow: 0 4px 12px rgba(138, 79, 53, 0.24);
+    --sw-warn-text: #a64632;
+    --sw-warn-bg: #f7e4dc;
+    --sw-info-text: #6a6341;
+    --sw-info-bg: #eee5cf;
+    --sw-info-border: #d8c7a7;
+    --sw-footer-bg: #f2e7d4;
+    --sw-scrollbar: rgba(138, 79, 53, 0.28);
+    --sw-item-off: #a6927e;
 }
 
 /* ---------- 外层容器与胶囊 ---------- */
@@ -192,7 +192,8 @@
     position: absolute;
     top: 44px;
     right: 0;
-    width: 360px;
+    width: 372px;
+    height: min(610px, calc(100vh - 80px));
     max-height: 610px;
     background: var(--sw-card-bg);
     border: 1px solid var(--sw-card-border);
@@ -202,6 +203,10 @@
     flex-direction: column;
     overflow: hidden;
     animation: tiandaoCardPop 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.tiandao-widget-expanded .tiandao-widget-card {
+    top: 0;
 }
 
 @keyframes tiandaoCardPop {
@@ -223,6 +228,11 @@
 .tiandao-widget-card.tiandao-open-upward {
     top: auto;
     bottom: 44px;
+}
+
+.tiandao-widget-expanded .tiandao-widget-card.tiandao-open-upward {
+    top: auto;
+    bottom: 0;
 }
 
 /* ---------- 顶部导航（分段选择器） ---------- */
@@ -345,6 +355,7 @@
 
 /* ---------- 故事时间横幅 ---------- */
 .tiandao-time-banner {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -354,6 +365,15 @@
     border: 1px solid var(--sw-banner-border);
     border-radius: 8px;
     margin-bottom: 10px;
+    overflow: hidden;
+}
+
+.tiandao-time-banner::before {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 3px;
+    background: linear-gradient(var(--sw-accent), var(--sw-accent-line));
 }
 
 .tiandao-time-label {
@@ -383,6 +403,11 @@
     margin-bottom: 8px;
 }
 
+.tiandao-char-card.tiandao-char-away {
+    border-left-color: var(--sw-muted);
+    opacity: 0.78;
+}
+
 .tiandao-char-card-header {
     display: flex;
     align-items: center;
@@ -392,10 +417,32 @@
     margin-bottom: 6px;
 }
 
+.tiandao-char-person {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+}
+
+.tiandao-char-avatar {
+    width: 25px;
+    height: 25px;
+    display: inline-grid;
+    place-items: center;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--sw-chip-sel-bg);
+    color: var(--sw-accent-bright);
+    font-family: "Songti SC", "Noto Serif SC", serif;
+    font-size: 0.82em;
+    font-weight: 700;
+}
+
 .tiandao-char-name {
     color: var(--sw-accent-bright);
     font-weight: 700;
     font-size: 0.95em;
+    font-family: "Songti SC", "Noto Serif SC", serif;
 }
 
 .tiandao-char-loc {
@@ -411,6 +458,11 @@
     flex-direction: column;
     gap: 3px;
     color: var(--sw-text-soft);
+}
+
+.tiandao-char-alias {
+    font-size: 0.8em;
+    color: var(--sw-muted);
 }
 
 .tiandao-char-prop {
@@ -480,6 +532,212 @@
     font-size: 0.85em;
 }
 
+/* ---------- 书页叙事主题细节 ---------- */
+:root[data-sw-theme="journal"] .tiandao-widget-card {
+    border-radius: 5px 15px 15px 5px;
+    background-image: linear-gradient(90deg, rgba(119, 78, 47, 0.035) 1px, transparent 1px);
+    background-size: 22px 100%;
+}
+
+:root[data-sw-theme="journal"] .tiandao-card-header {
+    padding: 10px 12px 7px;
+    border-bottom: 0;
+    background: transparent;
+}
+
+:root[data-sw-theme="journal"] .tiandao-segmented-control {
+    padding: 0;
+    border: 0;
+    border-bottom: 1px solid var(--sw-line);
+    border-radius: 0;
+    background: transparent;
+}
+
+:root[data-sw-theme="journal"] .tiandao-segment-btn {
+    padding: 5px 7px;
+    border-radius: 0;
+    font-size: 0.8em;
+}
+
+:root[data-sw-theme="journal"] .tiandao-segment-btn.active {
+    background: transparent;
+    box-shadow: inset 0 -2px 0 var(--sw-accent);
+}
+
+:root[data-sw-theme="journal"] .tiandao-status-bar {
+    padding-left: 14px;
+    border-bottom: 0;
+    background: transparent;
+}
+
+:root[data-sw-theme="journal"] .tiandao-card-body {
+    padding: 3px 17px 14px 19px;
+}
+
+:root[data-sw-theme="journal"] .tiandao-time-banner {
+    display: grid;
+    justify-content: stretch;
+    gap: 2px;
+    padding: 3px 0 10px;
+    margin-bottom: 9px;
+    border: 0;
+    border-bottom: 1px solid var(--sw-line);
+    border-radius: 0;
+    background: transparent;
+}
+
+:root[data-sw-theme="journal"] .tiandao-time-banner::before {
+    display: none;
+}
+
+:root[data-sw-theme="journal"] .tiandao-time-label {
+    color: var(--sw-muted);
+    font-size: 0.72em;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+}
+
+:root[data-sw-theme="journal"] .tiandao-time-val {
+    color: var(--sw-text);
+    font-family: "Songti SC", "Noto Serif SC", serif;
+    font-size: 1.15em;
+    text-align: left;
+}
+
+:root[data-sw-theme="journal"] .tiandao-char-card {
+    position: relative;
+    padding: 8px 0 8px 44px;
+    margin: 0;
+    border: 0;
+    border-bottom: 1px solid var(--sw-line);
+    border-radius: 0;
+    background: transparent;
+}
+
+:root[data-sw-theme="journal"] .tiandao-char-card::before {
+    content: "";
+    position: absolute;
+    top: 15px;
+    left: 27px;
+    width: 1px;
+    height: calc(100% - 13px);
+    background: var(--sw-line);
+}
+
+:root[data-sw-theme="journal"] .tiandao-char-card:last-of-type::before {
+    height: 8px;
+}
+
+:root[data-sw-theme="journal"] .tiandao-char-card.tiandao-char-away {
+    border-left: 0;
+}
+
+:root[data-sw-theme="journal"] .tiandao-char-avatar {
+    position: absolute;
+    top: 7px;
+    left: 0;
+    width: 27px;
+    height: 27px;
+    border: 1px solid var(--sw-card-border);
+    background: var(--sw-card-bg);
+}
+
+:root[data-sw-theme="journal"] .tiandao-char-card-header {
+    margin-bottom: 3px;
+}
+
+:root[data-sw-theme="journal"] .tiandao-char-name {
+    font-size: 1em;
+}
+
+:root[data-sw-theme="journal"] .tiandao-char-prop.tag-info {
+    border: 0;
+    background: transparent;
+    padding: 2px 0;
+}
+
+:root[data-sw-theme="journal"] .tiandao-todo-box {
+    padding: 10px 0 0;
+    margin-top: 4px;
+    border: 0;
+    border-top: 1px solid var(--sw-line);
+    border-radius: 0;
+    background: transparent;
+}
+
+:root[data-sw-theme="journal"] .tiandao-todo-title {
+    margin-bottom: 4px;
+    font-size: 0.86em;
+}
+
+:root[data-sw-theme="journal"] .tiandao-todo-list {
+    counter-reset: journal-todo;
+}
+
+:root[data-sw-theme="journal"] .tiandao-todo-item {
+    counter-increment: journal-todo;
+    align-items: center;
+    gap: 7px;
+}
+
+:root[data-sw-theme="journal"] .tiandao-todo-item > i {
+    display: none;
+}
+
+:root[data-sw-theme="journal"] .tiandao-todo-item::before {
+    content: counter(journal-todo);
+    width: 16px;
+    height: 16px;
+    display: inline-grid;
+    place-items: center;
+    flex: 0 0 auto;
+    border: 1px solid var(--sw-accent);
+    border-radius: 50%;
+    color: var(--sw-accent);
+    font-family: "Songti SC", "Noto Serif SC", serif;
+    font-size: 0.65em;
+}
+
+:root[data-sw-theme="journal"] .tiandao-story-range-bar {
+    border: 0;
+    border-bottom: 1px solid var(--sw-line);
+    border-radius: 0;
+    background: transparent;
+}
+
+:root[data-sw-theme="journal"] .tiandao-pagecap {
+    font-family: "Songti SC", "Noto Serif SC", serif;
+    font-size: 0.98em;
+}
+
+:root[data-sw-theme="journal"] .tiandao-story-entry {
+    border-left-width: 1px;
+    border-bottom: 1px solid var(--sw-line);
+    border-radius: 0;
+    background: transparent;
+}
+
+:root[data-sw-theme="journal"] .tiandao-story-entry.strong {
+    border-left-color: var(--sw-accent);
+    background: rgba(138, 79, 53, 0.035);
+}
+
+:root[data-sw-theme="journal"] .tiandao-card-panel,
+:root[data-sw-theme="journal"] .tiandao-collapsible {
+    border-color: var(--sw-line);
+    border-radius: 5px;
+    background: rgba(255, 250, 240, 0.36);
+}
+
+:root[data-sw-theme="journal"] .tiandao-panel-title,
+:root[data-sw-theme="journal"] .tiandao-collapsible summary {
+    font-family: "Songti SC", "Noto Serif SC", serif;
+}
+
+:root[data-sw-theme="journal"] .tiandao-card-footer {
+    background: rgba(242, 231, 212, 0.72);
+}
+
 /* ---------- 设置面板 ---------- */
 .tiandao-card-panel {
     background: var(--sw-panel-bg);
@@ -542,6 +800,35 @@
     display: flex;
     flex-direction: column;
     margin-bottom: 8px;
+}
+
+.tiandao-api-profile-row,
+.tiandao-api-profile-save-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.tiandao-api-profile-select {
+    width: auto;
+    min-width: 0;
+    max-width: none;
+    flex: 1;
+}
+
+.tiandao-api-profile-save-row .tiandao-input {
+    min-width: 0;
+    flex: 1;
+}
+
+.tiandao-api-profile-row .tiandao-btn,
+.tiandao-api-profile-save-row .tiandao-btn {
+    flex: 0 0 auto;
+}
+
+.tiandao-api-profile-hint {
+    margin: 2px 0 0;
 }
 
 .tiandao-field-caption {
@@ -617,14 +904,7 @@
     transform: scale(1.15);
 }
 
-/* ---------- 快捷模型标签 ---------- */
-.tiandao-quick-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 5px;
-    margin-top: 5px;
-}
-
+/* ---------- 通用标签 ---------- */
 .tiandao-chip {
     font-size: 0.74em;
     background: var(--sw-chip-bg);
@@ -837,25 +1117,6 @@
     box-shadow: var(--sw-focus-ring);
 }
 
-/* ---------- 移动端适配 ---------- */
-@media (max-width: 600px) {
-    #tiandao_floating_widget {
-        top: 60px;
-        right: 10px;
-    }
-    .tiandao-widget-pill {
-        padding: 5px 12px;
-        font-size: 0.84em;
-    }
-    .tiandao-widget-card {
-        width: min(345px, 94vw);
-        max-height: 78vh;
-    }
-    .tiandao-action-grid {
-        grid-template-columns: 1fr;
-    }
-}
-
 /* ---------- 二级页签（剧情 / 设置内部分页） ---------- */
 .tiandao-subtabs {
     display: flex;
@@ -904,6 +1165,88 @@
 }
 
 /* ---------- 剧情时间线 ---------- */
+.tiandao-story-error-box {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 8px 10px;
+    margin-bottom: 9px;
+    background: var(--sw-status-err-bg);
+    border: 1px solid var(--sw-status-err);
+    border-radius: 7px;
+    color: var(--sw-status-err);
+}
+
+.tiandao-story-error-text {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    font-size: 0.78em;
+    line-height: 1.45;
+    word-break: break-word;
+}
+
+.tiandao-story-error-text i {
+    margin-top: 2px;
+}
+
+.tiandao-story-range-bar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: nowrap;
+    padding: 6px 8px;
+    margin-bottom: 9px;
+    background: var(--sw-panel-bg);
+    border: 1px solid var(--sw-line);
+    border-radius: 7px;
+}
+
+.tiandao-story-range-label {
+    color: var(--sw-text-soft);
+    font-size: 0.76em;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.tiandao-story-range-dash {
+    color: var(--sw-muted);
+    font-size: 0.76em;
+}
+
+.tiandao-story-range-bar .tiandao-input-sm {
+    width: 38px;
+    height: 26px;
+    padding: 3px 4px;
+    text-align: center;
+    font-size: 0.78em;
+    appearance: textfield;
+    -moz-appearance: textfield;
+}
+
+.tiandao-story-range-bar .tiandao-input-sm::-webkit-outer-spin-button,
+.tiandao-story-range-bar .tiandao-input-sm::-webkit-inner-spin-button {
+    margin: 0;
+    -webkit-appearance: none;
+}
+
+.tiandao-story-range-mode {
+    width: 88px;
+    min-width: 0;
+    max-width: 88px;
+    height: 26px;
+    padding: 2px 4px;
+    font-size: 0.72em;
+}
+
+.tiandao-story-range-bar .tiandao-btn-sm {
+    margin-left: auto;
+    padding: 2px 6px;
+    font-size: 0.74em;
+    white-space: nowrap;
+}
+
 .tiandao-pagehead {
     display: flex;
     align-items: baseline;
@@ -921,6 +1264,12 @@
 .tiandao-pagehint {
     color: var(--sw-muted);
     font-size: 0.78em;
+}
+
+.tiandao-story-bulk-bar {
+    display: flex;
+    justify-content: flex-end;
+    margin: -2px 0 8px;
 }
 
 .tiandao-story-entry {
@@ -1003,7 +1352,8 @@
 }
 
 /* ---------- 剧情总结内联编辑 ---------- */
-.tiandao-entry-edit-btn {
+.tiandao-entry-edit-btn,
+.tiandao-entry-resummarize-btn {
     margin-left: auto;
     background: transparent;
     border: none;
@@ -1017,7 +1367,12 @@
     font-family: inherit;
 }
 
-.tiandao-entry-edit-btn:hover {
+.tiandao-entry-resummarize-btn {
+    margin-left: 0;
+}
+
+.tiandao-entry-edit-btn:hover,
+.tiandao-entry-resummarize-btn:hover {
     color: var(--sw-accent-bright);
     background: var(--sw-accent-tint);
 }
@@ -1053,4 +1408,57 @@
     display: flex;
     justify-content: flex-end;
     gap: 6px;
+}
+
+/* ---------- 移动端适配 ---------- */
+@media (max-width: 600px) {
+    #tiandao_floating_widget {
+        top: 60px;
+        right: 10px;
+    }
+    .tiandao-widget-pill {
+        padding: 5px 12px;
+        font-size: 0.84em;
+    }
+    .tiandao-widget-card {
+        width: min(345px, calc(100vw - 20px));
+        height: 78vh;
+        max-height: 78vh;
+    }
+    .tiandao-card-header {
+        padding: 7px 8px;
+    }
+    .tiandao-segment-btn {
+        padding: 4px 7px;
+        font-size: 0.79em;
+    }
+    .tiandao-card-body {
+        padding: 9px 10px 10px;
+        font-size: 0.82em;
+    }
+    .tiandao-story-range-bar {
+        gap: 3px;
+        padding: 5px 6px;
+    }
+    .tiandao-story-range-label {
+        display: none;
+    }
+    .tiandao-story-range-bar .tiandao-input-sm {
+        width: 34px;
+        padding: 2px 3px;
+    }
+    .tiandao-story-range-mode {
+        width: 76px;
+        max-width: 76px;
+        font-size: 0.68em;
+    }
+    .tiandao-story-range-bar .tiandao-btn-sm {
+        padding: 2px 5px;
+    }
+    .tiandao-story-range-bar .tiandao-btn-sm i {
+        display: none;
+    }
+    .tiandao-action-grid {
+        grid-template-columns: 1fr;
+    }
 }

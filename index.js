@@ -16,12 +16,18 @@ import {
     shouldSettleBeforeGeneration,
     computeHiddenMessageCutoff,
     rebuildMemoryHierarchy,
+    collectPendingAiTurns,
+    cleanupPlaceholderCharacters,
+    pruneStaleCharacters,
+    parseRoundRange,
+    isAiReplyMessage,
 } from "./memory-engine.js";
 
 const EXTENSION_NAME = "tiandao-memory-engine";
 const PROMPT_KEY = "tiandao_memory_prompt";
 const LS_SETTINGS_KEY = "suwei_memory_settings_backup_v1";
 const SENSITIVE_SETTING_KEYS = new Set(["apiKey", "embeddingApiKey"]);
+const API_PROFILE_FIELDS = ["apiUrl", "apiKey", "model", "temperature", "maxTokens", "useJsonMode"];
 
 // 运行时状态控制
 let isBackfilling = false;
@@ -32,6 +38,7 @@ let summaryEpoch = 0;
 const activeSummaryChats = new Set();
 let chatSaveTimer = null;
 let lastChatFingerprint = [];
+let statusBarHideTimer = null;
 
 // 设置输入框登记表：支持“输入即保存”，并在按钮点击前强制落盘
 const settingsInputRegistry = [];
@@ -44,12 +51,10 @@ function commitSettingInput(entry) {
     }
     const settings = getSettings();
     if (settings[entry.key] === value) {
-        if (entry.key === "model") syncModelChipActive();
         return;
     }
     settings[entry.key] = value;
     saveSettings();
-    if (entry.key === "model") syncModelChipActive();
     if (entry.onChange) entry.onChange(value);
 }
 
@@ -58,13 +63,6 @@ function flushSettingInputs() {
         clearTimeout(entry.timer);
         commitSettingInput(entry);
     }
-}
-
-function syncModelChipActive() {
-    const current = (getSettings().model || "").trim();
-    document.querySelectorAll("#tiandao_floating_widget .tiandao-chip").forEach(chip => {
-        chip.classList.toggle("active", chip.getAttribute("data-model") === current);
-    });
 }
 
 function getSTContext() {
@@ -156,6 +154,27 @@ const LEGACY_PREFILLED_DEFAULTS = {
     embeddingModel: "BAAI/bge-m3",
 };
 
+function sanitizeApiProfiles(value) {
+    const profiles = [];
+    const seenIds = new Set();
+    for (const [index, raw] of (Array.isArray(value) ? value : []).entries()) {
+        if (!raw || typeof raw !== "object") continue;
+        const name = String(raw.name || "").trim().slice(0, 80);
+        if (!name) continue;
+        let id = String(raw.id || "").trim() || `profile-${Date.now()}-${index}`;
+        while (seenIds.has(id)) id = `${id}-${index}`;
+        seenIds.add(id);
+        const profile = { id, name };
+        for (const field of API_PROFILE_FIELDS) {
+            profile[field] = field === "useJsonMode"
+                ? raw[field] !== false
+                : (raw[field] ?? "");
+        }
+        profiles.push(profile);
+    }
+    return profiles;
+}
+
 function getSettings() {
     const ctx = getSTContext();
     const extSettings = ctx.extensionSettings || window.extension_settings || {};
@@ -189,8 +208,15 @@ function getSettings() {
     }
     for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
         if (s[k] === undefined) {
-            s[k] = v;
+            s[k] = Array.isArray(v) ? v.slice() : v;
         }
+    }
+    s.apiProfiles = sanitizeApiProfiles(s.apiProfiles);
+    s.activeApiProfileId = String(s.activeApiProfileId || "");
+    // 旧版本 maxTokens 固定为 2000 且没有界面入口；升级时一次性放宽到新默认值。
+    if (s.maxTokens === 2000 && !s.maxTokensMigratedV190) {
+        s.maxTokens = 4000;
+        s.maxTokensMigratedV190 = true;
     }
     // 清空旧版本自动预填的示例值（不影响用户自行配置过的真实值）
     if (!s.apiKey) {
@@ -215,8 +241,127 @@ function saveSettings() {
     try {
         const backup = { ...getSettings() };
         for (const key of SENSITIVE_SETTING_KEYS) delete backup[key];
+        if (Array.isArray(backup.apiProfiles)) {
+            backup.apiProfiles = backup.apiProfiles.map(profile => {
+                const safeProfile = { ...profile };
+                delete safeProfile.apiKey;
+                return safeProfile;
+            });
+        }
         localStorage.setItem(LS_SETTINGS_KEY, JSON.stringify(backup));
     } catch (_) { /* 隐私模式等场景忽略 */ }
+}
+
+function refreshApiProfileSelect(preferredId = "") {
+    const select = document.getElementById("tiandao_api_profile_select");
+    if (!select) return;
+    const settings = getSettings();
+    const profiles = settings.apiProfiles;
+    const placeholder = new Option(profiles.length > 0 ? "选择已保存配置" : "暂无已保存配置", "");
+    select.replaceChildren(placeholder);
+    for (const profile of profiles) {
+        select.add(new Option(profile.name, profile.id));
+    }
+    const targetId = preferredId || settings.activeApiProfileId;
+    if (targetId && profiles.some(profile => profile.id === targetId)) {
+        select.value = targetId;
+    }
+    const deleteBtn = document.getElementById("tiandao_api_profile_delete_btn");
+    if (deleteBtn) deleteBtn.disabled = !select.value;
+}
+
+function applyApiProfileToForm(profile) {
+    if (!profile) return;
+    flushSettingInputs();
+    const settings = getSettings();
+    const bindings = {
+        apiUrl: "tiandao_api_url",
+        apiKey: "tiandao_api_key",
+        model: "tiandao_model",
+        temperature: "tiandao_temp",
+        maxTokens: "tiandao_max_tokens",
+        useJsonMode: "tiandao_use_json_mode",
+    };
+    for (const [field, id] of Object.entries(bindings)) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        const value = profile[field] ?? (field === "useJsonMode" ? true : "");
+        settings[field] = value;
+        if (field === "useJsonMode") {
+            el.checked = Boolean(value);
+        } else {
+            el.value = value;
+        }
+    }
+    settings.activeApiProfileId = profile.id;
+    saveSettings();
+    const nameInput = document.getElementById("tiandao_api_profile_name");
+    if (nameInput) nameInput.value = profile.name;
+    refreshApiProfileSelect(profile.id);
+    updateStatusBar(`✅ 已切换到 API 配置「${profile.name}」`);
+}
+
+function loadSelectedApiProfile() {
+    const select = document.getElementById("tiandao_api_profile_select");
+    const deleteBtn = document.getElementById("tiandao_api_profile_delete_btn");
+    if (deleteBtn) deleteBtn.disabled = !select?.value;
+    if (!select?.value) return;
+    const profile = getSettings().apiProfiles.find(item => item.id === select.value);
+    applyApiProfileToForm(profile);
+}
+
+function saveCurrentApiProfile() {
+    flushSettingInputs();
+    const nameInput = document.getElementById("tiandao_api_profile_name");
+    const name = String(nameInput?.value || "").trim();
+    if (!name) {
+        updateStatusBar("⚠️ 请先填写 API 配置名称", true);
+        nameInput?.focus();
+        return;
+    }
+
+    const settings = getSettings();
+    const profiles = settings.apiProfiles.slice();
+    const existingIndex = profiles.findIndex(profile => profile.name.toLocaleLowerCase() === name.toLocaleLowerCase());
+    const profile = {
+        id: existingIndex >= 0
+            ? profiles[existingIndex].id
+            : `profile-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        name,
+    };
+    for (const field of API_PROFILE_FIELDS) {
+        profile[field] = field === "useJsonMode"
+            ? settings.useJsonMode !== false
+            : (settings[field] ?? "");
+    }
+    if (existingIndex >= 0) {
+        profiles[existingIndex] = profile;
+    } else {
+        profiles.push(profile);
+    }
+    settings.apiProfiles = profiles;
+    settings.activeApiProfileId = profile.id;
+    saveSettings();
+    if (nameInput) nameInput.value = name;
+    refreshApiProfileSelect(profile.id);
+    updateStatusBar(`✅ 已保存 API 配置「${name}」`);
+}
+
+function deleteSelectedApiProfile() {
+    const select = document.getElementById("tiandao_api_profile_select");
+    const id = select?.value;
+    if (!id) return;
+    const settings = getSettings();
+    const profile = settings.apiProfiles.find(item => item.id === id);
+    if (!profile) return;
+    if (!confirm(`确定删除 API 配置「${profile.name}」吗？`)) return;
+    settings.apiProfiles = settings.apiProfiles.filter(item => item.id !== id);
+    if (settings.activeApiProfileId === id) settings.activeApiProfileId = "";
+    saveSettings();
+    refreshApiProfileSelect();
+    const nameInput = document.getElementById("tiandao_api_profile_name");
+    if (nameInput) nameInput.value = "";
+    updateStatusBar(`🗑️ 已删除 API 配置「${profile.name}」`);
 }
 
 function getChatMemory() {
@@ -226,7 +371,9 @@ function getChatMemory() {
     if (!metadata.tiandao_memory) {
         metadata.tiandao_memory = createEmptyMemoryData();
     }
-    return normalizeMemoryData(metadata.tiandao_memory);
+    const memoryData = normalizeMemoryData(metadata.tiandao_memory);
+    cleanupPlaceholderCharacters(memoryData, ctx.name1 || "");
+    return memoryData;
 }
 
 async function saveChatMemory() {
@@ -249,14 +396,19 @@ function updateStatusBar(text, isError = false) {
     }
     el.classList.toggle("error", Boolean(isError));
     el.title = text;
+    el.style.display = "flex";
+    clearTimeout(statusBarHideTimer);
+    statusBarHideTimer = setTimeout(() => {
+        el.style.display = "none";
+    }, isError ? 9000 : 3500);
 }
 
 /**
- * 应用内置看板主题（月白瓷 / 抹茶乳霜）：
+ * 应用内置看板主题（瓷白精修 / 书页叙事）：
  * 写在 <html data-sw-theme> 上，悬浮窗、状态栏与账本弹窗全部同步换肤
  */
 function applyWidgetTheme() {
-    const theme = getSettings().widgetTheme === "matcha" ? "matcha" : "porcelain";
+    const theme = getSettings().widgetTheme === "journal" ? "journal" : "porcelain";
     document.documentElement.dataset.swTheme = theme;
 }
 
@@ -308,7 +460,7 @@ async function refreshPromptInjection(customQuery = "") {
     }
     if (!isCurrentChat(chatKey)) return;
 
-    const promptText = buildInjectedMemoryPrompt(memoryData, retrieved);
+    const promptText = buildInjectedMemoryPrompt(memoryData, retrieved, ctx.name1 || "");
     ctx.setExtensionPrompt(
         PROMPT_KEY,
         promptText,
@@ -319,6 +471,179 @@ async function refreshPromptInjection(customQuery = "") {
     );
 
     updateFloatingWidgetUI();
+}
+
+function clonePlainData(value) {
+    return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function buildTurnSummaryInput(chat, msgIdx, settings, ctx) {
+    const targetMsg = chat[msgIdx];
+    if (!isAiReplyMessage(targetMsg, settings.includeNativeHidden)) return null;
+    const userName = ctx.name1 || "User";
+    const charName = targetMsg.name || ctx.name2 || "Character";
+    const roundNumber = calculateRoundForMessageIndex(chat, msgIdx, settings.includeNativeHidden);
+    const lines = [];
+    let startMessageId = msgIdx;
+    if (msgIdx > 0 && chat[msgIdx - 1]?.is_user) {
+        startMessageId = msgIdx - 1;
+        const userText = cleanMessageText(chat[msgIdx - 1].mes, settings.targetContentTags, settings.customStripTags);
+        if (userText) lines.push(`【${userName}】：\n${userText}`);
+    }
+    const aiText = cleanMessageText(targetMsg.mes, settings.targetContentTags, settings.customStripTags);
+    if (aiText) lines.push(`【${charName}】：\n${aiText}`);
+    if (lines.length === 0) return null;
+    return {
+        roundNumber,
+        startMessageId,
+        endMessageId: msgIdx,
+        userName,
+        charName,
+        dialogueText: lines.join("\n\n"),
+    };
+}
+
+function replaceL0Entry(memoryData, target, replacement) {
+    const targetId = target?.id || "";
+    const targetStart = numOr(target?.startMessageId, -1);
+    const targetEnd = numOr(target?.endMessageId, -1);
+    const isTarget = item => item && item.level === 0 && (
+        (targetId && item.id === targetId)
+        || (targetStart >= 0 && targetEnd >= 0
+            && numOr(item.startMessageId, -2) === targetStart
+            && numOr(item.endMessageId, -3) === targetEnd)
+    );
+
+    memoryData.archivePool = (memoryData.archivePool || []).filter(item => !isTarget(item));
+    memoryData.archivePool.push(replacement);
+    memoryData.archivePool.sort((a, b) =>
+        numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+        - numOr(b.startMessageId, parseRoundRange(b.roundRange).start)
+    );
+
+    const activeL0 = Array.isArray(memoryData.levels?.[0]) ? memoryData.levels[0] : [];
+    const targetWasActive = activeL0.some(isTarget);
+    memoryData.levels[0] = activeL0.filter(item => !isTarget(item));
+    if (targetWasActive) {
+        memoryData.levels[0].push(replacement);
+        memoryData.levels[0].sort((a, b) =>
+            numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+            - numOr(b.startMessageId, parseRoundRange(b.roundRange).start)
+        );
+    }
+}
+
+function refreshLedgerFromLatestL0(memoryData) {
+    const latest = (memoryData.archivePool || [])
+        .filter(item => item && item.level === 0)
+        .sort((a, b) =>
+            numOr(a.endMessageId, parseRoundRange(a.roundRange).end)
+            - numOr(b.endMessageId, parseRoundRange(b.roundRange).end)
+        )
+        .at(-1);
+    if (latest?.postStateSnapshot) {
+        memoryData.stateLedger = clonePlainData(latest.postStateSnapshot);
+    }
+}
+
+async function resummarizeRoundInPlace(settings, ctx, chat, msgIdx, memoryData, chatKey, epoch) {
+    const turn = buildTurnSummaryInput(chat, msgIdx, settings, ctx);
+    if (!turn) return true;
+    const target = (memoryData.archivePool || []).find(item =>
+        item?.level === 0
+        && numOr(item.endMessageId, parseRoundRange(item.roundRange).end) === msgIdx
+    );
+    const before = (memoryData.archivePool || [])
+        .filter(item => item?.level === 0
+            && numOr(item.endMessageId, parseRoundRange(item.roundRange).end) < turn.startMessageId)
+        .sort((a, b) =>
+            numOr(a.endMessageId, parseRoundRange(a.roundRange).end)
+            - numOr(b.endMessageId, parseRoundRange(b.roundRange).end)
+        );
+
+    const working = createEmptyMemoryData();
+    working.levels = { 0: [] };
+    working.archivePool = [];
+    working.stateLedger = clonePlainData(before.at(-1)?.postStateSnapshot || createEmptyMemoryData().stateLedger);
+    working.lastProcessedMessageId = turn.startMessageId - 1;
+    working.lastProcessedRound = Math.max(0, turn.roundNumber - 1);
+
+    const replacement = await summarizeSingleTurn(settings, working, {
+        ...turn,
+        shouldCommit: () =>
+            isCurrentChat(chatKey)
+            && epoch === summaryEpoch
+            && chat[msgIdx] && memoryData === getChatMemory(),
+    });
+    if (!replacement) return false;
+    replaceL0Entry(memoryData, target, replacement);
+    refreshLedgerFromLatestL0(memoryData);
+    return true;
+}
+
+function runStoryResummarize(turns, { button = null, requireConfirm = true, title = "重新总结" } = {}) {
+    if (!Array.isArray(turns) || turns.length === 0) {
+        updateStatusBar("⚠️ 没有可重新总结的剧情轮次", true);
+        return null;
+    }
+    if (isBackfilling) {
+        updateStatusBar("⏸️ 历史扫描进行中，请等待扫描完成后再重新总结", true);
+        return null;
+    }
+    const chatKey = getChatKey();
+    if (activeSummaryChats.has(chatKey)) {
+        updateStatusBar("⏳ 当前存档正在总结，请稍后再试", true);
+        return null;
+    }
+    const fromRound = turns[0].round;
+    const toRound = turns.at(-1).round;
+    if (requireConfirm && !confirm(
+        `将重新总结第 ${fromRound}-${toRound} 轮，共 ${turns.length} 轮。\n` +
+        "会调用独立总结 API，并重建受影响的高层摘要。确定继续吗？"
+    )) return null;
+
+    const ctx = getSTContext();
+    const chat = ctx.chat || [];
+    const memoryData = getChatMemory();
+    const epoch = summaryEpoch;
+    storyViewRange = null;
+    renderStoryTimeline();
+    if (button) button.disabled = true;
+    activeSummaryChats.add(chatKey);
+    updateFloatingWidgetUI();
+
+    const job = enqueueBackgroundSummary(async () => {
+        try {
+            for (let i = 0; i < turns.length; i++) {
+                if (!isCurrentChat(chatKey) || epoch !== summaryEpoch) return;
+                const turn = turns[i];
+                if (chat[turn.idx] !== turn.msg) continue;
+                updateStatusBar(`⏳ ${title} ${i + 1}/${turns.length} · 第 ${turn.round} 轮`);
+                const ok = await resummarizeRoundInPlace(
+                    getSettings(), ctx, chat, turn.idx, memoryData, chatKey, epoch
+                );
+                if (!ok) return;
+            }
+            if (!isCurrentChat(chatKey) || epoch !== summaryEpoch || memoryData !== getChatMemory()) return;
+            const rebuilt = await rebuildMemoryHierarchy(
+                getSettings(),
+                memoryData,
+                () => isCurrentChat(chatKey) && epoch === summaryEpoch && memoryData === getChatMemory(),
+            );
+            if (!rebuilt) return;
+            memoryData.lastSummaryError = null;
+            await saveChatMemory();
+            await refreshPromptInjection();
+            updateFloatingWidgetUI();
+            renderStoryTimeline();
+            updateStatusBar(`✅ 已重新总结第 ${fromRound}-${toRound} 轮`);
+        } finally {
+            activeSummaryChats.delete(chatKey);
+            if (button) button.disabled = false;
+            updateFloatingWidgetUI();
+        }
+    }, title);
+    return job;
 }
 
 globalThis.tiandaoMemoryInterceptor = async function (chat, _contextSize, _abort, type) {
@@ -360,7 +685,12 @@ function syncHiddenMessagesState(forceRestoreAll = false) {
 
     // 只隐藏已经归档的轮次。首次安装、清空记忆或重建期间，原文必须继续发送。
     const cutoffIndex = shouldHide
-        ? computeHiddenMessageCutoff(chat, keepRounds, memoryData.lastProcessedMessageId)
+        ? computeHiddenMessageCutoff(
+            chat,
+            keepRounds,
+            memoryData.lastProcessedMessageId,
+            settings.includeNativeHidden,
+        )
         : 0;
 
     let restoredCount = 0;
@@ -418,12 +748,13 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
 
     const msgIdx = typeof targetMessageId === "number" ? targetMessageId : chat.length - 1;
     const targetMsg = chat[msgIdx];
-    if (!targetMsg || targetMsg.is_user || (targetMsg.is_system && !targetMsg.extra?.tiandao_hidden)) return false;
+    if (!isAiReplyMessage(targetMsg, settings.includeNativeHidden)) return false;
 
     const memoryData = options.memoryData || getChatMemory();
     const userName = ctx.name1 || "User";
     const charName = targetMsg.name || ctx.name2 || "Character";
-    const roundNumber = options.roundNumber || calculateRoundForMessageIndex(chat, msgIdx);
+    const roundNumber = options.roundNumber
+        || calculateRoundForMessageIndex(chat, msgIdx, settings.includeNativeHidden);
 
     const lines = [];
     let startFloor = msgIdx;
@@ -438,7 +769,13 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
     if (aiCleaned) {
         lines.push(`【${charName}】：\n${aiCleaned}`);
     }
-    if (lines.length === 0) return false;
+    if (lines.length === 0) {
+        // 空回复无需调用 API，但必须推进游标，避免后台队列永远卡在同一楼。
+        memoryData.lastProcessedMessageId = msgIdx;
+        memoryData.lastProcessedRound = roundNumber;
+        if (isCurrentChat(chatKey)) await saveChatMemory();
+        return true;
+    }
 
     activeSummaryChats.add(chatKey);
     updateFloatingWidgetUI();
@@ -451,6 +788,10 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
             userName,
             charName,
             dialogueText: lines.join("\n\n"),
+            onRetry: (attempt, total, error) => {
+                if (!isCurrentChat(chatKey)) return;
+                updateStatusBar(`⏳ 第 ${roundNumber} 轮解析失败，正在自动重试 (${attempt - 1}/${total - 1})：${String(error?.message || "等待重新解析").slice(0, 80)}`, true);
+            },
             shouldCommit: () => isCurrentChat(chatKey)
                 && epoch === summaryEpoch
                 && (isManual || getSettings().enabled)
@@ -463,6 +804,8 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
             }
             return false;
         }
+        pruneStaleCharacters(memoryData, roundNumber, { keepNames: [ctx.name1 || ""] });
+        memoryData.lastSummaryError = null;
         memoryData.lastProcessedMessageId = msgIdx;
         memoryData.lastProcessedRound = roundNumber;
         if (!isCurrentChat(chatKey)) return false;
@@ -476,8 +819,14 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
         }
         return true;
     } catch (err) {
-        console.error("[溯微] Summarize turn error:", err);
+        console.error("[溯微] Summarize turn error:", err?.message || err);
         if (isCurrentChat(chatKey)) {
+            memoryData.lastSummaryError = {
+                message: String(err?.message || "总结失败").slice(0, 300),
+                roundNumber,
+                at: Date.now(),
+            };
+            await saveChatMemory().catch(() => {});
             updateStatusBar(`❌ 总结失败: ${err.message}`, true);
         }
         return false;
@@ -485,6 +834,46 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
         activeSummaryChats.delete(chatKey);
         updateFloatingWidgetUI();
     }
+}
+
+/**
+ * 依次补齐指定位置上尚未归档的 AI 轮次。
+ * 自动化与手动恢复共用同一条队列，失败时停止，确保不会跨过缺口。
+ */
+function enqueuePendingAiTurns(chat, upToIndex, options = {}) {
+    const ctx = options.ctx || getSTContext();
+    const chatKey = options.chatKey || getChatKey();
+    const epoch = options.epoch ?? summaryEpoch;
+    const memoryData = options.memoryData || getChatMemory();
+    const pending = collectPendingAiTurns(
+        chat,
+        memoryData.lastProcessedMessageId,
+        upToIndex,
+        getSettings().includeNativeHidden,
+    );
+    if (pending.length === 0) return null;
+
+    const label = options.label || "补齐待归档轮次";
+    const isManual = Boolean(options.isManual);
+    const job = enqueueBackgroundSummary(async () => {
+        for (const task of pending) {
+            if (!isCurrentChat(chatKey) || epoch !== summaryEpoch) return;
+            if (chat[task.idx] !== task.msg) continue;
+            if (memoryData.lastProcessedMessageId >= task.idx) continue;
+            const ok = await processSingleAiTurn(task.idx, isManual, {
+                ctx,
+                chat,
+                chatKey,
+                memoryData,
+                epoch,
+            });
+            if (!ok) return;
+        }
+        if (isCurrentChat(chatKey) && typeof options.onDone === "function") {
+            await options.onDone();
+        }
+    }, label);
+    return job;
 }
 
 /**
@@ -497,7 +886,6 @@ function schedulePendingTurnsBeforeGeneration(chat, generationType) {
     if (!shouldSettleBeforeGeneration(generationType)) return false;
 
     if (!Array.isArray(chat) || chat.length < 2) return false;
-    const ctx = getSTContext();
     const memoryData = getChatMemory();
     const chatKey = getChatKey();
     if (isBackfilling && activeBackfillChatKey === chatKey) return false;
@@ -507,30 +895,257 @@ function schedulePendingTurnsBeforeGeneration(chat, generationType) {
     const settledEndIdx = lastMsg?.is_user ? chat.length - 2 : chat.length - 1;
     if (settledEndIdx <= memoryData.lastProcessedMessageId) return false;
 
-    const pending = [];
-    for (let idx = Math.max(0, memoryData.lastProcessedMessageId + 1); idx <= settledEndIdx; idx++) {
-        const msg = chat[idx];
-        if (!msg || msg.is_user || (msg.is_system && !msg.extra?.tiandao_hidden)) continue;
-        pending.push({ idx, msg });
-    }
-    if (pending.length === 0) return false;
-
-    enqueueBackgroundSummary(async () => {
-        for (const task of pending) {
-            if (!isCurrentChat(chatKey) || epoch !== summaryEpoch) return;
-            if (chat[task.idx] !== task.msg) continue;
-            if (memoryData.lastProcessedMessageId >= task.idx) continue;
-            await processSingleAiTurn(task.idx, false, {
-                ctx,
-                chat,
-                chatKey,
-                memoryData,
-                epoch,
-            });
-        }
-    }, "结算上一轮");
-    return true;
+    return enqueuePendingAiTurns(chat, settledEndIdx, {
+        ctx: getSTContext(),
+        chatKey,
+        epoch,
+        memoryData,
+        label: "结算上一轮",
+    });
 }
+
+/**
+ * 供界面显示的“历史欠账”：默认不把最新一条 AI 回复算作异常待补，
+ * 因为 on_next_send 模式下它本来就要等玩家发送下一条时才结算。
+ */
+function getPendingBacklog(chat, memoryData) {
+    if (!Array.isArray(chat) || chat.length === 0) return [];
+    let upToIndex = chat.length - 1;
+    const settings = getSettings();
+    if (!settings.autoSummarizePerTurn && !memoryData.lastSummaryError) return [];
+    const lastMsg = chat[chat.length - 1];
+    if (settings.summarizeTiming === "on_next_send"
+        && lastMsg
+        && !lastMsg.is_user
+        && !memoryData.lastSummaryError) {
+        upToIndex = chat.length - 2;
+    }
+    return collectPendingAiTurns(
+        chat,
+        memoryData.lastProcessedMessageId,
+        upToIndex,
+        settings.includeNativeHidden,
+    );
+}
+
+function renderStoryRecoveryState(memoryData = getChatMemory(), pendingOverride = null) {
+    const box = document.getElementById("tiandao_story_error_box");
+    const messageEl = document.getElementById("tiandao_story_error_message");
+    const recoverBtn = document.getElementById("tiandao_story_recover_btn");
+    if (!box || !messageEl) return;
+
+    const pending = pendingOverride || getPendingBacklog(getSTContext().chat || [], memoryData);
+    const error = memoryData.lastSummaryError;
+    if (pending.length === 0 && !error) {
+        box.style.display = "none";
+        return;
+    }
+
+    const errorText = error
+        ? `第 ${error.roundNumber || "?"} 轮总结失败：${String(error.message || "未知错误").slice(0, 120)}`
+        : "有历史轮次尚未归档。";
+    messageEl.textContent = pending.length > 0
+        ? `${errorText} 待补 ${pending.length} 轮。`
+        : errorText;
+    box.style.display = "flex";
+    if (recoverBtn) {
+        recoverBtn.disabled = pending.length === 0;
+        recoverBtn.style.display = pending.length > 0 ? "inline-flex" : "none";
+    }
+}
+
+function recoverPendingSummaries() {
+    const ctx = getSTContext();
+    const chat = ctx.chat || [];
+    const memoryData = getChatMemory();
+    const pending = getPendingBacklog(chat, memoryData);
+    if (pending.length === 0) {
+        updateStatusBar("✅ 当前没有待补的历史轮次");
+        renderStoryRecoveryState(memoryData);
+        return;
+    }
+    const upToIndex = pending[pending.length - 1].idx;
+    const chatKey = getChatKey();
+    const epoch = summaryEpoch;
+    const btn = document.getElementById("tiandao_story_recover_btn");
+    const job = enqueuePendingAiTurns(chat, upToIndex, {
+        ctx,
+        chatKey,
+        epoch,
+        memoryData,
+        isManual: true,
+        label: "手动补齐待归档轮次",
+        onDone: async () => {
+            memoryData.lastSummaryError = null;
+            await saveChatMemory().catch(() => {});
+            updateFloatingWidgetUI();
+            updateStatusBar(`✅ 已补齐 ${pending.length} 轮待归档历史`);
+        },
+    });
+    if (btn && job) {
+        btn.disabled = true;
+        job.finally(() => { btn.disabled = false; });
+    }
+}
+
+/**
+ * 「剧情」页的总结范围：按轮次选取并重整该区间。
+ * fill=只补缺失（非破坏性）| view=仅筛选展示 | rebuild=从起点重做到最新
+ */
+function resummarizeStoryRange() {
+    const ctx = getSTContext();
+    const chat = ctx.chat || [];
+    if (chat.length === 0) {
+        updateStatusBar("⚠️ 当前没有可总结的历史对话", true);
+        return;
+    }
+
+    const aiTurns = [];
+    for (let idx = 0; idx < chat.length; idx++) {
+        const msg = chat[idx];
+        if (!isAiReplyMessage(msg, settings.includeNativeHidden)) continue;
+        aiTurns.push({
+            idx,
+            round: calculateRoundForMessageIndex(chat, idx, settings.includeNativeHidden),
+            msg,
+        });
+    }
+    if (aiTurns.length === 0) {
+        updateStatusBar("⚠️ 当前没有可总结的 AI 回复", true);
+        return;
+    }
+
+    const latestRound = aiTurns[aiTurns.length - 1].round;
+    const fromEl = document.getElementById("tiandao_story_range_from");
+    const toEl = document.getElementById("tiandao_story_range_to");
+    const rawFrom = String(fromEl?.value ?? "").trim();
+    const rawTo = String(toEl?.value ?? "").trim();
+    let fromRound = rawFrom === "" ? 1 : Math.max(1, Math.floor(Number(rawFrom)));
+    let toRound = rawTo === "" ? latestRound : Math.max(1, Math.floor(Number(rawTo)));
+    if (!Number.isFinite(fromRound) || !Number.isFinite(toRound)) {
+        updateStatusBar("⚠️ 请输入有效的起始与结束轮次", true);
+        return;
+    }
+    if (fromRound > toRound) {
+        [fromRound, toRound] = [toRound, fromRound];
+    }
+
+    const mode = document.getElementById("tiandao_story_range_mode")?.value || "fill";
+    if (mode === "view") {
+        storyViewRange = (rawFrom === "" && rawTo === "") ? null : { from: fromRound, to: toRound };
+        renderStoryTimeline();
+        updateStatusBar(storyViewRange
+            ? `👁️ 正在显示第 ${fromRound}-${toRound} 轮的总结`
+            : "👁️ 已显示全部剧情总结");
+        return;
+    }
+
+    const memoryData = getChatMemory();
+    const chatKey = getChatKey();
+    const epoch = summaryEpoch;
+    const btn = document.getElementById("tiandao_story_range_btn");
+
+    if (mode === "fill") {
+        storyViewRange = null;
+        renderStoryTimeline();
+        const pendingInRange = collectPendingAiTurns(
+            chat,
+            memoryData.lastProcessedMessageId,
+            Infinity,
+            settings.includeNativeHidden,
+        )
+            .filter(turn => turn.round >= fromRound && turn.round <= toRound);
+        if (pendingInRange.length === 0) {
+            updateStatusBar(`✅ 第 ${fromRound}-${toRound} 轮没有缺失的总结`);
+            return;
+        }
+        const upToIndex = pendingInRange[pendingInRange.length - 1].idx;
+        const job = enqueuePendingAiTurns(chat, upToIndex, {
+            ctx,
+            chatKey,
+            epoch,
+            memoryData,
+            isManual: true,
+            label: "补齐范围缺失总结",
+            onDone: async () => {
+                memoryData.lastSummaryError = null;
+                await saveChatMemory().catch(() => {});
+                updateFloatingWidgetUI();
+                updateStatusBar(`✅ 第 ${fromRound}-${toRound} 轮缺失总结已补齐`);
+            },
+        });
+        if (btn && job) {
+            btn.disabled = true;
+            job.finally(() => { btn.disabled = false; });
+        }
+        return;
+    }
+
+    const rebuildTurns = aiTurns.filter(turn => turn.round >= fromRound && turn.round <= toRound);
+    if (rebuildTurns.length === 0) {
+        updateStatusBar(`⚠️ 第 ${fromRound}-${toRound} 轮没有可重新总结的 AI 回复`, true);
+        return;
+    }
+    runStoryResummarize(rebuildTurns, { button: btn, title: "重新总结范围" });
+}
+
+function rebuildAllStorySummaries() {
+    const chat = getSTContext().chat || [];
+    const settings = getSettings();
+    const aiTurns = [];
+    for (let idx = 0; idx < chat.length; idx++) {
+        const msg = chat[idx];
+        if (!isAiReplyMessage(msg, settings.includeNativeHidden)) continue;
+        aiTurns.push({
+            idx,
+            round: calculateRoundForMessageIndex(chat, idx, settings.includeNativeHidden),
+            msg,
+        });
+    }
+    const btn = document.getElementById("tiandao_story_rebuild_all_btn");
+    runStoryResummarize(aiTurns, { button: btn, title: "重新总结全部" });
+}
+
+function resummarizeStoryEntry(lvl, idx, button = null) {
+    const item = getChatMemory()?.levels?.[lvl]?.[idx];
+    if (!item) {
+        updateStatusBar("⚠️ 该剧情条目已不存在，请刷新后重试", true);
+        return;
+    }
+    const range = parseRoundRange(item.roundRange);
+    const chat = getSTContext().chat || [];
+    const settings = getSettings();
+    const turns = [];
+    for (let messageIndex = 0; messageIndex < chat.length; messageIndex++) {
+        const msg = chat[messageIndex];
+        if (!isAiReplyMessage(msg, settings.includeNativeHidden)) continue;
+        const round = calculateRoundForMessageIndex(
+            chat,
+            messageIndex,
+            settings.includeNativeHidden,
+        );
+        if (round >= range.start && round <= range.end) {
+            turns.push({ idx: messageIndex, round, msg });
+        }
+    }
+    if (turns.length === 0) {
+        updateStatusBar(`⚠️ 第 ${item.roundRange} 轮没有可重新总结的剧情原文`, true);
+        return;
+    }
+    runStoryResummarize(turns, {
+        button,
+        requireConfirm: turns.length > 1,
+        title: `重新总结第 ${item.roundRange} 轮`,
+    });
+}
+
+window.tiandaoResummarizeStoryEntry = (lvl, idx) => {
+    const entry = document.querySelector(
+        `.tiandao-story-entry[data-lvl="${lvl}"][data-idx="${idx}"]`
+    );
+    const button = entry?.querySelector(".tiandao-entry-resummarize-btn") || null;
+    resummarizeStoryEntry(lvl, idx, button);
+};
 
 // ==================== 🌌 “溯微” 实时记忆悬浮窗 (Floating Widget) ====================
 let isWidgetExpanded = false;
@@ -558,7 +1173,7 @@ function initFloatingWidget() {
                 <button type="button" id="tiandao_widget_close_btn" class="tiandao-card-close" title="折叠看板">&times;</button>
             </div>
 
-            <div id="tiandao_status_bar" class="tiandao-status-bar">
+            <div id="tiandao_status_bar" class="tiandao-status-bar" style="display:none;">
                 <i class="fa-solid fa-circle-dot" style="font-size:0.75em; opacity:0.8;"></i> <span class="tiandao-status-text">当前状态：就绪</span>
             </div>
 
@@ -572,6 +1187,34 @@ function initFloatingWidget() {
 
                 <!-- Tab 2: 剧情（各轮总结时间线） -->
                 <div id="tiandao_tab_story_content" class="tiandao-tab-page" style="display: none;">
+                    <div id="tiandao_story_error_box" class="tiandao-story-error-box" style="display:none;">
+                        <div class="tiandao-story-error-text">
+                            <i class="fa-solid fa-triangle-exclamation"></i>
+                            <span id="tiandao_story_error_message"></span>
+                        </div>
+                        <button type="button" id="tiandao_story_recover_btn" class="tiandao-btn tiandao-btn-sm">
+                            <i class="fa-solid fa-rotate-right"></i> 立即补总结
+                        </button>
+                    </div>
+                    <div class="tiandao-story-range-bar">
+                        <span class="tiandao-story-range-label">轮次</span>
+                        <input id="tiandao_story_range_from" type="number" min="1" class="tiandao-input tiandao-input-sm" placeholder="起始" aria-label="起始轮次" />
+                        <span class="tiandao-story-range-dash">-</span>
+                        <input id="tiandao_story_range_to" type="number" min="1" class="tiandao-input tiandao-input-sm" placeholder="结束" aria-label="结束轮次" />
+                        <select id="tiandao_story_range_mode" class="tiandao-select tiandao-story-range-mode" aria-label="总结范围操作">
+                            <option value="fill">仅补缺失</option>
+                            <option value="view">仅筛选查看</option>
+                            <option value="rebuild">重新总结</option>
+                        </select>
+                        <button type="button" id="tiandao_story_range_btn" class="tiandao-btn tiandao-btn-sm" title="重新总结所选轮次范围">
+                            <i class="fa-solid fa-wand-magic-sparkles"></i> 执行
+                        </button>
+                    </div>
+                    <div class="tiandao-story-bulk-bar">
+                        <button type="button" id="tiandao_story_rebuild_all_btn" class="tiandao-btn tiandao-btn-sm">
+                            <i class="fa-solid fa-arrows-rotate"></i> 重新总结全部
+                        </button>
+                    </div>
                     <div id="tiandao_story_page_timeline" class="tiandao-story-page"></div>
                 </div>
 
@@ -600,6 +1243,10 @@ function initFloatingWidget() {
                                     <input id="tiandao_auto_summarize" type="checkbox" class="tiandao-checkbox" />
                                 </label>
                                 <div class="tiandao-form-row">
+                                    <span class="tiandao-field-label">解析/请求失败自动重试次数</span>
+                                    <input id="tiandao_summary_retry" type="number" class="tiandao-input tiandao-input-sm" min="0" max="5" placeholder="2" />
+                                </div>
+                                <div class="tiandao-form-row">
                                     <span class="tiandao-field-label">总结触发时机</span>
                                     <select id="tiandao_summarize_timing" class="tiandao-select">
                                         <option value="on_next_send">发送下一条时 (重Roll零消耗·推荐)</option>
@@ -607,10 +1254,10 @@ function initFloatingWidget() {
                                     </select>
                                 </div>
                                 <div class="tiandao-form-row">
-                                    <span class="tiandao-field-label">🎨 看板主题</span>
+                                    <span class="tiandao-field-label">看板主题</span>
                                     <select id="tiandao_widget_theme" class="tiandao-select">
-                                        <option value="porcelain">月白瓷 · 清爽瓷白</option>
-                                        <option value="matcha">抹茶乳霜 · 奶绿软糯</option>
+                                        <option value="porcelain">瓷白精修 · 清透纸感</option>
+                                        <option value="journal">书页叙事 · 暖纸墨痕</option>
                                     </select>
                                 </div>
                             </div>
@@ -710,6 +1357,27 @@ function initFloatingWidget() {
 
                     <!-- 设置分页 2 · API -->
                     <div class="tiandao-settings-page" data-page="api" style="display: none;">
+                        <div class="tiandao-card-panel">
+                            <div class="tiandao-panel-title">
+                                <i class="fa-solid fa-bookmark"></i> API 配置档案
+                            </div>
+                            <div class="tiandao-api-profile-row">
+                                <select id="tiandao_api_profile_select" class="tiandao-select tiandao-api-profile-select" aria-label="已保存的 API 配置"></select>
+                                <button type="button" id="tiandao_api_profile_delete_btn" class="tiandao-btn tiandao-btn-sm tiandao-btn-danger" disabled>
+                                    删除
+                                </button>
+                            </div>
+                            <div class="tiandao-api-profile-save-row">
+                                <input id="tiandao_api_profile_name" type="text" class="tiandao-input" maxlength="80" placeholder="配置名称，例如 DeepSeek" aria-label="API 配置名称" />
+                                <button type="button" id="tiandao_api_profile_save_btn" class="tiandao-btn tiandao-btn-sm tiandao-btn-primary">
+                                    保存当前
+                                </button>
+                            </div>
+                            <div class="tiandao-field-caption tiandao-api-profile-hint">
+                                保存地址、Key、模型与生成参数，切换后立即生效。
+                            </div>
+                        </div>
+
                         <!-- 独立总结 API 设置 -->
                         <div class="tiandao-card-panel">
                             <div class="tiandao-panel-title">
@@ -741,19 +1409,8 @@ function initFloatingWidget() {
                                 </div>
                                 <div class="tiandao-input-wrapper">
                                     <i class="fa-solid fa-microchip tiandao-input-icon"></i>
-                                    <input id="tiandao_model" type="text" class="tiandao-input with-icon" list="tiandao_model_datalist" placeholder="例如 deepseek-chat 或点击下方快捷标签" />
-                                    <datalist id="tiandao_model_datalist">
-                                        <option value="deepseek-chat"></option>
-                                        <option value="gemini-2.5-flash"></option>
-                                        <option value="gpt-4o-mini"></option>
-                                        <option value="qwen-2.5-72b-instruct"></option>
-                                    </datalist>
-                                </div>
-                                <!-- 常用快捷模型 Chips -->
-                                <div class="tiandao-quick-chips">
-                                    <span class="tiandao-chip" data-model="deepseek-chat">deepseek-chat</span>
-                                    <span class="tiandao-chip" data-model="gemini-2.5-flash">gemini-2.5-flash</span>
-                                    <span class="tiandao-chip" data-model="gpt-4o-mini">gpt-4o-mini</span>
+                                    <input id="tiandao_model" type="text" class="tiandao-input with-icon" list="tiandao_model_datalist" placeholder="" />
+                                    <datalist id="tiandao_model_datalist"></datalist>
                                 </div>
                             </div>
 
@@ -761,15 +1418,23 @@ function initFloatingWidget() {
                                 <span class="tiandao-field-label">总结温度 (Temperature)</span>
                                 <input id="tiandao_temp" type="number" step="0.05" min="0" max="1.5" class="tiandao-input tiandao-input-sm" placeholder="0.2" />
                             </div>
+                            <div class="tiandao-form-row">
+                                <span class="tiandao-field-label">最大输出 Tokens</span>
+                                <input id="tiandao_max_tokens" type="number" min="500" max="16000" step="500" class="tiandao-input tiandao-input-sm" placeholder="4000" />
+                            </div>
+                            <label class="tiandao-toggle-row">
+                                <span class="tiandao-toggle-label">启用 JSON 模式（不支持时自动回退）</span>
+                                <input id="tiandao_use_json_mode" type="checkbox" class="tiandao-checkbox" />
+                            </label>
 
                             <div class="tiandao-input-block" style="margin-top: 8px;">
                                 <label class="tiandao-field-caption">🎯 目标正文提取标签（白名单优先）</label>
-                                <input id="tiandao_target_tags" type="text" class="tiandao-input" placeholder="默认留空（若有特定标签可填 content, story 等）" />
+                                <input id="tiandao_target_tags" type="text" class="tiandao-input" placeholder="" />
                             </div>
 
                             <div class="tiandao-input-block">
                                 <label class="tiandao-field-caption">备用排除标签（黑名单）</label>
-                                <input id="tiandao_strip_tags" type="text" class="tiandao-input" placeholder="默认内置 thinking, report, options_engine 等" />
+                                <input id="tiandao_strip_tags" type="text" class="tiandao-input" placeholder="" />
                             </div>
 
                             <button type="button" id="tiandao_test_api_btn" class="tiandao-btn tiandao-btn-primary tiandao-btn-full" style="margin-top: 10px;">
@@ -792,6 +1457,14 @@ function initFloatingWidget() {
                                 <button type="button" id="tiandao_clear_memory_btn" class="tiandao-btn tiandao-btn-danger">
                                     <i class="fa-solid fa-trash-can"></i> 清空本存档记忆
                                 </button>
+                            </div>
+                            <div class="tiandao-panel-divider"></div>
+                            <label class="tiandao-toggle-row">
+                                <span class="tiandao-toggle-label">扫描与重新总结包含酒馆原生隐藏楼层</span>
+                                <input id="tiandao_include_native_hidden" type="checkbox" class="tiandao-checkbox" />
+                            </label>
+                            <div class="tiandao-field-caption" style="margin:5px 0 0;">
+                                仅在确认隐藏楼层属于剧情正文时开启，系统消息也会被纳入扫描。
                             </div>
                         </div>
 
@@ -822,11 +1495,6 @@ function initFloatingWidget() {
                 <div id="tiandao_widget_summary_info" class="tiandao-footer-meta">
                     L0: 0 | L1: 0 | L2: 0
                 </div>
-                <div class="tiandao-footer-actions">
-                    <button type="button" id="tiandao_widget_refresh_last_btn" class="tiandao-btn tiandao-btn-sm" title="重整当前最新一问一答轮次">
-                        <i class="fa-solid fa-rotate"></i> 重整本轮
-                    </button>
-                </div>
             </div>
         </div>
     `;
@@ -841,22 +1509,31 @@ function initFloatingWidget() {
     const tabLedgerContent = document.getElementById("tiandao_tab_ledger_content");
     const tabStoryContent = document.getElementById("tiandao_tab_story_content");
     const tabSettingsContent = document.getElementById("tiandao_tab_settings_content");
-    const refreshLastBtn = document.getElementById("tiandao_widget_refresh_last_btn");
 
-    // 展开/折叠
-    pill.addEventListener("click", () => {
-        isWidgetExpanded = !isWidgetExpanded;
-        card.style.display = isWidgetExpanded ? "flex" : "none";
-        if (isWidgetExpanded) {
+    // 展开/折叠：展开后用卡片头作为拖拽锚点，胶囊本体暂时隐藏。
+    const setWidgetExpanded = (expanded) => {
+        if (expanded) {
+            // 先按胶囊当前位置决定展开方向，再切换到卡片锚点，避免量到卡片自身。
+            isWidgetExpanded = false;
             positionFloatingWidgetCard();
+            isWidgetExpanded = true;
+            widget.classList.add("tiandao-widget-expanded");
+            card.style.display = "flex";
+            pill.style.display = "none";
             updateFloatingWidgetUI();
+        } else {
+            isWidgetExpanded = false;
+            widget.classList.remove("tiandao-widget-expanded");
+            card.style.display = "none";
+            pill.style.display = "inline-flex";
         }
-    });
+    };
+
+    pill.addEventListener("click", () => setWidgetExpanded(!isWidgetExpanded));
 
     closeBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        isWidgetExpanded = false;
-        card.style.display = "none";
+        setWidgetExpanded(false);
     });
 
     // 主 Tab 切换（状态看板 / 剧情 / 溯微设置）
@@ -877,6 +1554,27 @@ function initFloatingWidget() {
         renderStoryTimeline();
     });
 
+    const storyRangeBtn = document.getElementById("tiandao_story_range_btn");
+    if (storyRangeBtn) storyRangeBtn.addEventListener("click", resummarizeStoryRange);
+    const storyRebuildAllBtn = document.getElementById("tiandao_story_rebuild_all_btn");
+    if (storyRebuildAllBtn) storyRebuildAllBtn.addEventListener("click", rebuildAllStorySummaries);
+    const storyRangeMode = document.getElementById("tiandao_story_range_mode");
+    const syncStoryRangeModeUi = () => {
+        if (!storyRangeBtn || !storyRangeMode) return;
+        const mode = storyRangeMode.value;
+        const config = {
+            fill: { text: "补齐", title: "只补齐所选范围内尚未归档的轮次" },
+            view: { text: "筛选", title: "只筛选时间线显示，不调用总结 API" },
+            rebuild: { text: "总结", title: "从起始轮重新总结到结束轮" },
+        }[mode] || { text: "执行", title: "执行范围操作" };
+        storyRangeBtn.innerHTML = `<i class="fa-solid fa-wand-magic-sparkles"></i> ${config.text}`;
+        storyRangeBtn.title = config.title;
+    };
+    if (storyRangeMode) storyRangeMode.addEventListener("change", syncStoryRangeModeUi);
+    syncStoryRangeModeUi();
+    const storyRecoverBtn = document.getElementById("tiandao_story_recover_btn");
+    if (storyRecoverBtn) storyRecoverBtn.addEventListener("click", recoverPendingSummaries);
+
     tabSettingsBtn.addEventListener("click", () => {
         switchMainTab(tabSettingsBtn, tabSettingsContent);
     });
@@ -890,42 +1588,6 @@ function initFloatingWidget() {
             card.querySelectorAll("#tiandao_tab_settings_content .tiandao-settings-page").forEach(p => {
                 p.style.display = p.dataset.page === target ? "block" : "none";
             });
-        });
-    });
-
-    if (refreshLastBtn) refreshLastBtn.addEventListener("click", async () => {
-        const ctx = getSTContext();
-        const chat = ctx.chat || [];
-        let msgIdx = chat.length - 1;
-        while (msgIdx >= 0 && (chat[msgIdx]?.is_user || (chat[msgIdx]?.is_system && !chat[msgIdx]?.extra?.tiandao_hidden))) {
-            msgIdx--;
-        }
-        if (msgIdx < 0) {
-            updateStatusBar("当前没有可重整的 AI 回复", true);
-            return;
-        }
-        const chatKey = getChatKey();
-        const epoch = summaryEpoch;
-        const targetMsg = chat[msgIdx];
-        enqueueBackgroundSummary(async () => {
-            if (!isCurrentChat(chatKey) || epoch !== summaryEpoch || chat[msgIdx] !== targetMsg) return;
-            await processSingleAiTurn(msgIdx, true, { ctx, chat, chatKey, epoch });
-        }, "重整本轮");
-    });
-
-    // 快捷模型标签点击填充
-    const chips = card.querySelectorAll(".tiandao-chip");
-    chips.forEach(chip => {
-        chip.addEventListener("click", () => {
-            const m = chip.getAttribute("data-model");
-            const modelInput = document.getElementById("tiandao_model");
-            if (!modelInput || !m) return;
-            modelInput.value = m;
-            const settings = getSettings();
-            settings.model = m;
-            saveSettings();
-            syncModelChipActive();
-            updateStatusBar(`✨ 已选择模型: ${m}`);
         });
     });
 
@@ -996,11 +1658,12 @@ function positionFloatingWidgetCard() {
     const widget = document.getElementById("tiandao_floating_widget");
     const card = document.getElementById("tiandao_widget_card");
     if (!widget || !card) return;
+    if (isWidgetExpanded) return;
 
     const rect = widget.getBoundingClientRect();
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-    const desiredWidth = Math.min(360, vw - 20);
+    const desiredWidth = Math.min(372, vw - 20);
 
     const openRightward = rect.left < desiredWidth;
     const spaceBelow = vh - rect.bottom - 10;
@@ -1010,7 +1673,10 @@ function positionFloatingWidgetCard() {
     card.classList.toggle("tiandao-open-leftward", !openRightward);
     card.classList.toggle("tiandao-open-rightward", openRightward);
     card.classList.toggle("tiandao-open-upward", openUpward);
-    card.style.maxHeight = Math.max(200, Math.min(610, openUpward ? spaceAbove : spaceBelow)) + "px";
+    const viewportCap = vw <= 600 ? vh * 0.78 : vh;
+    const fixedHeight = Math.max(200, Math.min(610, viewportCap, openUpward ? spaceAbove : spaceBelow));
+    card.style.height = fixedHeight + "px";
+    card.style.maxHeight = fixedHeight + "px";
 }
 
 function makeDraggable(element, handle, { onDragMove = null } = {}) {
@@ -1029,9 +1695,13 @@ function makeDraggable(element, handle, { onDragMove = null } = {}) {
         moved = false;
         startX = e.clientX;
         startY = e.clientY;
-        const rect = element.getBoundingClientRect();
-        baseLeft = rect.left;
-        baseTop = rect.top;
+        const cardSurface = handle.closest(".tiandao-widget-card");
+        const dragSurface = cardSurface || element;
+        const rect = dragSurface.getBoundingClientRect();
+        const opensRightward = Boolean(cardSurface?.classList.contains("tiandao-open-rightward"));
+        const opensUpward = Boolean(cardSurface?.classList.contains("tiandao-open-upward"));
+        baseLeft = cardSurface && !opensRightward ? rect.right : rect.left;
+        baseTop = cardSurface && opensUpward ? rect.bottom : rect.top;
         element.style.left = baseLeft + "px";
         element.style.top = baseTop + "px";
         element.style.right = "auto";
@@ -1046,8 +1716,9 @@ function makeDraggable(element, handle, { onDragMove = null } = {}) {
         const dy = e.clientY - startY;
         if (!moved && Math.hypot(dx, dy) < 4) return;
         moved = true;
-        const width = element.offsetWidth || 120;
-        const height = element.offsetHeight || 40;
+        const dragSurface = handle.closest(".tiandao-widget-card") || element;
+        const width = dragSurface.offsetWidth || 120;
+        const height = dragSurface.offsetHeight || 40;
         const nextLeft = Math.min(Math.max(8, baseLeft + dx), window.innerWidth - width - 8);
         const nextTop = Math.min(Math.max(8, baseTop + dy), window.innerHeight - height - 8);
         element.style.left = nextLeft + "px";
@@ -1095,13 +1766,20 @@ function updateFloatingWidgetUI() {
     const l1Count = (memoryData.levels?.[1] || []).length;
     const l2Count = (memoryData.levels?.[2] || []).length;
     const l3Count = (memoryData.levels?.[3] || []).length;
+    const pendingBacklog = getPendingBacklog(getSTContext().chat || [], memoryData);
 
     if (badge) {
         const badgeText = !settings.enabled
             ? "已暂停"
             : (isBackfilling && activeBackfillChatKey === getChatKey()
                 ? "回溯中"
-                : (activeSummaryChats.has(getChatKey()) ? "整理中" : (memoryData.lastProcessedRound > 0 ? `第${memoryData.lastProcessedRound}轮` : "就绪")));
+                : (activeSummaryChats.has(getChatKey())
+                    ? "整理中"
+                    : (pendingBacklog.length > 0
+                        ? `待补 ${pendingBacklog.length}`
+                        : (memoryData.lastSummaryError
+                            ? "需检查"
+                            : (memoryData.lastProcessedRound > 0 ? `第${memoryData.lastProcessedRound}轮` : "就绪")))));
         badge.textContent = badgeText;
     }
     if (pill) {
@@ -1120,6 +1798,7 @@ function updateFloatingWidgetUI() {
 
     // 「剧情」Tab 的时间线随数据实时刷新（纯展示无输入，重建安全）
     renderStoryTimeline();
+    renderStoryRecoveryState(memoryData, pendingBacklog);
 }
 
 /**
@@ -1141,8 +1820,28 @@ function buildLedgerHtml(memoryData) {
     const ledger = memoryData.stateLedger || {};
     const chars = ledger.characters || {};
     const charCards = [];
+    const ctx = getSTContext();
+    const userNames = new Set(
+        [ctx.name1, ...(Array.isArray(ctx.chat) ? ctx.chat.filter(msg => msg?.is_user).map(msg => msg?.name) : [])]
+            .map(name => String(name || "").trim())
+            .filter(Boolean)
+    );
 
-    for (const [name, info] of Object.entries(chars)) {
+    const entries = Object.entries(chars);
+    entries.sort(([nameA], [nameB]) => {
+        const aIsUser = userNames.has(nameA);
+        const bIsUser = userNames.has(nameB);
+        if (aIsUser !== bIsUser) return aIsUser ? -1 : 1;
+        const aPresent = chars[nameA]?.present === false ? 0 : 1;
+        const bPresent = chars[nameB]?.present === false ? 0 : 1;
+        if (aPresent !== bPresent) return bPresent - aPresent;
+        const aSeen = numOr(chars[nameA]?.lastSeenRound, 0);
+        const bSeen = numOr(chars[nameB]?.lastSeenRound, 0);
+        if (aSeen !== bSeen) return bSeen - aSeen;
+        return 0;
+    });
+
+    for (const [name, info] of entries) {
         if (!info) continue;
         // 已摘除的饰品并入随身道具展示（标注“已摘下”），不再单列一行
         const removedParts = (Array.isArray(info.removedItemsLock) ? info.removedItemsLock : [])
@@ -1157,14 +1856,23 @@ function buildLedgerHtml(memoryData) {
         const inv = allItems.length > 0
             ? `<div class="tiandao-char-prop tag-info"><i class="fa-solid fa-box-archive"></i> <b>随身道具</b>: ${allItems.join("，")}</div>`
             : "";
+        const aliasHtml = (Array.isArray(info.aliases) && info.aliases.length > 0)
+            ? `<div class="tiandao-char-alias">别名/称号: ${info.aliases.map(escapeHTML).join("，")}</div>`
+            : "";
+        const away = info.present === false;
+        const initial = escapeHTML(Array.from(String(name || "?"))[0] || "?");
 
         charCards.push(`
-            <div class="tiandao-char-card">
+            <div class="tiandao-char-card${away ? " tiandao-char-away" : ""}">
                 <div class="tiandao-char-card-header">
-                    <span class="tiandao-char-name">${escapeHTML(name)}</span>
-                    <span class="tiandao-char-loc"><i class="fa-solid fa-location-dot"></i> ${escapeHTML(info.location || "未知位置")}</span>
+                    <span class="tiandao-char-person">
+                        <span class="tiandao-char-avatar" aria-hidden="true">${initial}</span>
+                        <span class="tiandao-char-name">${escapeHTML(name)}</span>
+                    </span>
+                    <span class="tiandao-char-loc">${away ? '<i class="fa-solid fa-person-walking-arrow-right"></i> 暂离场 · ' : '<i class="fa-solid fa-location-dot"></i> '}${escapeHTML(info.location || "未知位置")}</span>
                 </div>
                 <div class="tiandao-char-body">
+                    ${aliasHtml}
                     <div class="tiandao-char-prop"><b>状态行动</b>: ${escapeHTML(info.statusAndAction || "平静")}</div>
                     <div class="tiandao-char-prop"><b>当前衣着</b>: ${escapeHTML(info.wear || "常规穿戴")}</div>
                     ${inv}
@@ -1182,7 +1890,7 @@ function buildLedgerHtml(memoryData) {
             <span class="tiandao-time-label"><i class="fa-regular fa-clock"></i> 故事时间</span>
             <span class="tiandao-time-val">${escapeHTML(ledger.time || "未知时间")}</span>
         </div>
-        ${charCards.length > 0 ? charCards.join("") : "<div class='tiandao-empty-hint'>暂无在场人物追踪</div>"}
+        ${charCards.length > 0 ? charCards.join("") : "<div class='tiandao-empty-hint'>暂无在场个体状态</div>"}
         <div class="tiandao-todo-box">
             <div class="tiandao-todo-title"><i class="fa-solid fa-list-check"></i> 待办与约定追踪</div>
             <div class="tiandao-todo-list">${todoHtml}</div>
@@ -1194,10 +1902,17 @@ function buildLedgerHtml(memoryData) {
  * 剧情时间线：各轮总结按层级（L2 大阶段 → L1 阶段 → L0 单轮）由远及近汇总，
  * 每条总结带编辑按钮，可内联修改剧情文本
  */
+let storyViewRange = null;
+
 function buildTimelineHtml(memoryData) {
     const sections = [];
     const levels = memoryData.levels || {};
     const maxLvl = Math.max(...Object.keys(levels).map(Number), 1);
+    const inViewRange = (item) => {
+        if (!storyViewRange) return true;
+        const range = parseRoundRange(item?.roundRange);
+        return range.end >= storyViewRange.from && range.start <= storyViewRange.to;
+    };
 
     const pushEntry = (lvl, item, idx) => {
         const badgeClass = lvl >= 2 ? "tiandao-lvl-2" : (lvl === 1 ? "tiandao-lvl-1" : "tiandao-lvl-0");
@@ -1210,24 +1925,31 @@ function buildTimelineHtml(memoryData) {
                     <button type="button" class="tiandao-entry-edit-btn" title="编辑这条剧情总结" onclick="window.tiandaoEditStoryEntry(${lvl}, ${idx})">
                         <i class="fa-solid fa-pen"></i>
                     </button>
+                    <button type="button" class="tiandao-entry-resummarize-btn" title="只重新总结这条对应的轮次" onclick="window.tiandaoResummarizeStoryEntry(${lvl}, ${idx})">
+                        <i class="fa-solid fa-arrows-rotate"></i>
+                    </button>
                 </div>
                 <div class="tiandao-entry-text">${escapeHTML(item.text)}</div>
             </div>`);
     };
 
     for (let lvl = maxLvl; lvl >= 1; lvl--) {
-        (levels[lvl] || []).forEach((it, idx) => pushEntry(lvl, it, idx));
+        (levels[lvl] || []).forEach((it, idx) => {
+            if (inViewRange(it)) pushEntry(lvl, it, idx);
+        });
     }
-    (levels[0] || []).forEach((it, idx) => pushEntry(0, it, idx));
+    (levels[0] || []).forEach((it, idx) => {
+        if (inViewRange(it)) pushEntry(0, it, idx);
+    });
 
     const body = sections.length > 0
         ? sections.join("")
-        : `<div class='tiandao-empty-hint'>暂无剧情总结 · 开启自动总结后，这里会按轮次逐步填充</div>`;
+        : `<div class='tiandao-empty-hint'>${storyViewRange ? "所选范围暂无剧情总结" : "暂无剧情总结 · 开启自动总结后，这里会按轮次逐步填充"}</div>`;
 
     return `
         <div class="tiandao-pagehead">
             <span class="tiandao-pagecap">剧情时间线（由远及近）</span>
-            <span class="tiandao-pagehint">点击 ✏ 可修改每条剧情总结</span>
+            <span class="tiandao-pagehint">${storyViewRange ? `显示第 ${storyViewRange.from}-${storyViewRange.to} 轮` : "点击 ✏ 可修改每条剧情总结"}</span>
         </div>
         ${body}`;
 }
@@ -1276,6 +1998,8 @@ window.tiandaoEditStoryEntry = (lvl, idx) => {
     textDiv.after(editor);
     const editBtn = entry.querySelector(".tiandao-entry-edit-btn");
     if (editBtn) editBtn.style.display = "none";
+    const resummarizeBtn = entry.querySelector(".tiandao-entry-resummarize-btn");
+    if (resummarizeBtn) resummarizeBtn.style.display = "none";
 
     const ta = editor.querySelector("textarea");
     ta.focus();
@@ -1402,6 +2126,7 @@ function importMemoryJsonFile(file) {
             summaryEpoch++;
             storyEditingKey = null;
             storyEditingId = null;
+            storyViewRange = null;
             const normalizedImport = normalizeMemoryData(imported);
             const merged = normalizeMemoryData(mergeEditedMemoryWithEmbeddings(getChatMemory(), normalizedImport));
             const ctx = getSTContext();
@@ -1459,8 +2184,11 @@ function bindSettingsUI() {
         updateFloatingWidgetUI();
     });
     bindCheck("tiandao_auto_summarize", "autoSummarizePerTurn");
+    bindInput("tiandao_summary_retry", "summaryRetryCount", true);
     bindInput("tiandao_summarize_timing", "summarizeTiming");
     bindInput("tiandao_widget_theme", "widgetTheme", false, () => applyWidgetTheme());
+    bindCheck("tiandao_use_json_mode", "useJsonMode");
+    bindCheck("tiandao_include_native_hidden", "includeNativeHidden");
 
     bindCheck("tiandao_auto_hide", "autoHideOldMessages", (checked) => {
         const count = syncHiddenMessagesState(!checked);
@@ -1481,8 +2209,16 @@ function bindSettingsUI() {
     bindInput("tiandao_api_key", "apiKey");
     bindInput("tiandao_model", "model");
     bindInput("tiandao_temp", "temperature", true);
+    bindInput("tiandao_max_tokens", "maxTokens", true);
     bindInput("tiandao_target_tags", "targetContentTags");
     bindInput("tiandao_strip_tags", "customStripTags");
+    const apiProfileSelect = document.getElementById("tiandao_api_profile_select");
+    if (apiProfileSelect) apiProfileSelect.addEventListener("change", loadSelectedApiProfile);
+    const apiProfileSaveBtn = document.getElementById("tiandao_api_profile_save_btn");
+    if (apiProfileSaveBtn) apiProfileSaveBtn.addEventListener("click", saveCurrentApiProfile);
+    const apiProfileDeleteBtn = document.getElementById("tiandao_api_profile_delete_btn");
+    if (apiProfileDeleteBtn) apiProfileDeleteBtn.addEventListener("click", deleteSelectedApiProfile);
+    refreshApiProfileSelect();
 
     bindInput("tiandao_merge_chunk", "mergeChunkSize", true);
     bindInput("tiandao_max_level", "maxLevel", true);
@@ -1521,7 +2257,11 @@ function bindSettingsUI() {
         flushSettingInputs();
         try {
             updateStatusBar("⏳ 正在测试独立 API 连接...");
-            const reply = await callIndependentLLM(getSettings(), [{ role: "user", content: "请仅回复“连接成功”四个字。" }]);
+            const reply = await callIndependentLLM(
+                getSettings(),
+                [{ role: "user", content: "请仅回复“连接成功”四个字。" }],
+                { jsonMode: false },
+            );
             updateStatusBar(`✅ API 测试通过！模型回复: ${reply.slice(0, 30)}`);
         } catch (e) {
             updateStatusBar(`❌ API 连接失败: ${e.message}`, true);
@@ -1553,6 +2293,10 @@ function bindSettingsUI() {
             const charName = ctx.name2 || "Character";
             const result = await backfillExistingChatHistory(getSettings(), memoryData, chat, userName, charName, {
                 onProgress: (cur, total, roundNumber) => updateStatusBar(`⏳ 扫描旧历史 (${cur}/${total}) · 第 ${roundNumber} 轮...`),
+                onRetry: (attempt, total, error, roundNumber) => updateStatusBar(
+                    `⏳ 第 ${roundNumber} 轮解析失败，自动重试 (${attempt - 1}/${total - 1})：${String(error?.message || "等待重新解析").slice(0, 80)}`,
+                    true,
+                ),
                 onChunkSaved: async () => {
                     if (!isCurrentChat(backfillChatKey)) return;
                     await saveChatMemory();
@@ -1562,11 +2306,21 @@ function bindSettingsUI() {
                 shouldCommitTurn: () => isCurrentChat(backfillChatKey),
             });
             if (!isCurrentChat(backfillChatKey)) return;
+            memoryData.lastSummaryError = null;
             syncHiddenMessagesState();
             updateStatusBar(result.aborted
                 ? `⏸️ 已暂停，当前已处理 ${result.processedCount} 轮；再次点击可继续。`
                 : `✅ 存量历史按轮次扫描构建完成！`);
-        } catch (e) { updateStatusBar(`❌ 历史回溯中断: ${e.message}`, true); }
+        } catch (e) {
+            memoryData.lastSummaryError = {
+                message: String(e?.message || "历史回溯中断").slice(0, 300),
+                roundNumber: numOr(memoryData.lastProcessedRound, 0) + 1,
+                at: Date.now(),
+            };
+            await saveChatMemory().catch(() => {});
+            updateFloatingWidgetUI();
+            updateStatusBar(`❌ 历史回溯中断: ${e.message}`, true);
+        }
         finally {
             isBackfilling = false;
             activeBackfillChatKey = null;
@@ -1593,6 +2347,7 @@ function bindSettingsUI() {
             summaryEpoch++;
             storyEditingKey = null;
             storyEditingId = null;
+            storyViewRange = null;
             syncHiddenMessagesState(true);
             metadata.tiandao_memory = createEmptyMemoryData();
             await saveChatMemory();
@@ -1612,7 +2367,6 @@ function bindSettingsUI() {
         ev.target.value = ""; // 允许重复选择同一个文件
     });
 
-    syncModelChipActive();
 }
 
 (async function initTiandaoMemoryExtension() {
@@ -1653,11 +2407,12 @@ function bindSettingsUI() {
                 if (settings.autoSummarizePerTurn && settings.summarizeTiming === "after_reply") {
                     const chatKey = getChatKey();
                     const epoch = summaryEpoch;
-                    const targetMsg = chat[msgId];
-                    enqueueBackgroundSummary(async () => {
-                        if (!isCurrentChat(chatKey) || epoch !== summaryEpoch || chat[msgId] !== targetMsg) return;
-                        await processSingleAiTurn(msgId, false, { ctx: currentCtx, chat, chatKey, epoch });
-                    }, "即时归档");
+                    enqueuePendingAiTurns(chat, msgId, {
+                        ctx: currentCtx,
+                        chatKey,
+                        epoch,
+                        label: "即时归档",
+                    });
                 }
             });
             if (eventTypes.MESSAGE_DELETED) eventSource.on(eventTypes.MESSAGE_DELETED, async (newLength) => {
@@ -1673,6 +2428,7 @@ function bindSettingsUI() {
                 const memoryData = getChatMemory();
                 if (cutoff >= 0 && memoryData.lastProcessedMessageId >= cutoff) {
                     if (rollbackMemoryFromMessageIndex(memoryData, cutoff)) {
+                        memoryData.lastSummaryError = null;
                         await saveChatMemory();
                         await refreshPromptInjection();
                     }
@@ -1687,11 +2443,23 @@ function bindSettingsUI() {
                 const memoryData = getChatMemory();
                 if (memoryData.lastProcessedMessageId >= idx) {
                     rollbackMemoryFromMessageIndex(memoryData, idx);
+                    memoryData.lastSummaryError = null;
                     await saveChatMemory();
                 }
                 const targetMsg = chat[idx];
                 const settings = getSettings();
-                if (targetMsg && !targetMsg.is_user && settings.enabled && settings.autoSummarizePerTurn) {
+                if (settings.enabled
+                    && settings.autoSummarizePerTurn
+                    && settings.summarizeTiming === "after_reply") {
+                    const chatKey = getChatKey();
+                    const epoch = summaryEpoch;
+                    enqueuePendingAiTurns(chat, chat.length - 1, {
+                        ctx: currentCtx,
+                        chatKey,
+                        epoch,
+                        label: "编辑后重建",
+                    });
+                } else if (targetMsg && !targetMsg.is_user && settings.enabled && settings.autoSummarizePerTurn) {
                     const chatKey = getChatKey();
                     const epoch = summaryEpoch;
                     enqueueBackgroundSummary(async () => {
@@ -1711,6 +2479,7 @@ function bindSettingsUI() {
                 const startFloor = idx > 0 && chat[idx - 1]?.is_user ? idx - 1 : idx;
                 if (memoryData.lastProcessedMessageId >= startFloor) {
                     rollbackMemoryFromMessageIndex(memoryData, startFloor);
+                    memoryData.lastSummaryError = null;
                     await saveChatMemory();
                     await refreshPromptInjection();
                     updateFloatingWidgetUI();
@@ -1721,6 +2490,6 @@ function bindSettingsUI() {
             });
         }
         updateFloatingWidgetUI();
-        console.log("[溯微] v1.8.0 (后台归档·原子状态提交·可回滚分层记忆) 加载完毕！");
+        console.log("[溯微] v1.9.0 (缺口补齐·JSON 模式·失败恢复·身份稳定) 加载完毕！");
     } catch (err) { console.error("[溯微] 初始化异常:", err); }
 })();
