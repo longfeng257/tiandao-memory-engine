@@ -1644,15 +1644,17 @@
     #tiandao_floating_widget.tiandao-widget-expanded {
         position: fixed !important;
         top: 0 !important;
-        right: 0 !important;
-        bottom: 0 !important;
         left: 0 !important;
-        inset: 0 !important;
-        width: auto !important;
-        height: auto !important;
+        right: auto !important;
+        bottom: auto !important;
+        inset: auto !important;
+        width: 100vw !important;
+        height: 100vh !important;
+        height: 100dvh !important;
         display: flex !important;
         align-items: center !important;
         justify-content: center !important;
+        overflow: hidden !important;
         pointer-events: none;
     }
     #tiandao_floating_widget.tiandao-widget-expanded .tiandao-widget-card {
