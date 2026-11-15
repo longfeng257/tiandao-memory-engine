@@ -121,6 +121,7 @@ function sleepWithAbort(delayMs, signal) {
             reject(createAbortError());
         };
         signal?.addEventListener?.("abort", onAbort, { once: true });
+        if (signal?.aborted) onAbort();
     });
 }
 
@@ -154,6 +155,7 @@ export async function fetchWithTimeout(
         rejectExternalAbort?.(createAbortError());
     };
     externalSignal?.addEventListener?.("abort", onExternalAbort, { once: true });
+    if (externalSignal?.aborted) onExternalAbort();
     const timer = setTimeout(() => {
         timedOut = true;
         controller.abort();
@@ -200,18 +202,23 @@ export async function readResponseText(
     const timeoutPromise = new Promise((_, reject) => {
         rejectTimeout = reject;
     });
-    const onExternalAbort = () => {
-        rejectExternalAbort?.(createAbortError());
-    };
-    externalSignal?.addEventListener?.("abort", onExternalAbort, { once: true });
-    const timer = setTimeout(() => {
-        timedOut = true;
+    const cancelResponseBody = () => {
         try {
             const cancellation = response.body?.cancel?.();
             cancellation?.catch?.(() => {});
         } catch (_) {
-            // 流已被读取端锁定时无法取消，超时错误仍会正常返回。
+            // 流已被读取端锁定时无法取消，仍拒绝等待并让上层结束任务。
         }
+    };
+    const onExternalAbort = () => {
+        cancelResponseBody();
+        rejectExternalAbort?.(createAbortError());
+    };
+    externalSignal?.addEventListener?.("abort", onExternalAbort, { once: true });
+    if (externalSignal?.aborted) onExternalAbort();
+    const timer = setTimeout(() => {
+        timedOut = true;
+        cancelResponseBody();
         rejectTimeout?.(new Error(`响应体读取超时（${Math.round(timeoutMs / 1000)} 秒）`));
     }, Math.max(100, timeoutMs));
 
@@ -419,6 +426,60 @@ export function resolveStateLedgerAfterEntry(memoryData, targetEntry) {
         }
     }
     return state;
+}
+
+function getLatestL0Entry(memoryData) {
+    return (memoryData?.archivePool || [])
+        .filter(item => item && item.level === 0)
+        .sort((a, b) =>
+            numOr(a.endMessageId, parseRoundRange(a.roundRange).end)
+            - numOr(b.endMessageId, parseRoundRange(b.roundRange).end)
+        )
+        .at(-1) || null;
+}
+
+/**
+ * 手工修改当前状态账本前先保存最近 L0 的状态存储形态。
+ * 保存失败时可以把快照/差异字段一起恢复，避免下一次回滚读到旧状态。
+ */
+export function captureLatestL0StateStorage(memoryData) {
+    const entry = getLatestL0Entry(memoryData);
+    if (!entry) return null;
+    return {
+        entry,
+        hadSnapshot: Object.prototype.hasOwnProperty.call(entry, "postStateSnapshot"),
+        snapshot: entry.postStateSnapshot === undefined ? undefined : deepClone(entry.postStateSnapshot),
+        hadDelta: Object.prototype.hasOwnProperty.call(entry, "postStateDelta"),
+        delta: entry.postStateDelta === undefined ? undefined : deepClone(entry.postStateDelta),
+    };
+}
+
+/**
+ * 把人工校正后的当前账本写成最近 L0 的完整快照。
+ * 手工修正是最新事实，必须覆盖该条目的旧差异，否则回滚会复活旧物品或旧待办。
+ */
+export function stampLatestL0StateSnapshot(memoryData) {
+    const entry = getLatestL0Entry(memoryData);
+    if (!entry) return false;
+    entry.postStateSnapshot = deepClone(memoryData.stateLedger);
+    delete entry.postStateDelta;
+    return true;
+}
+
+export function restoreLatestL0StateStorage(capture) {
+    if (!capture?.entry) return false;
+    const entry = capture.entry;
+    if (capture.hadSnapshot) {
+        entry.postStateSnapshot = deepClone(capture.snapshot);
+    } else {
+        delete entry.postStateSnapshot;
+    }
+    if (capture.hadDelta) {
+        entry.postStateDelta = deepClone(capture.delta);
+    } else {
+        delete entry.postStateDelta;
+    }
+    return true;
 }
 
 function compressLegacyStateSnapshots(memoryData) {
@@ -1018,11 +1079,17 @@ export function buildRoundMessageIndex(chat, includeNativeHidden = false) {
  * 汇总尚未归档的 AI 轮次。upToIndex 用于“本轮回合之前先补齐旧轮次”，
  * 避免 after_reply 模式在失败后直接跨到新回复。
  */
-export function collectPendingAiTurns(chat, lastProcessedMessageId = -1, upToIndex = Infinity, includeNativeHidden = false) {
+export function collectPendingAiTurns(
+    chat,
+    lastProcessedMessageId = -1,
+    upToIndex = Infinity,
+    includeNativeHidden = false,
+    roundIndex = null,
+) {
     if (!Array.isArray(chat)) return [];
     const start = Math.max(0, numOr(lastProcessedMessageId, -1) + 1);
     const end = Math.min(chat.length - 1, Number.isFinite(Number(upToIndex)) ? Number(upToIndex) : chat.length - 1);
-    return buildRoundMessageIndex(chat, includeNativeHidden).aiTurns
+    return (roundIndex || buildRoundMessageIndex(chat, includeNativeHidden)).aiTurns
         .filter(turn => turn.idx >= start && turn.idx <= end)
         .map(({ idx, round, msg }) => ({ idx, round, msg }));
 }
@@ -1305,18 +1372,37 @@ export async function callIndependentLLM(settings, messages, options = {}) {
             : body),
     }, LLM_REQUEST_TIMEOUT_MS, signal);
 
-    // 部分 OpenAI 兼容渠道不支持 response_format；仅在格式相关错误时静默回退。
-    if (!response.ok && useJsonMode && [400, 404, 422].includes(response.status)) {
-        jsonModeUnsupported.add(jsonModeKey);
-        response = await fetchWithTimeout(endpoint, {
-            ...requestOptions,
-            body: JSON.stringify(body),
-        }, LLM_REQUEST_TIMEOUT_MS, signal);
+    // 部分 OpenAI 兼容渠道不支持 response_format；只有错误正文明确指向格式参数时才回退，
+    // 避免模型名错误、鉴权失败或上下文超限被重复请求一次并重复计费。
+    if (!response.ok && useJsonMode && [400, 422].includes(response.status)) {
+        let probeText = "";
+        try {
+            const probe = typeof response.clone === "function" ? response.clone() : null;
+            if (probe) {
+                probeText = await readResponseText(probe, RESPONSE_BODY_TIMEOUT_MS, signal);
+            }
+        } catch (error) {
+            if (signal?.aborted || error?.name === "AbortError") throw createAbortError();
+            // 探测失败时保留原错误，交给下面的统一错误处理。
+        }
+        const formatRejected = /(response[_ -]?format|json[_ -]?object|structured output|unsupported|not supported|invalid.*(format|parameter)|unknown.*parameter)/i
+            .test(probeText);
+        if (formatRejected) {
+            jsonModeUnsupported.add(jsonModeKey);
+            response = await fetchWithTimeout(endpoint, {
+                ...requestOptions,
+                body: JSON.stringify(body),
+            }, LLM_REQUEST_TIMEOUT_MS, signal);
+        }
     }
 
     if (!response.ok) {
-        const errText = await readResponseText(response, RESPONSE_BODY_TIMEOUT_MS, signal)
-            .catch(() => "");
+        let errText = "";
+        try {
+            errText = await readResponseText(response, RESPONSE_BODY_TIMEOUT_MS, signal);
+        } catch (error) {
+            if (signal?.aborted || error?.name === "AbortError") throw createAbortError();
+        }
         const error = new Error(`独立 API 请求失败 (${response.status}): ${errText.slice(0, 200)}`);
         error.status = response.status;
         error.retryAfterMs = parseRetryAfterMs(response);

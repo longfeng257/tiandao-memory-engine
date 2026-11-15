@@ -39,10 +39,29 @@ test("summary progress is a separate persistent task panel with stop and progres
     assert.match(indexSource, /id="tiandao_summary_progress_stop"/);
     assert.match(indexSource, /function beginSummaryTask\(/);
     assert.match(indexSource, /function requestSummaryTaskStop\(/);
+    assert.match(indexSource, /function requestSummaryTaskStop\(\) \{[\s\S]{0,260}summaryEpoch\+\+;/);
     assert.match(indexSource, /task\.controller\.abort\(\)/);
     assert.match(indexSource, /finishSummaryTask\(task\)/);
     assert.match(styleSource, /\.tiandao-summary-progress\s*\{/);
     assert.match(styleSource, /\.tiandao-summary-progress-bar\s*\{/);
+});
+
+test("editing or swiping archived rounds restores hidden raw context immediately", () => {
+    assert.match(
+        indexSource,
+        /eventTypes\.MESSAGE_EDITED[\s\S]{0,1200}rollbackMemoryFromMessageIndex\(memoryData, idx\);[\s\S]{0,500}syncHiddenMessagesState\(\)/,
+    );
+    assert.match(
+        indexSource,
+        /eventTypes\.MESSAGE_SWIPED[\s\S]{0,1000}rollbackMemoryFromMessageIndex\(memoryData, startFloor\);[\s\S]{0,500}syncHiddenMessagesState\(\)/,
+    );
+});
+
+test("existing-swipe changes get a deferred after_reply repair that generation can cancel", () => {
+    assert.match(indexSource, /function scheduleAfterReplySwipeRepair\(chatKey\)/);
+    assert.match(indexSource, /label: "补总结当前 swipe"/);
+    assert.match(indexSource, /eventTypes\.GENERATION_STARTED[\s\S]{0,260}clearSwipeRepairTimer\(\)/);
+    assert.match(indexSource, /eventTypes\.CHARACTER_MESSAGE_RENDERED[\s\S]{0,260}clearSwipeRepairTimer\(\)/);
 });
 
 test("backfill and story rebuild pass cancellation signals into summary work", () => {
@@ -159,6 +178,38 @@ test("long-chat performance paths avoid repeated full work", () => {
     assert.match(indexSource, /if \(storyVisible\) \{/);
     assert.match(indexSource, /label: "重建高层记忆"/);
     assert.match(indexSource, /rebuildMemoryHierarchy\([\s\S]{0,500}\{ signal \}/);
+    assert.match(indexSource, /const roundIndexCache = new WeakMap\(\)/);
+    assert.match(indexSource, /function getCachedRoundIndex\(chat, includeNativeHidden = false\)/);
+    assert.match(indexSource, /requestAnimationFrame\(callback\)/);
+    assert.match(indexSource, /ledgerRenderKey !== lastLedgerRenderKey/);
+});
+
+test("story summary edits rebuild atomically and preserve old high-level summaries on failure", () => {
+    assert.match(indexSource, /function startHierarchyRebuildTransaction\(/);
+    assert.match(indexSource, /async function rebuildHierarchyLevelsFromL0\(/);
+    assert.match(indexSource, /memoryData\.levels = rebuiltLevels\.levels;/);
+    assert.match(indexSource, /memoryData\.farHistory = rebuiltLevels\.farHistory;/);
+    assert.match(indexSource, /本次修改未保存/);
+    assert.match(indexSource, /pendingHierarchyEdits/);
+    assert.match(indexSource, /重建后的层级无法定位所选阶段/);
+    assert.match(indexSource, /restoreStagedIfNeeded/);
+    assert.doesNotMatch(
+        indexSource,
+        /if \(Number\(lvl\) === 0\) \{[\s\S]{0,500}memoryData\.levels = \{ 0: l0 \};/,
+    );
+});
+
+test("manual ledger edits are stamped into the latest L0 state storage", () => {
+    assert.match(indexSource, /captureLatestL0StateStorage\(memoryData\)/);
+    assert.match(indexSource, /stampLatestL0StateSnapshot\(memoryData\)/);
+    assert.match(indexSource, /restoreLatestL0StateStorage\(stateStorageCapture\)/);
+});
+
+test("model lists normalize full endpoint URLs and the pill is keyboard operable", () => {
+    assert.match(indexSource, /function getModelsEndpoint\(baseUrl\)/);
+    assert.match(indexSource, /normalized\.endsWith\("\/chat\/completions"\)/);
+    assert.match(indexSource, /id="tiandao_widget_pill"[^>]*role="button"[^>]*tabindex="0"/);
+    assert.match(indexSource, /pill\.addEventListener\("keydown"/);
 });
 
 test("story timeline paginates twenty entries with older and newer controls", () => {

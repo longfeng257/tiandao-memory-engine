@@ -29,6 +29,9 @@ import {
     buildRoundMessageIndex,
     invalidateDerivedSummariesInRange,
     readResponseText,
+    captureLatestL0StateStorage,
+    stampLatestL0StateSnapshot,
+    restoreLatestL0StateStorage,
 } from "../memory-engine.js";
 
 function memoryWithRounds(lastRound = 5) {
@@ -530,6 +533,41 @@ test("state snapshots use keyframes plus deltas without losing rollback accuracy
     assert.equal(data.stateLedger.characters.小明, undefined);
 });
 
+test("manual ledger corrections are persisted into the latest L0 state snapshot", () => {
+    const data = memoryWithRounds(2);
+    const latest = data.archivePool[1];
+    delete latest.postStateSnapshot;
+    latest.postStateDelta = {
+        t: "o",
+        v: {},
+    };
+    const originalDelta = JSON.parse(JSON.stringify(latest.postStateDelta));
+    const capture = captureLatestL0StateStorage(data);
+
+    data.stateLedger.characters.小明 = {
+        canonicalName: "小明",
+        aliases: [],
+        location: "书房",
+        statusAndAction: "整理信件",
+        wear: "长衫",
+        removedItemsLock: ["眼镜（已摘下）"],
+        inventory: ["钥匙"],
+        present: true,
+        lastSeenRound: 2,
+    };
+    assert.equal(stampLatestL0StateSnapshot(data), true);
+    assert.ok(latest.postStateSnapshot);
+    assert.equal(latest.postStateDelta, undefined);
+    assert.equal(
+        resolveStateLedgerAfterEntry(data, latest).characters.小明.location,
+        "书房",
+    );
+
+    assert.equal(restoreLatestL0StateStorage(capture), true);
+    assert.equal(latest.postStateSnapshot, undefined);
+    assert.deepEqual(latest.postStateDelta, originalDelta);
+});
+
 test("legacy full snapshots are migrated to keyframes and deltas on load", () => {
     const data = createEmptyMemoryData();
     data.stateStorageVersion = 1;
@@ -967,6 +1005,60 @@ test("JSON mode falls back once when a provider rejects response_format", async 
     assert.equal(bodies[1].max_tokens, undefined);
 });
 
+test("JSON mode does not retry unrelated 400 errors", async () => {
+    let calls = 0;
+    globalThis.fetch = async () => {
+        calls++;
+        return new Response("model not found", { status: 400 });
+    };
+    await assert.rejects(
+        () => callIndependentLLM(
+            { ...SETTINGS, useJsonMode: true },
+            [{ role: "user", content: "测试" }],
+        ),
+        error => error.status === 400 && /model not found/.test(error.message),
+    );
+    assert.equal(calls, 1);
+});
+
+test("aborting during the JSON fallback probe still surfaces AbortError", async () => {
+    const controller = new AbortController();
+    const makeResponse = () => ({
+        ok: false,
+        status: 400,
+        headers: { get: () => null },
+        body: { cancel: () => Promise.resolve() },
+        text: () => new Promise(() => {}),
+        clone: () => makeResponse(),
+    });
+    globalThis.fetch = async () => makeResponse();
+    const request = callIndependentLLM(
+        { ...SETTINGS, useJsonMode: true },
+        [{ role: "user", content: "测试" }],
+        { signal: controller.signal },
+    );
+    setTimeout(() => controller.abort(), 5);
+    await assert.rejects(request, error => error?.name === "AbortError");
+});
+
+test("stopping while reading an API error body still surfaces AbortError", async () => {
+    const controller = new AbortController();
+    globalThis.fetch = async () => ({
+        ok: false,
+        status: 400,
+        headers: { get: () => null },
+        body: { cancel: () => Promise.resolve() },
+        text: () => new Promise(() => {}),
+    });
+    const request = callIndependentLLM(
+        { ...SETTINGS, useJsonMode: false },
+        [{ role: "user", content: "测试" }],
+        { signal: controller.signal },
+    );
+    setTimeout(() => controller.abort(), 5);
+    await assert.rejects(request, error => error?.name === "AbortError");
+});
+
 test("summary API requests honor an external abort signal", async () => {
     const controller = new AbortController();
     controller.abort();
@@ -1077,6 +1169,24 @@ test("response body reads cannot hang after headers have arrived", async () => {
         () => readResponseText(response, 100),
         /响应体读取超时/,
     );
+});
+
+test("response body reads cancel the stream when the external summary is stopped", async () => {
+    let cancelled = false;
+    const controller = new AbortController();
+    const response = {
+        body: {
+            cancel: () => {
+                cancelled = true;
+                return Promise.resolve();
+            },
+        },
+        text: () => new Promise(() => {}),
+    };
+    const request = readResponseText(response, 1000, controller.signal);
+    setTimeout(() => controller.abort(), 5);
+    await assert.rejects(request, /已停止/);
+    assert.equal(cancelled, true);
 });
 
 test("round index computes every window in one pass", () => {

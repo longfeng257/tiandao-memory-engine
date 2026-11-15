@@ -162,10 +162,12 @@
     transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.tiandao-widget-pill:hover {
+.tiandao-widget-pill:hover,
+.tiandao-widget-pill:focus-visible {
     transform: translateY(-2px) scale(1.02);
     border-color: var(--sw-accent);
     box-shadow: var(--sw-pill-shadow), 0 0 0 3px var(--sw-accent-tint);
+    outline: none;
 }
 
 .tiandao-widget-pill.tiandao-pill-paused {
