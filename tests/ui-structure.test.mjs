@@ -65,10 +65,11 @@ test("story range exposes fill, view and rebuild modes plus recovery entry", () 
     assert.match(styleSource, /\.tiandao-story-range-mode/);
 });
 
-test("API controls expose retry, max tokens and JSON mode", () => {
+test("API controls expose retry and JSON mode without an output token cap", () => {
     assert.match(indexSource, /id="tiandao_summary_retry"/);
-    assert.match(indexSource, /id="tiandao_max_tokens"/);
     assert.match(indexSource, /id="tiandao_use_json_mode"/);
+    assert.doesNotMatch(indexSource, /id="tiandao_max_tokens"/);
+    assert.doesNotMatch(engineSource, /max_tokens:\s*numOr/);
 });
 
 test("after_reply path fills older gaps before archiving the new reply", () => {
@@ -314,4 +315,44 @@ test("range resummarize passes precomputed round windows", () => {
     assert.match(indexSource, /precomputedTurn\?\.window/);
     assert.match(indexSource, /\.map\(\(\{ idx, round, msg, window \}\) => \(\{ idx, round, msg, window \}\)\)/);
     assert.match(indexSource, /signal,\s*turn,\s*\);/);
+});
+
+test("character cards and their inventory lists are collapsed disclosures", () => {
+    assert.match(indexSource, /const expandedCharacterCards = new Set\(\)/);
+    assert.match(indexSource, /const expandedInventoryCards = new Set\(\)/);
+    assert.match(indexSource, /data-char-toggle="\$\{escapeHTML\(name\)\}"/);
+    assert.match(indexSource, /class="tiandao-char-body" \$\{characterExpanded \? "" : "hidden"\}/);
+    assert.match(indexSource, /data-item-toggle="\$\{escapeHTML\(name\)\}"/);
+    assert.match(indexSource, /class="tiandao-item-list" \$\{inventoryExpanded \? "" : "hidden"\}/);
+    assert.match(styleSource, /\.tiandao-char-body\[hidden\][\s\S]{0,80}display:\s*none/);
+    assert.match(styleSource, /\.tiandao-item-list\[hidden\][\s\S]{0,80}display:\s*none/);
+});
+
+test("ledger items can be deleted after confirmation and refresh injection", () => {
+    assert.match(indexSource, /data-delete-item="\$\{kind\}"/);
+    assert.match(indexSource, /class="tiandao-item-delete"/);
+    assert.match(indexSource, /async function deleteLedgerItem\(characterName, itemKind, itemIndex, button = null\)/);
+    assert.match(indexSource, /只会修改当前状态账本，不会改动历史剧情/);
+    assert.match(indexSource, /info\[field\] = previousList/);
+    assert.match(indexSource, /await refreshPromptInjection\("", \{ skipRetrieval: true \}\)/);
+    assert.match(styleSource, /\.tiandao-item-delete:hover:not\(:disabled\)/);
+});
+
+test("model menus keep scrolling inside the open menu", () => {
+    assert.match(indexSource, /const scrollingInsideModelMenu = modelMenu && !modelMenu\.hidden/);
+    assert.match(indexSource, /const scrollingInsideEmbeddingMenu = embeddingMenu && !embeddingMenu\.hidden/);
+    assert.match(indexSource, /if \(!scrollingInsideModelMenu\) closeModelMenu\(\)/);
+    assert.match(indexSource, /if \(!scrollingInsideEmbeddingMenu\) closeEmbeddingModelMenu\(\)/);
+    assert.match(styleSource, /\.tiandao-model-menu\s*\{[\s\S]{0,520}touch-action:\s*pan-y/);
+    assert.match(styleSource, /-webkit-overflow-scrolling:\s*touch/);
+});
+
+test("embedding models have a separate fetch action and embedding-only filter", () => {
+    assert.match(engineSource, /embeddingModelFilterOnly:\s*true/);
+    assert.match(indexSource, /id="tiandao_fetch_embedding_models_btn"/);
+    assert.match(indexSource, /id="tiandao_emb_model_toggle_btn"/);
+    assert.match(indexSource, /id="tiandao_emb_filter_models"/);
+    assert.match(indexSource, /function isEmbeddingModelName\(name\)/);
+    assert.match(indexSource, /function getVisibleEmbeddingModelNames\(\)/);
+    assert.match(indexSource, /bindCheck\("tiandao_emb_filter_models", "embeddingModelFilterOnly"/);
 });

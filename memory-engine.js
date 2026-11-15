@@ -21,7 +21,6 @@ export const DEFAULT_SETTINGS = {
     apiKey: "",
     model: "",
     temperature: "",       // 留空时按 0.2 处理
-    maxTokens: 4000,
     useJsonMode: true,     // 支持 response_format 的渠道优先使用 JSON 模式，不支持时自动回退
     summaryRetryCount: "", // 留空时按自动重试 2 次处理（不含首次请求）
     apiProfiles: [],       // 可切换的独立 API 配置档案；API Key 仅保存在酒馆扩展设置中
@@ -46,6 +45,7 @@ export const DEFAULT_SETTINGS = {
     embeddingApiUrl: "",
     embeddingApiKey: "",
     embeddingModel: "",
+    embeddingModelFilterOnly: true, // 拉取模型时默认只保留向量/Embedding 模型
 
     // 注入位置设置（下拉选择，保留明确默认值）
     injectionPosition: 1, // 0: 聊天历史后(In-Prompt), 1: 聊天历史中(In-chat @ depth), 2: 主提示词前(Before Main Prompt)
@@ -1284,7 +1284,6 @@ export async function callIndependentLLM(settings, messages, options = {}) {
         model: modelName,
         messages: messages,
         temperature: numOr(settings.temperature, 0.2),
-        max_tokens: numOr(settings.maxTokens, 4000),
     };
     const jsonModeKey = `${endpoint}|${modelName}`;
     const jsonModeRequested = options.jsonMode === undefined
@@ -1339,7 +1338,8 @@ export async function callIndependentLLM(settings, messages, options = {}) {
         || "";
     if (OUTPUT_TRUNCATION_REASONS.has(finishReason)) {
         const error = new Error(
-            `模型输出已达到最大 Tokens 限制（max_tokens=${numOr(settings.maxTokens, 4000)}），响应可能被截断`,
+            `模型输出被渠道提前截断（finish_reason=${finishReason}）；`
+            + "当前未发送 max_tokens，请检查渠道默认输出上限或上下文窗口",
         );
         error.code = "OUTPUT_TRUNCATED";
         error.finishReason = finishReason;

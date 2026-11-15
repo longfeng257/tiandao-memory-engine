@@ -34,7 +34,7 @@ const EXTENSION_NAME = "tiandao-memory-engine";
 const PROMPT_KEY = "tiandao_memory_prompt";
 const LS_SETTINGS_KEY = "suwei_memory_settings_backup_v1";
 const SENSITIVE_SETTING_KEYS = new Set(["apiKey", "embeddingApiKey"]);
-const API_PROFILE_FIELDS = ["apiUrl", "apiKey", "model", "temperature", "maxTokens", "useJsonMode"];
+const API_PROFILE_FIELDS = ["apiUrl", "apiKey", "model", "temperature", "useJsonMode"];
 
 // 运行时状态控制
 let isBackfilling = false;
@@ -50,6 +50,9 @@ let summaryTaskSequence = 0;
 let activeSummaryTask = null;
 let lastMemoryPromptTokens = 0;
 let fetchedModelNames = [];
+let fetchedEmbeddingModelNames = [];
+const expandedCharacterCards = new Set();
+const expandedInventoryCards = new Set();
 
 // 设置输入框登记表：支持“输入即保存”，并在按钮点击前强制落盘
 const settingsInputRegistry = [];
@@ -224,11 +227,6 @@ function getSettings() {
     }
     s.apiProfiles = sanitizeApiProfiles(s.apiProfiles);
     s.activeApiProfileId = String(s.activeApiProfileId || "");
-    // 旧版本 maxTokens 固定为 2000 且没有界面入口；升级时一次性放宽到新默认值。
-    if (s.maxTokens === 2000 && !s.maxTokensMigratedV190) {
-        s.maxTokens = 4000;
-        s.maxTokensMigratedV190 = true;
-    }
     // 清空旧版本自动预填的示例值（不影响用户自行配置过的真实值）
     if (!s.apiKey) {
         if (s.apiUrl === LEGACY_PREFILLED_DEFAULTS.apiUrl) s.apiUrl = "";
@@ -290,7 +288,6 @@ function applyApiProfileToForm(profile) {
         apiKey: "tiandao_api_key",
         model: "tiandao_model",
         temperature: "tiandao_temp",
-        maxTokens: "tiandao_max_tokens",
         useJsonMode: "tiandao_use_json_mode",
     };
     for (const [field, id] of Object.entries(bindings)) {
@@ -1474,81 +1471,32 @@ function isMobileWidgetViewport() {
         : window.innerWidth <= 600;
 }
 
-function ensureModelMenu() {
-    let menu = document.getElementById("tiandao_model_menu");
+function ensureChoiceMenu(menuId, ariaLabel) {
+    let menu = document.getElementById(menuId);
     if (menu) return menu;
     menu = document.createElement("div");
-    menu.id = "tiandao_model_menu";
+    menu.id = menuId;
     menu.className = "tiandao-model-menu";
     menu.setAttribute("role", "listbox");
-    menu.setAttribute("aria-label", "可用模型");
+    menu.setAttribute("aria-label", ariaLabel);
     menu.hidden = true;
     document.body.appendChild(menu);
     return menu;
 }
 
-function closeModelMenu() {
-    const menu = document.getElementById("tiandao_model_menu");
+function closeChoiceMenu(menuId, inputId, toggleId) {
+    const menu = document.getElementById(menuId);
     if (menu) menu.hidden = true;
-    const input = document.getElementById("tiandao_model");
+    const input = document.getElementById(inputId);
     input?.setAttribute("aria-expanded", "false");
-    const toggle = document.getElementById("tiandao_model_toggle_btn");
+    const toggle = document.getElementById(toggleId);
     if (toggle) {
         toggle.setAttribute("aria-expanded", "false");
         toggle.querySelector("i")?.classList.replace("fa-chevron-up", "fa-chevron-down");
     }
 }
 
-function openModelMenu() {
-    const input = document.getElementById("tiandao_model");
-    const menu = ensureModelMenu();
-    if (!input || fetchedModelNames.length === 0) {
-        closeModelMenu();
-        return;
-    }
-    menu.replaceChildren();
-    const current = input.value.trim();
-    const manualOption = document.createElement("button");
-    manualOption.type = "button";
-    manualOption.className = "tiandao-model-option tiandao-model-manual";
-    manualOption.setAttribute("role", "option");
-    manualOption.textContent = "手动输入模型名称";
-    manualOption.addEventListener("click", () => {
-        closeModelMenu();
-        input.focus();
-    });
-    menu.appendChild(manualOption);
-    for (const name of fetchedModelNames) {
-        const option = document.createElement("button");
-        option.type = "button";
-        option.className = `tiandao-model-option${name === current ? " selected" : ""}`;
-        option.setAttribute("role", "option");
-        option.setAttribute("aria-selected", name === current ? "true" : "false");
-        option.textContent = name;
-        option.title = name;
-        option.addEventListener("click", () => {
-            input.value = name;
-            input.dispatchEvent(new Event("change", { bubbles: true }));
-            closeModelMenu();
-            if (!isMobileWidgetViewport()) input.focus();
-        });
-        option.addEventListener("keydown", (event) => {
-            if (event.key === "Escape") {
-                event.preventDefault();
-                closeModelMenu();
-                input.focus();
-            } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-                event.preventDefault();
-                const delta = event.key === "ArrowDown" ? 1 : -1;
-                const options = [...menu.querySelectorAll(".tiandao-model-option")];
-                const index = options.indexOf(option);
-                options[(index + delta + options.length) % options.length]?.focus();
-            }
-        });
-        menu.appendChild(option);
-    }
-
-    menu.hidden = false;
+function positionChoiceMenu(menu, input) {
     const rect = input.getBoundingClientRect();
     const width = Math.max(180, rect.width);
     const margin = 8;
@@ -1567,6 +1515,90 @@ function openModelMenu() {
         menu.style.top = `${rect.bottom + 4}px`;
         menu.style.bottom = "auto";
     }
+    menu.scrollTop = 0;
+}
+
+function fillChoiceMenu(menu, {
+    names,
+    current,
+    manualLabel,
+    onManual,
+    onChoose,
+    onEscape,
+}) {
+    menu.replaceChildren();
+    if (manualLabel) {
+        const manualOption = document.createElement("button");
+        manualOption.type = "button";
+        manualOption.className = "tiandao-model-option tiandao-model-manual";
+        manualOption.setAttribute("role", "option");
+        manualOption.textContent = manualLabel;
+        manualOption.addEventListener("click", onManual);
+        menu.appendChild(manualOption);
+    }
+    for (const name of names) {
+        const option = document.createElement("button");
+        option.type = "button";
+        option.className = `tiandao-model-option${name === current ? " selected" : ""}`;
+        option.setAttribute("role", "option");
+        option.setAttribute("aria-selected", name === current ? "true" : "false");
+        option.textContent = name;
+        option.title = name;
+        option.addEventListener("click", () => onChoose(name));
+        option.addEventListener("keydown", (event) => {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                onEscape();
+            } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                const delta = event.key === "ArrowDown" ? 1 : -1;
+                const options = [...menu.querySelectorAll(".tiandao-model-option")];
+                const index = options.indexOf(option);
+                options[(index + delta + options.length) % options.length]?.focus();
+            }
+        });
+        menu.appendChild(option);
+    }
+}
+
+function ensureModelMenu() {
+    return ensureChoiceMenu("tiandao_model_menu", "可用模型");
+}
+
+function closeModelMenu() {
+    closeChoiceMenu("tiandao_model_menu", "tiandao_model", "tiandao_model_toggle_btn");
+}
+
+function openModelMenu() {
+    const input = document.getElementById("tiandao_model");
+    const menu = ensureModelMenu();
+    if (!input || fetchedModelNames.length === 0) {
+        closeModelMenu();
+        return;
+    }
+    const current = input.value.trim();
+    fillChoiceMenu(menu, {
+        names: fetchedModelNames,
+        current,
+        manualLabel: "手动输入模型名称",
+        onManual: () => {
+            closeModelMenu();
+            input.focus();
+        },
+        onChoose: (name) => {
+            input.value = name;
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            closeModelMenu();
+            if (!isMobileWidgetViewport()) input.focus();
+        },
+        onEscape: () => {
+            closeModelMenu();
+            input.focus();
+        },
+    });
+
+    menu.hidden = false;
+    positionChoiceMenu(menu, input);
 
     input.setAttribute("aria-expanded", "true");
     const toggle = document.getElementById("tiandao_model_toggle_btn");
@@ -1595,10 +1627,99 @@ function setFetchedModelNames(names) {
     if (fetchedModelNames.length === 0) closeModelMenu();
 }
 
+function isEmbeddingModelName(name) {
+    return /(?:embed|bge|m3e|(?:^|[/_.:-])e5(?:[-/_.:]|$)|gte-|jina|nomic|voyage|mxbai)/i
+        .test(String(name || ""));
+}
+
+function getVisibleEmbeddingModelNames() {
+    const onlyEmbedding = getSettings().embeddingModelFilterOnly !== false;
+    return onlyEmbedding
+        ? fetchedEmbeddingModelNames.filter(isEmbeddingModelName)
+        : fetchedEmbeddingModelNames.slice();
+}
+
+function refreshEmbeddingModelOptions() {
+    const visibleNames = getVisibleEmbeddingModelNames();
+    const datalist = document.getElementById("tiandao_emb_model_datalist");
+    if (datalist) {
+        const frag = document.createDocumentFragment();
+        for (const name of visibleNames) {
+            const option = document.createElement("option");
+            option.value = name;
+            frag.appendChild(option);
+        }
+        datalist.replaceChildren(frag);
+    }
+    const toggle = document.getElementById("tiandao_emb_model_toggle_btn");
+    if (toggle) toggle.disabled = visibleNames.length === 0;
+    if (visibleNames.length === 0) closeEmbeddingModelMenu();
+    return visibleNames;
+}
+
+function ensureEmbeddingModelMenu() {
+    return ensureChoiceMenu("tiandao_emb_model_menu", "可用向量模型");
+}
+
+function closeEmbeddingModelMenu() {
+    closeChoiceMenu(
+        "tiandao_emb_model_menu",
+        "tiandao_emb_model",
+        "tiandao_emb_model_toggle_btn",
+    );
+}
+
+function openEmbeddingModelMenu() {
+    const input = document.getElementById("tiandao_emb_model");
+    const menu = ensureEmbeddingModelMenu();
+    const names = getVisibleEmbeddingModelNames();
+    if (!input || names.length === 0) {
+        closeEmbeddingModelMenu();
+        return;
+    }
+    const current = input.value.trim();
+    fillChoiceMenu(menu, {
+        names,
+        current,
+        manualLabel: "手动输入向量模型名称",
+        onManual: () => {
+            closeEmbeddingModelMenu();
+            input.focus();
+        },
+        onChoose: (name) => {
+            input.value = name;
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            closeEmbeddingModelMenu();
+            if (!isMobileWidgetViewport()) input.focus();
+        },
+        onEscape: () => {
+            closeEmbeddingModelMenu();
+            input.focus();
+        },
+    });
+    menu.hidden = false;
+    positionChoiceMenu(menu, input);
+
+    input.setAttribute("aria-expanded", "true");
+    const toggle = document.getElementById("tiandao_emb_model_toggle_btn");
+    if (toggle) {
+        toggle.setAttribute("aria-expanded", "true");
+        toggle.querySelector("i")?.classList.replace("fa-chevron-down", "fa-chevron-up");
+    }
+}
+
+function setFetchedEmbeddingModelNames(names) {
+    fetchedEmbeddingModelNames = [...new Set((Array.isArray(names) ? names : [])
+        .map(name => String(name || "").trim())
+        .filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    refreshEmbeddingModelOptions();
+}
+
 function initFloatingWidget() {
     let widget = document.getElementById("tiandao_floating_widget");
     if (widget) {
         ensureModelMenu();
+        ensureEmbeddingModelMenu();
         return;
     }
 
@@ -1811,8 +1932,24 @@ function initFloatingWidget() {
                                     <input id="tiandao_emb_key" type="password" class="tiandao-input" placeholder="sk-..." />
                                 </div>
                                 <div class="tiandao-input-block">
-                                    <label class="tiandao-field-caption">Embedding 模型</label>
-                                    <input id="tiandao_emb_model" type="text" class="tiandao-input" placeholder="BAAI/bge-m3" />
+                                    <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:6px 8px; margin-bottom:4px;">
+                                        <label class="tiandao-field-caption" style="margin:0;">Embedding 模型</label>
+                                        <button type="button" id="tiandao_fetch_embedding_models_btn" class="tiandao-link-btn" title="使用上方 Embedding 地址与 Key 拉取向量模型">
+                                            <i class="fa-solid fa-cloud-arrow-down"></i> 拉取向量模型
+                                        </button>
+                                    </div>
+                                    <div class="tiandao-input-wrapper">
+                                        <i class="fa-solid fa-vector-square tiandao-input-icon"></i>
+                                        <input id="tiandao_emb_model" type="text" class="tiandao-input with-icon has-model-toggle" list="tiandao_emb_model_datalist" placeholder="BAAI/bge-m3" autocomplete="off" aria-haspopup="listbox" aria-expanded="false" />
+                                        <button type="button" id="tiandao_emb_model_toggle_btn" class="tiandao-model-toggle" title="展开已拉取的向量模型列表" aria-label="展开已拉取的向量模型列表" disabled>
+                                            <i class="fa-solid fa-chevron-down"></i>
+                                        </button>
+                                        <datalist id="tiandao_emb_model_datalist"></datalist>
+                                    </div>
+                                    <label class="tiandao-inline-check" title="关闭后会显示该渠道返回的全部模型">
+                                        <input id="tiandao_emb_filter_models" type="checkbox" class="tiandao-checkbox" checked />
+                                        <span>只显示向量 / Embedding 模型</span>
+                                    </label>
                                 </div>
                             </div>
                         </div>
@@ -1883,13 +2020,6 @@ function initFloatingWidget() {
                             <div class="tiandao-form-row" style="margin-top: 8px;">
                                 <span class="tiandao-field-label">总结温度 (Temperature)</span>
                                 <input id="tiandao_temp" type="number" step="0.05" min="0" max="1.5" class="tiandao-input tiandao-input-sm" placeholder="0.2" />
-                            </div>
-                            <div class="tiandao-form-row">
-                                <span class="tiandao-field-label">最大输出 Tokens</span>
-                                <input id="tiandao_max_tokens" type="number" min="500" max="16000" step="500" class="tiandao-input tiandao-input-sm" placeholder="4000" />
-                            </div>
-                            <div class="tiandao-field-caption" style="margin:2px 0 0;">
-                                仅影响独立总结 API。若渠道日志的输出 Tokens 正好等于此值，通常说明触发了输出上限。
                             </div>
                             <label class="tiandao-toggle-row">
                                 <span class="tiandao-toggle-label">启用 JSON 模式（不支持时自动回退）</span>
@@ -2022,6 +2152,7 @@ function initFloatingWidget() {
     `;
     document.body.appendChild(widget);
     ensureModelMenu();
+    ensureEmbeddingModelMenu();
 
     const pill = document.getElementById("tiandao_widget_pill");
     const card = document.getElementById("tiandao_widget_card");
@@ -2060,16 +2191,65 @@ function initFloatingWidget() {
             closeModelMenu();
         }
     });
+    const embModelInput = document.getElementById("tiandao_emb_model");
+    const embModelToggle = document.getElementById("tiandao_emb_model_toggle_btn");
+    embModelToggle?.addEventListener("click", () => {
+        const menu = document.getElementById("tiandao_emb_model_menu");
+        if (!menu || menu.hidden) openEmbeddingModelMenu();
+        else closeEmbeddingModelMenu();
+    });
+    embModelInput?.addEventListener("click", () => {
+        const menu = document.getElementById("tiandao_emb_model_menu");
+        if (getVisibleEmbeddingModelNames().length > 0 && (!menu || menu.hidden)) {
+            openEmbeddingModelMenu();
+        }
+    });
+    embModelInput?.addEventListener("pointerdown", (event) => {
+        if (isMobileWidgetViewport() && getVisibleEmbeddingModelNames().length > 0) {
+            event.preventDefault();
+            openEmbeddingModelMenu();
+        }
+    });
+    embModelInput?.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowDown" && getVisibleEmbeddingModelNames().length > 0) {
+            event.preventDefault();
+            openEmbeddingModelMenu();
+            document.querySelector("#tiandao_emb_model_menu .tiandao-model-option")?.focus();
+        } else if (event.key === "Escape") {
+            closeEmbeddingModelMenu();
+        }
+    });
     document.addEventListener("pointerdown", (event) => {
-        const menu = document.getElementById("tiandao_model_menu");
-        if (!menu || menu.hidden) return;
-        if (menu.contains(event.target)
-            || modelInput?.contains(event.target)
-            || modelToggle?.contains(event.target)) return;
-        closeModelMenu();
+        const modelMenu = document.getElementById("tiandao_model_menu");
+        if (modelMenu && !modelMenu.hidden
+            && !modelMenu.contains(event.target)
+            && !modelInput?.contains(event.target)
+            && !modelToggle?.contains(event.target)) {
+            closeModelMenu();
+        }
+        const embeddingMenu = document.getElementById("tiandao_emb_model_menu");
+        if (embeddingMenu && !embeddingMenu.hidden
+            && !embeddingMenu.contains(event.target)
+            && !embModelInput?.contains(event.target)
+            && !embModelToggle?.contains(event.target)) {
+            closeEmbeddingModelMenu();
+        }
     }, true);
-    window.addEventListener("resize", closeModelMenu);
-    window.addEventListener("scroll", closeModelMenu, true);
+    window.addEventListener("resize", () => {
+        closeModelMenu();
+        closeEmbeddingModelMenu();
+    });
+    window.addEventListener("scroll", (event) => {
+        const modelMenu = document.getElementById("tiandao_model_menu");
+        const embeddingMenu = document.getElementById("tiandao_emb_model_menu");
+        const target = event.target;
+        const scrollingInsideModelMenu = modelMenu && !modelMenu.hidden
+            && (target === modelMenu || modelMenu.contains(target));
+        const scrollingInsideEmbeddingMenu = embeddingMenu && !embeddingMenu.hidden
+            && (target === embeddingMenu || embeddingMenu.contains(target));
+        if (!scrollingInsideModelMenu) closeModelMenu();
+        if (!scrollingInsideEmbeddingMenu) closeEmbeddingModelMenu();
+    }, true);
 
     // 展开/折叠：展开后用卡片头作为拖拽锚点，胶囊本体暂时隐藏。
     const setWidgetExpanded = (expanded) => {
@@ -2099,6 +2279,48 @@ function initFloatingWidget() {
 
     const ledgerBody = document.getElementById("tiandao_widget_body_inner");
     if (ledgerBody) {
+        ledgerBody.addEventListener("click", (event) => {
+            const characterToggle = event.target.closest("[data-char-toggle]");
+            if (characterToggle) {
+                const card = characterToggle.closest(".tiandao-char-card");
+                const body = card?.querySelector(".tiandao-char-body");
+                if (!card || !body) return;
+                const expand = characterToggle.getAttribute("aria-expanded") !== "true";
+                const key = `${getChatKey()}::${characterToggle.dataset.charToggle || ""}`;
+                characterToggle.setAttribute("aria-expanded", expand ? "true" : "false");
+                card.classList.toggle("tiandao-char-expanded", expand);
+                body.hidden = !expand;
+                characterToggle.querySelector(".tiandao-char-chevron")?.classList.toggle("expanded", expand);
+                if (expand) expandedCharacterCards.add(key);
+                else expandedCharacterCards.delete(key);
+                return;
+            }
+
+            const itemToggle = event.target.closest("[data-item-toggle]");
+            if (itemToggle) {
+                const section = itemToggle.closest(".tiandao-char-item-section");
+                const list = section?.querySelector(".tiandao-item-list");
+                if (!section || !list) return;
+                const expand = itemToggle.getAttribute("aria-expanded") !== "true";
+                const key = `${getChatKey()}::${itemToggle.dataset.itemToggle || ""}`;
+                itemToggle.setAttribute("aria-expanded", expand ? "true" : "false");
+                list.hidden = !expand;
+                itemToggle.querySelector(".tiandao-item-chevron")?.classList.toggle("expanded", expand);
+                if (expand) expandedInventoryCards.add(key);
+                else expandedInventoryCards.delete(key);
+                return;
+            }
+
+            const deleteButton = event.target.closest("[data-delete-item]");
+            if (deleteButton) {
+                deleteLedgerItem(
+                    deleteButton.dataset.charName || "",
+                    deleteButton.dataset.deleteItem || "",
+                    Number(deleteButton.dataset.itemIndex),
+                    deleteButton,
+                );
+            }
+        });
         ledgerBody.addEventListener("change", (event) => {
             const checkbox = event.target.closest(".tiandao-todo-check");
             if (!checkbox) return;
@@ -2236,6 +2458,57 @@ function initFloatingWidget() {
                 updateStatusBar(`❌ 拉取模型列表失败: ${String(err.message || err).slice(0, 160)}`, true);
             } finally {
                 fetchModelsBtn.disabled = false;
+            }
+        });
+    }
+
+    const fetchEmbeddingModelsBtn = document.getElementById("tiandao_fetch_embedding_models_btn");
+    if (fetchEmbeddingModelsBtn) {
+        fetchEmbeddingModelsBtn.addEventListener("click", async () => {
+            flushSettingInputs();
+            const settings = getSettings();
+            const baseUrl = (settings.embeddingApiUrl || "").trim().replace(/\/+$/, "");
+            if (!baseUrl) {
+                updateStatusBar("❌ 请先填写 Embedding URL", true);
+                return;
+            }
+            try {
+                updateStatusBar("⏳ 正在获取向量模型列表...");
+                fetchEmbeddingModelsBtn.disabled = true;
+                const endpoint = baseUrl.endsWith("/models") ? baseUrl : `${baseUrl}/models`;
+                const headers = {};
+                if (settings.embeddingApiKey && settings.embeddingApiKey.trim()) {
+                    headers["Authorization"] = `Bearer ${settings.embeddingApiKey.trim()}`;
+                }
+                const res = await fetchWithTimeout(endpoint, { method: "GET", headers }, 20_000);
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+                const responseText = await readResponseText(res, 20_000);
+                const data = JSON.parse(responseText);
+                const raw = Array.isArray(data?.data)
+                    ? data.data
+                    : (Array.isArray(data?.models) ? data.models : (Array.isArray(data) ? data : []));
+                const names = raw
+                    .map(x => (typeof x === "string" ? x : (x?.id || x?.name || "")))
+                    .filter(Boolean);
+                setFetchedEmbeddingModelNames(names);
+                const visibleNames = getVisibleEmbeddingModelNames();
+                if (visibleNames.length > 0) {
+                    updateStatusBar(`✅ 已拉取 ${visibleNames.length} 个向量模型，点击输入框或右侧箭头即可选择`);
+                    openEmbeddingModelMenu();
+                } else if (fetchedEmbeddingModelNames.length > 0) {
+                    updateStatusBar(
+                        `⚠️ 已拉取 ${fetchedEmbeddingModelNames.length} 个模型，但未识别出向量模型；可关闭筛选后手动选择`,
+                        true,
+                    );
+                } else {
+                    updateStatusBar("⚠️ 渠道未返回模型列表，请手动输入向量模型名称", true);
+                }
+            } catch (err) {
+                updateStatusBar(`❌ 拉取向量模型失败: ${String(err.message || err).slice(0, 160)}`, true);
+            } finally {
+                fetchEmbeddingModelsBtn.disabled = false;
             }
         });
     }
@@ -2507,38 +2780,97 @@ function buildLedgerHtml(memoryData) {
     for (const [name, info] of entries) {
         if (!info) continue;
         // 已摘除的饰品并入随身道具展示（标注“已摘下”），不再单列一行
-        const removedParts = (Array.isArray(info.removedItemsLock) ? info.removedItemsLock : [])
-            .map(x => {
-                const label = /已摘|未佩戴|已脱/.test(String(x)) ? String(x) : `${String(x)}（已摘下）`;
-                return `<span class="tiandao-item-off">${escapeHTML(label)}</span>`;
-            });
-        const allItems = [
-            ...(Array.isArray(info.inventory) ? info.inventory : []).map(x => escapeHTML(x)),
-            ...removedParts,
+        const inventoryItems = Array.isArray(info.inventory) ? info.inventory : [];
+        const removedItems = Array.isArray(info.removedItemsLock) ? info.removedItemsLock : [];
+        const itemEntries = [
+            ...inventoryItems.map((text, index) => ({
+                text,
+                kind: "inventory",
+                index,
+                removed: false,
+            })),
+            ...removedItems.map((text, index) => ({
+                text,
+                kind: "removed",
+                index,
+                removed: true,
+            })),
         ];
-        const inv = allItems.length > 0
-            ? `<div class="tiandao-char-prop tag-info"><i class="fa-solid fa-box-archive"></i> <b>随身道具</b>: ${allItems.join("，")}</div>`
+        const removedCount = removedItems.length;
+        const itemListId = `tiandao-char-items-${charCards.length}`;
+        const itemHtml = itemEntries.length > 0
+            ? (() => {
+                const inventoryExpanded = expandedInventoryCards.has(`${chatKey}::${name}`);
+                const chips = itemEntries.map(({ text, kind, index, removed }) => {
+                    const rawText = String(text);
+                    const label = removed && !/已摘|未佩戴|已脱/.test(rawText)
+                        ? `${rawText}（已摘下）`
+                        : rawText;
+                    const deleteTitle = memoryBusy
+                        ? "总结进行中，完成后再删除物品"
+                        : (kind === "removed"
+                            ? "从当前状态账本删除这条已摘下记录"
+                            : "从当前状态账本删除这件随身道具");
+                    return `<span class="tiandao-item-chip${removed ? " tiandao-item-off" : ""}">
+                        <span class="tiandao-item-text">${escapeHTML(label)}</span>
+                        <button type="button"
+                            class="tiandao-item-delete"
+                            data-char-name="${escapeHTML(name)}"
+                            data-delete-item="${kind}"
+                            data-item-index="${index}"
+                            title="${deleteTitle}"
+                            aria-label="删除物品：${escapeHTML(rawText)}"
+                            ${memoryBusy ? "disabled" : ""}>
+                            <i class="fa-solid fa-trash-can" aria-hidden="true"></i>
+                        </button>
+                    </span>`;
+                }).join("");
+                return `<div class="tiandao-char-item-section">
+                    <button type="button"
+                        class="tiandao-item-toggle"
+                        data-item-toggle="${escapeHTML(name)}"
+                        aria-expanded="${inventoryExpanded ? "true" : "false"}"
+                        aria-controls="${itemListId}">
+                        <span class="tiandao-item-heading">
+                            <i class="fa-solid fa-box-archive"></i>
+                            <b>随身道具</b>
+                            <span class="tiandao-item-count">${itemEntries.length}件${removedCount > 0 ? ` · ${removedCount}已摘下` : ""}</span>
+                        </span>
+                        <i class="fa-solid fa-chevron-down tiandao-item-chevron${inventoryExpanded ? " expanded" : ""}" aria-hidden="true"></i>
+                    </button>
+                    <div id="${itemListId}" class="tiandao-item-list" ${inventoryExpanded ? "" : "hidden"}>${chips}</div>
+                </div>`;
+            })()
             : "";
         const aliasHtml = (Array.isArray(info.aliases) && info.aliases.length > 0)
             ? `<div class="tiandao-char-alias">别名/称号: ${info.aliases.map(escapeHTML).join("，")}</div>`
             : "";
         const away = info.present === false;
         const initial = escapeHTML(Array.from(String(name || "?"))[0] || "?");
+        const characterExpanded = expandedCharacterCards.has(`${chatKey}::${name}`);
+        const bodyId = `tiandao-char-body-${charCards.length}`;
 
         charCards.push(`
-            <div class="tiandao-char-card${away ? " tiandao-char-away" : ""}">
-                <div class="tiandao-char-card-header">
+            <div class="tiandao-char-card${away ? " tiandao-char-away" : ""}${characterExpanded ? " tiandao-char-expanded" : ""}">
+                <button type="button"
+                    class="tiandao-char-card-header"
+                    data-char-toggle="${escapeHTML(name)}"
+                    aria-expanded="${characterExpanded ? "true" : "false"}"
+                    aria-controls="${bodyId}">
                     <span class="tiandao-char-person">
                         <span class="tiandao-char-avatar" aria-hidden="true">${initial}</span>
                         <span class="tiandao-char-name">${escapeHTML(name)}</span>
                     </span>
-                    <span class="tiandao-char-loc">${away ? '<i class="fa-solid fa-person-walking-arrow-right"></i> 暂离场 · ' : '<i class="fa-solid fa-location-dot"></i> '}${escapeHTML(info.location || "未知位置")}</span>
-                </div>
-                <div class="tiandao-char-body">
+                    <span class="tiandao-char-header-tail">
+                        <span class="tiandao-char-loc">${away ? '<i class="fa-solid fa-person-walking-arrow-right"></i> 暂离场 · ' : '<i class="fa-solid fa-location-dot"></i> '}${escapeHTML(info.location || "未知位置")}</span>
+                        <i class="fa-solid fa-chevron-down tiandao-char-chevron${characterExpanded ? " expanded" : ""}" aria-hidden="true"></i>
+                    </span>
+                </button>
+                <div id="${bodyId}" class="tiandao-char-body" ${characterExpanded ? "" : "hidden"}>
                     ${aliasHtml}
                     <div class="tiandao-char-prop"><b>状态行动</b>: ${escapeHTML(info.statusAndAction || "平静")}</div>
                     <div class="tiandao-char-prop"><b>当前衣着</b>: ${escapeHTML(info.wear || "常规穿戴")}</div>
-                    ${inv}
+                    ${itemHtml}
                 </div>
             </div>
         `);
@@ -2577,6 +2909,64 @@ function buildLedgerHtml(memoryData) {
             <div class="tiandao-todo-list">${todoHtml}</div>
         </div>
     `;
+}
+
+async function deleteLedgerItem(characterName, itemKind, itemIndex, button = null) {
+    const chatKey = getChatKey();
+    if (activeSummaryChats.has(chatKey)
+        || (isBackfilling && activeBackfillChatKey === chatKey)) {
+        updateFloatingWidgetUI();
+        updateStatusBar("⏳ 总结进行中，请等当前任务结束后再删除物品", true);
+        return;
+    }
+
+    const memoryData = getChatMemory();
+    const info = memoryData.stateLedger?.characters?.[characterName];
+    const field = itemKind === "removed"
+        ? "removedItemsLock"
+        : (itemKind === "inventory" ? "inventory" : "");
+    if (!info || !field || !Number.isInteger(itemIndex)) {
+        updateFloatingWidgetUI();
+        updateStatusBar("⚠️ 该人物的状态记录已变化，请刷新后重试", true);
+        return;
+    }
+    const list = Array.isArray(info[field]) ? info[field] : [];
+    const itemText = list[itemIndex];
+    if (typeof itemText !== "string") {
+        updateFloatingWidgetUI();
+        updateStatusBar("⚠️ 该物品已不存在，请刷新后重试", true);
+        return;
+    }
+
+    const fieldLabel = itemKind === "removed" ? "已摘下记录" : "随身道具";
+    const confirmed = confirm(
+        `确定从「${characterName}」的${fieldLabel}中删除「${itemText}」吗？\n\n`
+        + "只会修改当前状态账本，不会改动历史剧情。",
+    );
+    if (!confirmed) return;
+
+    const previousList = list.slice();
+    button?.setAttribute("disabled", "");
+    list.splice(itemIndex, 1);
+    try {
+        await saveChatMemory();
+    } catch (error) {
+        info[field] = previousList;
+        button?.removeAttribute("disabled");
+        updateFloatingWidgetUI();
+        updateStatusBar(`❌ 删除物品失败：${String(error?.message || error).slice(0, 160)}`, true);
+        return;
+    }
+
+    try {
+        await refreshPromptInjection("", { skipRetrieval: true });
+    } catch (error) {
+        updateFloatingWidgetUI();
+        updateStatusBar(`⚠️ 物品已删除，但刷新注入失败：${String(error?.message || error).slice(0, 160)}`, true);
+        return;
+    }
+    updateFloatingWidgetUI();
+    updateStatusBar(`🗑️ 已从「${characterName}」的状态账本删除「${itemText}」`);
 }
 
 async function updateTodoCompletion(todoId, completed) {
@@ -3062,7 +3452,6 @@ function bindSettingsUI() {
     bindInput("tiandao_api_key", "apiKey");
     bindInput("tiandao_model", "model");
     bindInput("tiandao_temp", "temperature", true);
-    bindInput("tiandao_max_tokens", "maxTokens", true);
     bindInput("tiandao_target_tags", "targetContentTags");
     bindInput("tiandao_strip_tags", "customStripTags");
     const apiProfileSelect = document.getElementById("tiandao_api_profile_select");
@@ -3100,9 +3489,15 @@ function bindSettingsUI() {
         saveSettings();
         updateEmbeddingBoxVisibility();
     });
-    bindInput("tiandao_emb_url", "embeddingApiUrl");
+    bindInput("tiandao_emb_url", "embeddingApiUrl", false, () => setFetchedEmbeddingModelNames([]));
     bindInput("tiandao_emb_key", "embeddingApiKey");
     bindInput("tiandao_emb_model", "embeddingModel");
+    bindCheck("tiandao_emb_filter_models", "embeddingModelFilterOnly", () => {
+        const visibleNames = refreshEmbeddingModelOptions();
+        if (visibleNames.length > 0) {
+            updateStatusBar(`已显示 ${visibleNames.length} 个可选向量模型`);
+        }
+    });
 
     const testBtn = document.getElementById("tiandao_test_api_btn");
     if (testBtn) testBtn.addEventListener("click", async () => {
@@ -3301,6 +3696,8 @@ function bindSettingsUI() {
                 storyEditingId = null;
                 storyViewRange = null;
                 storyPage = 0;
+                expandedCharacterCards.clear();
+                expandedInventoryCards.clear();
                 refreshChatFingerprint(getSTContext().chat || []);
                 await refreshPromptInjection(); syncHiddenMessagesState(); updateFloatingWidgetUI();
             });
@@ -3405,6 +3802,6 @@ function bindSettingsUI() {
             });
         }
         updateFloatingWidgetUI();
-        console.log("[溯微] v1.12.0 (模型菜单·截断检测·任务与切档修复) 加载完毕！");
+        console.log("[溯微] v1.13.1 (折叠看板·物品清理·无输出上限) 加载完毕！");
     } catch (err) { console.error("[溯微] 初始化异常:", err); }
 })();

@@ -514,12 +514,58 @@
 }
 
 .tiandao-char-card-header {
+    width: 100%;
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
     flex-wrap: wrap;
     margin-bottom: 6px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.tiandao-char-card:not(.tiandao-char-expanded) .tiandao-char-card-header {
+    margin-bottom: 0;
+}
+
+.tiandao-char-card-header:hover .tiandao-char-name,
+.tiandao-char-card-header:focus-visible .tiandao-char-name {
+    color: var(--sw-accent);
+}
+
+.tiandao-char-card-header:focus-visible {
+    outline: none;
+}
+
+.tiandao-char-card-header:focus-visible .tiandao-char-person {
+    border-radius: 4px;
+    box-shadow: var(--sw-focus-ring);
+}
+
+.tiandao-char-header-tail {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+}
+
+.tiandao-char-chevron,
+.tiandao-item-chevron {
+    flex: 0 0 auto;
+    color: var(--sw-muted);
+    font-size: 0.72em;
+    transition: transform 0.18s ease;
+}
+
+.tiandao-char-chevron.expanded,
+.tiandao-item-chevron.expanded {
+    transform: rotate(180deg);
 }
 
 .tiandao-char-person {
@@ -565,6 +611,11 @@
     color: var(--sw-text-soft);
 }
 
+.tiandao-char-body[hidden],
+.tiandao-item-list[hidden] {
+    display: none;
+}
+
 .tiandao-char-alias {
     font-size: 0.8em;
     color: var(--sw-muted);
@@ -591,10 +642,107 @@
     color: var(--sw-info-text);
 }
 
+/* ---------- 随身物品折叠栏 ---------- */
+.tiandao-char-item-section {
+    margin-top: 5px;
+    border-top: 1px solid var(--sw-line);
+    padding-top: 5px;
+}
+
+.tiandao-item-toggle {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 2px 0;
+    border: 0;
+    background: transparent;
+    color: var(--sw-info-text);
+    font: inherit;
+    font-size: 0.92em;
+    text-align: left;
+    cursor: pointer;
+}
+
+.tiandao-item-toggle:hover,
+.tiandao-item-toggle:focus-visible {
+    outline: none;
+    color: var(--sw-accent-bright);
+}
+
+.tiandao-item-heading {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+}
+
+.tiandao-item-count {
+    color: var(--sw-muted);
+    font-size: 0.82em;
+    font-weight: 500;
+}
+
+.tiandao-item-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 5px;
+}
+
+.tiandao-item-chip {
+    max-width: 100%;
+    display: inline-flex;
+    align-items: flex-start;
+    gap: 4px;
+    padding: 3px 4px 3px 7px;
+    border: 1px solid var(--sw-info-border);
+    border-radius: 5px;
+    background: var(--sw-info-bg);
+    color: var(--sw-info-text);
+    font-size: 0.86em;
+    line-height: 1.45;
+}
+
+.tiandao-item-text {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.tiandao-item-delete {
+    width: 20px;
+    height: 20px;
+    flex: 0 0 auto;
+    display: inline-grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--sw-muted);
+    font-size: 0.78em;
+    cursor: pointer;
+}
+
+.tiandao-item-delete:hover:not(:disabled),
+.tiandao-item-delete:focus-visible:not(:disabled) {
+    outline: none;
+    background: var(--sw-warn-bg);
+    color: var(--sw-warn-text);
+}
+
+.tiandao-item-delete:disabled {
+    cursor: default;
+    opacity: 0.35;
+}
+
 /* 已摘下的饰品：并入随身道具，弱化显示 */
 .tiandao-item-off {
     color: var(--sw-item-off);
-    opacity: 0.85;
+    background: transparent;
+    border-style: dashed;
+    opacity: 0.9;
 }
 
 /* ---------- 待办箱 ---------- */
@@ -1105,6 +1253,8 @@
     padding: 4px;
     overflow-y: auto;
     overscroll-behavior: contain;
+    touch-action: pan-y;
+    -webkit-overflow-scrolling: touch;
     background: var(--sw-input-bg);
     border: 1px solid var(--sw-input-border);
     border-radius: 7px;
@@ -1154,6 +1304,21 @@
     border-radius: 5px 5px 0 0;
     color: var(--sw-accent);
     font-weight: 600;
+}
+
+.tiandao-inline-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+    color: var(--sw-muted);
+    font-size: 0.8em;
+    line-height: 1.4;
+    cursor: pointer;
+}
+
+.tiandao-inline-check .tiandao-checkbox {
+    flex: 0 0 auto;
 }
 
 .tiandao-input::placeholder {

@@ -963,6 +963,8 @@ test("JSON mode falls back once when a provider rejects response_format", async 
     assert.equal(bodies.length, 2);
     assert.equal(bodies[0].response_format.type, "json_object");
     assert.equal(bodies[1].response_format, undefined);
+    assert.equal(bodies[0].max_tokens, undefined);
+    assert.equal(bodies[1].max_tokens, undefined);
 });
 
 test("summary API requests honor an external abort signal", async () => {
@@ -1019,12 +1021,12 @@ test("truncated model output is reported instead of parsed as a valid response",
 
     await assert.rejects(
         () => callIndependentLLM(
-            { ...SETTINGS, maxTokens: 4000, useJsonMode: false },
+            { ...SETTINGS, useJsonMode: false },
             [{ role: "user", content: "测试" }],
         ),
         error => error.code === "OUTPUT_TRUNCATED"
             && error.finishReason === "length"
-            && /max_tokens=4000/.test(error.message),
+            && /未发送 max_tokens/.test(error.message),
     );
 });
 
@@ -1037,12 +1039,12 @@ test("finish reason variants and provider-specific fields are recognized", async
     });
     await assert.rejects(
         () => callIndependentLLM(
-            { ...SETTINGS, maxTokens: 2000, useJsonMode: false },
+            { ...SETTINGS, useJsonMode: false },
             [{ role: "user", content: "测试" }],
         ),
         error => error.code === "OUTPUT_TRUNCATED"
             && error.finishReason === "max_tokens"
-            && /max_tokens=2000/.test(error.message),
+            && /未发送 max_tokens/.test(error.message),
     );
 });
 
