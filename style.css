@@ -1643,11 +1643,11 @@
     /* 移动端展开后，由铺满视口的外层容器负责居中，卡片不再自行计算 fixed 坐标。 */
     #tiandao_floating_widget.tiandao-widget-expanded {
         position: fixed !important;
+        inset: auto !important;
         top: 0 !important;
         left: 0 !important;
         right: auto !important;
         bottom: auto !important;
-        inset: auto !important;
         width: 100vw !important;
         height: 100vh !important;
         height: 100dvh !important;
