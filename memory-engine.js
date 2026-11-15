@@ -67,6 +67,32 @@ let embeddingFailureUntil = 0;
 const jsonModeUnsupported = new Set();
 const memorySearchTokenCache = new WeakMap();
 
+/**
+ * SillyTavern 欢迎页也会产生 Assistant 楼层，但它没有当前聊天 ID。
+ * 以酒馆自己的聊天 ID 为准，避免把欢迎语误算成待归档轮次。
+ */
+export function isActiveChatContext(ctx) {
+    if (!ctx || typeof ctx !== "object") return false;
+    try {
+        if (typeof ctx.getCurrentChatId === "function") {
+            const chatId = ctx.getCurrentChatId();
+            return chatId !== undefined
+                && chatId !== null
+                && String(chatId).trim() !== "";
+        }
+    } catch (_) {
+        // 旧版本或临时上下文不可用时，继续使用下面的字段兜底。
+    }
+    if (ctx.chatId !== undefined && ctx.chatId !== null) {
+        return String(ctx.chatId).trim() !== "";
+    }
+    const hasCharacter = ctx.characterId !== undefined && ctx.characterId !== null;
+    const hasGroup = ctx.groupId !== undefined
+        && ctx.groupId !== null
+        && String(ctx.groupId).trim() !== "";
+    return hasCharacter || hasGroup;
+}
+
 function createAbortError() {
     const error = new Error("总结已停止");
     error.name = "AbortError";
@@ -165,14 +191,35 @@ export function isAiReplyMessage(msg, includeNativeHidden = false) {
     return Boolean(msg && !msg.is_user && (!msg.is_system || msg.extra?.tiandao_hidden || includeNativeHidden));
 }
 
+/**
+ * 返回卡片开场白所在楼：第一条非系统消息若为 AI，则它是第一轮序章。
+ * 第一条非系统消息若是玩家消息，则视为没有卡片开场白。
+ */
+export function getOpeningAiMessageIndex(chat, includeNativeHidden = false) {
+    if (!Array.isArray(chat)) return -1;
+    for (let i = 0; i < chat.length; i++) {
+        const msg = chat[i];
+        if (!msg) continue;
+        if (msg.is_system && !msg.extra?.tiandao_hidden) continue;
+        return isAiReplyMessage(msg, includeNativeHidden) ? i : -1;
+    }
+    return -1;
+}
+
+export function isOpeningAiMessage(chat, messageIndex, includeNativeHidden = false) {
+    return getOpeningAiMessageIndex(chat, includeNativeHidden) === messageIndex;
+}
+
 export function computeHiddenMessageCutoff(chat, keepRounds, lastProcessedMessageId, includeNativeHidden = false) {
     if (!Array.isArray(chat) || chat.length === 0) return 0;
     const keep = Math.max(1, numOr(keepRounds, 5));
+    const openingIndex = getOpeningAiMessageIndex(chat, includeNativeHidden);
     let aiCount = 0;
     let cutoff = 0;
     for (let i = chat.length - 1; i >= 0; i--) {
         const msg = chat[i];
-        if (isAiReplyMessage(msg, includeNativeHidden)) {
+        if (isAiReplyMessage(msg, includeNativeHidden)
+            && i !== openingIndex) {
             aiCount++;
             if (aiCount === keep) {
                 cutoff = (i > 0 && chat[i - 1]?.is_user) ? i - 1 : i;
@@ -205,7 +252,7 @@ export function deepClone(obj) {
  */
 export function createEmptyMemoryData() {
     return {
-        version: 3,
+        version: 4,
         stateStorageVersion: STATE_STORAGE_VERSION,
         lastProcessedMessageId: -1,
         lastProcessedRound: 0,
@@ -348,13 +395,104 @@ function compressLegacyStateSnapshots(memoryData) {
     memoryData.stateStorageVersion = STATE_STORAGE_VERSION;
 }
 
+function shiftRoundRangeDown(roundRange) {
+    const range = parseRoundRange(roundRange);
+    if (range.end <= 0) return String(roundRange || "0");
+    const start = Math.max(1, range.start - 1);
+    const end = Math.max(start, range.end - 1);
+    return start === end ? String(start) : `${start}-${end}`;
+}
+
+/**
+ * 旧版把卡片开场白单独存成第 1 轮。新规则把它并入第一轮真实对话，
+ * 这里一次性删除该独立条目、保留其摘要，并把后续轮次整体前移一位。
+ */
+function migrateLegacyOpeningRound(data) {
+    const l0Entries = (data.archivePool || [])
+        .filter(item => item && item.level === 0)
+        .sort((a, b) =>
+            numOr(a.endMessageId, parseRoundRange(a.roundRange).end)
+            - numOr(b.endMessageId, parseRoundRange(b.roundRange).end)
+        );
+    const opening = l0Entries[0];
+    if (!opening
+        || numOr(opening.startMessageId, -1) !== 0
+        || numOr(opening.endMessageId, -1) !== 0
+        || parseRoundRange(opening.roundRange).end !== 1) {
+        return false;
+    }
+
+    const openingId = opening.id;
+    const isOpeningItem = item => item === opening || (openingId && item?.id === openingId);
+    data.archivePool = data.archivePool.filter(item => !isOpeningItem(item));
+    for (const list of Object.values(data.levels || {})) {
+        if (Array.isArray(list)) {
+            const kept = list.filter(item => !isOpeningItem(item));
+            list.splice(0, list.length, ...kept);
+        }
+    }
+
+    const remainingL0 = (data.archivePool || [])
+        .filter(item => item && item.level === 0)
+        .sort((a, b) =>
+            numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
+            - numOr(b.startMessageId, parseRoundRange(b.roundRange).start)
+        );
+    const firstRealRound = remainingL0[0];
+    if (firstRealRound && opening.text) {
+        firstRealRound.text = `【开场背景】${opening.text}\n${firstRealRound.text || ""}`.trim();
+        firstRealRound.startMessageId = 0;
+    }
+
+    const seen = new Set();
+    const allEntries = [
+        ...(data.archivePool || []),
+        ...Object.values(data.levels || {}).flatMap(list => Array.isArray(list) ? list : []),
+    ];
+    for (const item of allEntries) {
+        if (!item || seen.has(item)) continue;
+        seen.add(item);
+        if (parseRoundRange(item.roundRange).end > 0) {
+            item.roundRange = shiftRoundRangeDown(item.roundRange);
+        }
+    }
+
+    for (const item of data.pendingFarHistory || []) {
+        if (parseRoundRange(item.roundRange).end > 0) {
+            item.roundRange = shiftRoundRangeDown(item.roundRange);
+        }
+    }
+    for (const history of [data.farHistory, data.fadedHistory]) {
+        if (!history) continue;
+        if (numOr(history.earliestRound, 0) > 0) {
+            history.earliestRound = Math.max(1, history.earliestRound - 1);
+        }
+        if (numOr(history.latestRound, 0) > 0) {
+            history.latestRound = Math.max(1, history.latestRound - 1);
+        }
+    }
+
+    if (data.lastProcessedRound > 0) {
+        data.lastProcessedRound--;
+    }
+    if (data.lastSummaryError?.roundNumber > 0) {
+        data.lastSummaryError.roundNumber--;
+    }
+    if (remainingL0.length === 0) {
+        data.lastProcessedMessageId = -1;
+        data.lastProcessedRound = 0;
+    }
+    return true;
+}
+
 export function normalizeMemoryData(memoryData) {
     if (!memoryData || typeof memoryData !== "object") {
         return createEmptyMemoryData();
     }
 
     const data = memoryData;
-    data.version = numOr(data.version, 3);
+    const previousVersion = numOr(data.version, 3);
+    data.version = Math.max(previousVersion, 4);
     data.stateStorageVersion = numOr(data.stateStorageVersion, 1);
     data.lastProcessedMessageId = Number.isFinite(Number(data.lastProcessedMessageId))
         ? Number(data.lastProcessedMessageId)
@@ -504,6 +642,10 @@ export function normalizeMemoryData(memoryData) {
         if (item.id && !data.archivePool.some(x => x.id === item.id)) {
             data.archivePool.push(item);
         }
+    }
+
+    if (previousVersion < 4) {
+        migrateLegacyOpeningRound(data);
     }
 
     if (data.lastProcessedMessageId < 0 && data.archivePool.length > 0) {
@@ -764,13 +906,15 @@ export function parseRoundRange(roundRange) {
 
 /**
  * 根据聊天记录计算某条 AI 消息对应的真实“第几轮 (Round)”
- * 规则：一问一答算一轮（统计该消息及之前出现的非 user、非纯 system 回复总数）
+ * 规则：一问一答算一轮；开场白作为序章并入第一轮，不单独计数。
  */
 export function calculateRoundForMessageIndex(chat, messageIndex, includeNativeHidden = false) {
     if (!Array.isArray(chat) || messageIndex < 0 || messageIndex >= chat.length) return 1;
+    const openingIndex = getOpeningAiMessageIndex(chat, includeNativeHidden);
     let round = 0;
     for (let i = 0; i <= messageIndex; i++) {
         const msg = chat[i];
+        if (i === openingIndex) continue;
         if (isAiReplyMessage(msg, includeNativeHidden)) {
             round++;
         }
@@ -786,15 +930,53 @@ export function collectPendingAiTurns(chat, lastProcessedMessageId = -1, upToInd
     if (!Array.isArray(chat)) return [];
     const start = Math.max(0, numOr(lastProcessedMessageId, -1) + 1);
     const end = Math.min(chat.length - 1, Number.isFinite(Number(upToIndex)) ? Number(upToIndex) : chat.length - 1);
+    const openingIndex = getOpeningAiMessageIndex(chat, includeNativeHidden);
     const pending = [];
     let round = 0;
     for (let idx = 0; idx <= end; idx++) {
         const msg = chat[idx];
         if (!isAiReplyMessage(msg, includeNativeHidden)) continue;
+        if (idx === openingIndex) continue;
         round++;
         if (idx >= start) pending.push({ idx, round, msg });
     }
     return pending;
+}
+
+/**
+ * 返回一条实际 AI 轮次需要纳入摘要的消息窗口。
+ * 第一轮若存在开场白，会从开场白开始，确保序章随第一轮一起归档。
+ */
+export function getRoundMessageWindow(chat, messageIndex, includeNativeHidden = false) {
+    const openingIndex = getOpeningAiMessageIndex(chat, includeNativeHidden);
+    if (!Array.isArray(chat)
+        || messageIndex < 0
+        || messageIndex >= chat.length
+        || !isAiReplyMessage(chat[messageIndex], includeNativeHidden)
+        || messageIndex === openingIndex) {
+        return null;
+    }
+
+    const roundNumber = calculateRoundForMessageIndex(chat, messageIndex, includeNativeHidden);
+    const openingMessageIndex = openingIndex >= 0
+        && roundNumber === 1
+        && messageIndex > openingIndex
+        ? openingIndex
+        : -1;
+    const userMessageIndex = messageIndex > 0 && chat[messageIndex - 1]?.is_user
+        ? messageIndex - 1
+        : -1;
+    const startMessageId = openingMessageIndex >= 0
+        ? openingMessageIndex
+        : (userMessageIndex >= 0 ? userMessageIndex : messageIndex);
+
+    return {
+        roundNumber,
+        startMessageId,
+        endMessageId: messageIndex,
+        userMessageIndex,
+        openingMessageIndex,
+    };
 }
 
 /**
@@ -2000,11 +2182,12 @@ export async function backfillExistingChatHistory(
     }
     normalizeMemoryData(memoryData);
 
-    // 找出所有配对的有效 AI 回复楼层
+    // 开场白是序章，会并入第一轮；这里只扫描真正的 AI 回复轮次。
     const aiMessageIndices = [];
     for (let idx = 0; idx < chatMessages.length; idx++) {
         const m = chatMessages[idx];
-        if (isAiReplyMessage(m, settings.includeNativeHidden)) {
+        if (isAiReplyMessage(m, settings.includeNativeHidden)
+            && !isOpeningAiMessage(chatMessages, idx, settings.includeNativeHidden)) {
             aiMessageIndices.push(idx);
         }
     }
@@ -2031,13 +2214,21 @@ export async function backfillExistingChatHistory(
         }
 
         const msgIdx = pendingAiIndices[i];
-        const roundNumber = roundByMessageId.get(msgIdx) || 1;
+        const turnWindow = getRoundMessageWindow(chatMessages, msgIdx, settings.includeNativeHidden);
+        if (!turnWindow) continue;
+        const roundNumber = turnWindow.roundNumber || roundByMessageId.get(msgIdx) || 1;
 
-        let startFloor = msgIdx;
+        let startFloor = turnWindow.startMessageId;
         const batchMsgs = [];
-        if (msgIdx > 0 && chatMessages[msgIdx - 1]?.is_user) {
-            startFloor = msgIdx - 1;
-            const uClean = cleanMessageText(chatMessages[msgIdx - 1].mes, settings.targetContentTags, settings.customStripTags);
+        if (turnWindow.openingMessageIndex >= 0) {
+            const openingMsg = chatMessages[turnWindow.openingMessageIndex];
+            const openingText = cleanMessageText(openingMsg.mes, settings.targetContentTags, settings.customStripTags);
+            if (openingText) {
+                batchMsgs.push(`【开场白·${openingMsg.name || charName}】：\n${openingText}`);
+            }
+        }
+        if (turnWindow.userMessageIndex >= 0) {
+            const uClean = cleanMessageText(chatMessages[turnWindow.userMessageIndex].mes, settings.targetContentTags, settings.customStripTags);
             if (uClean) batchMsgs.push(`【${userName}】：\n${uClean}`);
         }
         const aClean = cleanMessageText(chatMessages[msgIdx].mes, settings.targetContentTags, settings.customStripTags);

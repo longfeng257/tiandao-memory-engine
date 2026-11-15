@@ -22,6 +22,10 @@ import {
     checkAndCascadeMerge,
     backfillExistingChatHistory,
     resolveStateLedgerAfterEntry,
+    isActiveChatContext,
+    isOpeningAiMessage,
+    getOpeningAiMessageIndex,
+    getRoundMessageWindow,
 } from "../memory-engine.js";
 
 function memoryWithRounds(lastRound = 5) {
@@ -375,6 +379,43 @@ test("history backfill saves in batches instead of after every round", async () 
     assert.equal(saves, 3);
 });
 
+test("history backfill sends the card opening with the first real round", async () => {
+    const data = createEmptyMemoryData();
+    const chat = [
+        { is_user: false, name: "角色", mes: "这是卡片开场白。" },
+        { is_user: true, name: "玩家", mes: "这是第一句话。" },
+        { is_user: false, name: "角色", mes: "这是第一个回复。" },
+    ];
+    let capturedPrompt = "";
+    globalThis.fetch = async (_url, options = {}) => {
+        const body = JSON.parse(options.body || "{}");
+        capturedPrompt = body.messages.map(message => message.content || "").join("\n");
+        const content = JSON.stringify({
+            l0_summary: "开场与第一轮",
+            keywords: ["开场"],
+            stateLedger: { time: "开始", characters: {}, todosAndPromises: [] },
+        });
+        return new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    };
+
+    const result = await backfillExistingChatHistory(
+        { ...SETTINGS, mergeChunkSize: 20 },
+        data,
+        chat,
+        "玩家",
+        "角色",
+    );
+    assert.equal(result.processedCount, 1);
+    assert.match(capturedPrompt, /开场白·角色[\s\S]*这是卡片开场白/);
+    assert.match(capturedPrompt, /玩家[\s\S]*这是第一句话/);
+    assert.equal(data.archivePool[0].roundRange, "1");
+    assert.equal(data.archivePool[0].startMessageId, 0);
+    assert.equal(data.archivePool[0].endMessageId, 2);
+});
+
 test("state snapshots use keyframes plus deltas without losing rollback accuracy", async () => {
     const data = memoryWithRounds(1);
     stubChatCompletion("第二轮摘要");
@@ -431,6 +472,55 @@ test("legacy full snapshots are migrated to keyframes and deltas on load", () =>
     assert.equal(data.archivePool[1].postStateSnapshot, undefined);
     assert.ok(data.archivePool[1].postStateDelta);
     assert.equal(resolveStateLedgerAfterEntry(data, data.archivePool[2]).characters.小明.location, "地点3");
+});
+
+test("legacy standalone opening entries are folded into the first real round", () => {
+    const opening = {
+        id: "L0_opening",
+        level: 0,
+        roundRange: "1",
+        startMessageId: 0,
+        endMessageId: 0,
+        text: "开场摘要",
+    };
+    const firstRound = {
+        id: "L0_first",
+        level: 0,
+        roundRange: "2",
+        startMessageId: 1,
+        endMessageId: 2,
+        text: "第一轮真实对话",
+    };
+    const data = {
+        ...createEmptyMemoryData(),
+        version: 3,
+        lastProcessedMessageId: 2,
+        lastProcessedRound: 2,
+        levels: { 0: [opening, firstRound], 1: [], 2: [], 3: [] },
+        archivePool: [opening, firstRound],
+    };
+
+    normalizeMemoryData(data);
+    assert.equal(data.version, 4);
+    assert.equal(data.archivePool.length, 1);
+    assert.equal(data.archivePool[0].id, "L0_first");
+    assert.equal(data.archivePool[0].roundRange, "1");
+    assert.equal(data.archivePool[0].startMessageId, 0);
+    assert.match(data.archivePool[0].text, /开场背景.*开场摘要/);
+    assert.equal(data.lastProcessedRound, 1);
+
+    const openingOnly = {
+        ...createEmptyMemoryData(),
+        version: 3,
+        lastProcessedMessageId: 0,
+        lastProcessedRound: 1,
+        levels: { 0: [opening], 1: [], 2: [], 3: [] },
+        archivePool: [opening],
+    };
+    normalizeMemoryData(openingOnly);
+    assert.equal(openingOnly.archivePool.length, 0);
+    assert.equal(openingOnly.lastProcessedMessageId, -1);
+    assert.equal(openingOnly.lastProcessedRound, 0);
 });
 
 test("safeParseJSON tolerates code fences, commentary and trailing commas", () => {
@@ -525,6 +615,94 @@ test("pending AI turns include earlier gaps before the current reply", () => {
     const pending = collectPendingAiTurns(chat, 1, 5);
     assert.deepEqual(pending.map(x => x.idx), [3, 5]);
     assert.deepEqual(pending.map(x => x.round), [2, 3]);
+});
+
+test("welcome screen context is not treated as an active chat", () => {
+    assert.equal(isActiveChatContext({
+        getCurrentChatId: () => undefined,
+        characterId: undefined,
+        groupId: null,
+    }), false);
+    assert.equal(isActiveChatContext({
+        getCurrentChatId: () => "",
+        characterId: 0,
+    }), false);
+    assert.equal(isActiveChatContext({
+        getCurrentChatId: () => "Chat 2026-11-15",
+        characterId: 0,
+    }), true);
+    assert.equal(isActiveChatContext({ chatId: "Chat 2026-11-15" }), true);
+    assert.equal(isActiveChatContext({ characterId: 0 }), true);
+    assert.equal(isActiveChatContext({ groupId: "group-1" }), true);
+});
+
+test("card opening is a prologue folded into the first real round", () => {
+    const chat = [
+        { is_user: false, name: "角色", mes: "开场白" },
+        { is_user: true, mes: "第一句话" },
+        { is_user: false, name: "角色", mes: "第一个回复" },
+        { is_user: true, mes: "第二句话" },
+        { is_user: false, name: "角色", mes: "第二个回复" },
+    ];
+    assert.equal(isOpeningAiMessage(chat, 0), true);
+    assert.equal(calculateRoundForMessageIndex(chat, 0), 1);
+    assert.equal(calculateRoundForMessageIndex(chat, 2), 1);
+    assert.equal(calculateRoundForMessageIndex(chat, 4), 2);
+    assert.deepEqual(
+        collectPendingAiTurns(chat, -1).map(item => [item.idx, item.round]),
+        [[2, 1], [4, 2]],
+    );
+    assert.deepEqual(getRoundMessageWindow(chat, 2), {
+        roundNumber: 1,
+        startMessageId: 0,
+        endMessageId: 2,
+        userMessageIndex: 1,
+        openingMessageIndex: 0,
+    });
+    assert.equal(getRoundMessageWindow(chat, 0), null);
+    assert.deepEqual(getRoundMessageWindow(chat, 4), {
+        roundNumber: 2,
+        startMessageId: 3,
+        endMessageId: 4,
+        userMessageIndex: 3,
+        openingMessageIndex: -1,
+    });
+});
+
+test("user-starting chats and system-prefixed openings use the same round rules", () => {
+    const userStart = [
+        { is_user: true, mes: "玩家自定义开场" },
+        { is_user: false, mes: "AI 回复" },
+    ];
+    assert.equal(getOpeningAiMessageIndex(userStart), -1);
+    assert.deepEqual(
+        collectPendingAiTurns(userStart, -1).map(item => [item.idx, item.round]),
+        [[1, 1]],
+    );
+    assert.deepEqual(getRoundMessageWindow(userStart, 1), {
+        roundNumber: 1,
+        startMessageId: 0,
+        endMessageId: 1,
+        userMessageIndex: 0,
+        openingMessageIndex: -1,
+    });
+
+    const systemPrefixed = [
+        { is_user: false, is_system: true, mes: "系统提示" },
+        { is_user: false, mes: "卡片开场白" },
+        { is_user: true, mes: "第一句话" },
+        { is_user: false, mes: "第一个回复" },
+    ];
+    assert.equal(getOpeningAiMessageIndex(systemPrefixed), 1);
+    assert.equal(calculateRoundForMessageIndex(systemPrefixed, 3), 1);
+    assert.deepEqual(getRoundMessageWindow(systemPrefixed, 3), {
+        roundNumber: 1,
+        startMessageId: 1,
+        endMessageId: 3,
+        userMessageIndex: 2,
+        openingMessageIndex: 1,
+    });
+    assert.equal(computeHiddenMessageCutoff(systemPrefixed, 1, 3), 2);
 });
 
 test("native hidden AI floors can be included explicitly for legacy migration", () => {

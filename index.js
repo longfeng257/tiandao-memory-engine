@@ -22,6 +22,8 @@ import {
     pruneStaleCharacters,
     parseRoundRange,
     isAiReplyMessage,
+    isActiveChatContext,
+    getRoundMessageWindow,
     resolveStateLedgerAfterEntry,
 } from "./memory-engine.js";
 
@@ -377,8 +379,10 @@ function getChatMemory() {
         metadata.tiandao_memory = createEmptyMemoryData();
     }
     const previousStateStorageVersion = metadata.tiandao_memory.stateStorageVersion;
+    const previousMemoryVersion = metadata.tiandao_memory.version;
     const memoryData = normalizeMemoryData(metadata.tiandao_memory);
-    if (previousStateStorageVersion !== memoryData.stateStorageVersion) {
+    if (previousStateStorageVersion !== memoryData.stateStorageVersion
+        || previousMemoryVersion !== memoryData.version) {
         scheduleChatSave();
     }
     cleanupPlaceholderCharacters(memoryData, ctx.name1 || "");
@@ -608,23 +612,27 @@ function clonePlainData(value) {
 function buildTurnSummaryInput(chat, msgIdx, settings, ctx) {
     const targetMsg = chat[msgIdx];
     if (!isAiReplyMessage(targetMsg, settings.includeNativeHidden)) return null;
+    const roundWindow = getRoundMessageWindow(chat, msgIdx, settings.includeNativeHidden);
+    if (!roundWindow) return null;
     const userName = ctx.name1 || "User";
     const charName = targetMsg.name || ctx.name2 || "Character";
-    const roundNumber = calculateRoundForMessageIndex(chat, msgIdx, settings.includeNativeHidden);
     const lines = [];
-    let startMessageId = msgIdx;
-    if (msgIdx > 0 && chat[msgIdx - 1]?.is_user) {
-        startMessageId = msgIdx - 1;
-        const userText = cleanMessageText(chat[msgIdx - 1].mes, settings.targetContentTags, settings.customStripTags);
+    if (roundWindow.openingMessageIndex >= 0) {
+        const openingMsg = chat[roundWindow.openingMessageIndex];
+        const openingText = cleanMessageText(openingMsg.mes, settings.targetContentTags, settings.customStripTags);
+        if (openingText) lines.push(`【开场白·${openingMsg.name || charName}】：\n${openingText}`);
+    }
+    if (roundWindow.userMessageIndex >= 0) {
+        const userText = cleanMessageText(chat[roundWindow.userMessageIndex].mes, settings.targetContentTags, settings.customStripTags);
         if (userText) lines.push(`【${userName}】：\n${userText}`);
     }
     const aiText = cleanMessageText(targetMsg.mes, settings.targetContentTags, settings.customStripTags);
     if (aiText) lines.push(`【${charName}】：\n${aiText}`);
     if (lines.length === 0) return null;
     return {
-        roundNumber,
-        startMessageId,
-        endMessageId: msgIdx,
+        roundNumber: roundWindow.roundNumber,
+        startMessageId: roundWindow.startMessageId,
+        endMessageId: roundWindow.endMessageId,
         userName,
         charName,
         dialogueText: lines.join("\n\n"),
@@ -943,6 +951,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
     if (!settings.enabled && !isManual) return false;
 
     const ctx = options.ctx || getSTContext();
+    if (!isActiveChatContext(ctx)) return false;
     const chat = options.chat || ctx.chat || [];
     const chatKey = options.chatKey || getChatKey();
     const epoch = options.epoch ?? summaryEpoch;
@@ -953,18 +962,25 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
     const msgIdx = typeof targetMessageId === "number" ? targetMessageId : chat.length - 1;
     const targetMsg = chat[msgIdx];
     if (!isAiReplyMessage(targetMsg, settings.includeNativeHidden)) return false;
+    const roundWindow = getRoundMessageWindow(chat, msgIdx, settings.includeNativeHidden);
+    if (!roundWindow) return false;
 
     const memoryData = options.memoryData || getChatMemory();
     const userName = ctx.name1 || "User";
     const charName = targetMsg.name || ctx.name2 || "Character";
-    const roundNumber = options.roundNumber
-        || calculateRoundForMessageIndex(chat, msgIdx, settings.includeNativeHidden);
+    const roundNumber = options.roundNumber || roundWindow.roundNumber;
 
     const lines = [];
-    let startFloor = msgIdx;
-    if (msgIdx > 0 && chat[msgIdx - 1] && chat[msgIdx - 1].is_user) {
-        startFloor = msgIdx - 1;
-        const userCleaned = cleanMessageText(chat[msgIdx - 1].mes, settings.targetContentTags, settings.customStripTags);
+    if (roundWindow.openingMessageIndex >= 0) {
+        const openingMsg = chat[roundWindow.openingMessageIndex];
+        const openingText = cleanMessageText(openingMsg.mes, settings.targetContentTags, settings.customStripTags);
+        if (openingText) {
+            lines.push(`【开场白·${openingMsg.name || charName}】：\n${openingText}`);
+        }
+    }
+    if (roundWindow.userMessageIndex >= 0) {
+        const userMsg = chat[roundWindow.userMessageIndex];
+        const userCleaned = cleanMessageText(userMsg.mes, settings.targetContentTags, settings.customStripTags);
         if (userCleaned) {
             lines.push(`【${userName}】：\n${userCleaned}`);
         }
@@ -1000,7 +1016,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
         updateStatusBar(`⏳ 正在总结第 ${roundNumber} 轮对话并更新状态账本...`);
         const result = await summarizeSingleTurn(settings, memoryData, {
             roundNumber,
-            startMessageId: startFloor,
+            startMessageId: roundWindow.startMessageId,
             endMessageId: msgIdx,
             userName,
             charName,
@@ -1071,6 +1087,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
  */
 function enqueuePendingAiTurns(chat, upToIndex, options = {}) {
     const ctx = options.ctx || getSTContext();
+    if (!isActiveChatContext(ctx)) return null;
     const chatKey = options.chatKey || getChatKey();
     const epoch = options.epoch ?? summaryEpoch;
     const memoryData = options.memoryData || getChatMemory();
@@ -1146,6 +1163,7 @@ function schedulePendingTurnsBeforeGeneration(chat, generationType) {
     const settings = getSettings();
     if (!settings.enabled || !settings.autoSummarizePerTurn) return false;
     if (!shouldSettleBeforeGeneration(generationType)) return false;
+    if (!isActiveChatContext(getSTContext())) return false;
 
     if (!Array.isArray(chat) || chat.length < 2) return false;
     const memoryData = getChatMemory();
@@ -1171,6 +1189,7 @@ function schedulePendingTurnsBeforeGeneration(chat, generationType) {
  * 因为 on_next_send 模式下它本来就要等玩家发送下一条时才结算。
  */
 function getPendingBacklog(chat, memoryData) {
+    if (!isActiveChatContext(getSTContext())) return [];
     if (!Array.isArray(chat) || chat.length === 0) return [];
     let upToIndex = chat.length - 1;
     const settings = getSettings();
@@ -1196,8 +1215,11 @@ function renderStoryRecoveryState(memoryData = getChatMemory(), pendingOverride 
     const recoverBtn = document.getElementById("tiandao_story_recover_btn");
     if (!box || !messageEl) return;
 
-    const pending = pendingOverride || getPendingBacklog(getSTContext().chat || [], memoryData);
-    const error = memoryData.lastSummaryError;
+    const activeChat = isActiveChatContext(getSTContext());
+    const pending = activeChat
+        ? (pendingOverride || getPendingBacklog(getSTContext().chat || [], memoryData))
+        : [];
+    const error = activeChat ? memoryData.lastSummaryError : null;
     if (pending.length === 0 && !error) {
         box.style.display = "none";
         return;
@@ -1708,13 +1730,16 @@ function initFloatingWidget() {
                             <div class="tiandao-input-block" style="margin-top: 8px;">
                                 <label class="tiandao-field-caption">🎯 目标正文提取标签（白名单优先）</label>
                                 <input id="tiandao_target_tags" type="text" class="tiandao-input" placeholder="" />
+                                <div class="tiandao-field-caption" style="margin:5px 0 0;">
+                                    英文逗号、中文逗号或空格均可分隔，例如 content, story, reply。标签名不必带尖括号，大小写不敏感；多个目标标签会按填写顺序尝试。
+                                </div>
                             </div>
 
                             <div class="tiandao-input-block">
                                 <label class="tiandao-field-caption">备用排除标签（黑名单）</label>
                                 <input id="tiandao_strip_tags" type="text" class="tiandao-input" placeholder="" />
                                 <div class="tiandao-field-caption" style="margin:5px 0 0;">
-                                    两项都留空时，玩家输入与 AI 回复会完整进入单轮总结。只把思考过程、状态栏等非正文标签填入黑名单即可；楼层显示时间属于酒馆元数据，不等同于剧情内时间。
+                                    同样使用英文逗号、中文逗号或空格分隔，例如 thinking, status_bar。匹配到的整个标签块会从正文中移除。两项都留空时，玩家输入与 AI 回复会完整进入单轮总结；楼层显示时间属于酒馆元数据，不等同于剧情内时间。
                                 </div>
                             </div>
 
@@ -2164,6 +2189,7 @@ function updateFloatingWidgetUI() {
     const l2Count = (memoryData.levels?.[2] || []).length;
     const l3Count = (memoryData.levels?.[3] || []).length;
     const pendingBacklog = getPendingBacklog(getSTContext().chat || [], memoryData);
+    const summaryError = isActiveChatContext(getSTContext()) ? memoryData.lastSummaryError : null;
 
     if (badge) {
         const badgeText = !settings.enabled
@@ -2174,7 +2200,7 @@ function updateFloatingWidgetUI() {
                     ? "整理中"
                     : (pendingBacklog.length > 0
                         ? `待补 ${pendingBacklog.length}`
-                        : (memoryData.lastSummaryError
+                        : (summaryError
                             ? "需检查"
                             : (memoryData.lastProcessedRound > 0 ? `第${memoryData.lastProcessedRound}轮` : "就绪")))));
         badge.textContent = badgeText;

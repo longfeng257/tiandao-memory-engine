@@ -21,6 +21,12 @@ test("tag inputs stay visually empty and custom strip tags have no defaults", ()
     assert.doesNotMatch(indexSource, /默认留空|默认内置 thinking/);
 });
 
+test("tag fields document comma, Chinese comma and whitespace separators", () => {
+    assert.match(indexSource, /英文逗号、中文逗号或空格均可分隔/);
+    assert.match(indexSource, /同样使用英文逗号、中文逗号或空格分隔/);
+    assert.match(indexSource, /标签名不必带尖括号，大小写不敏感/);
+});
+
 test("status bar starts hidden and contains transient status logic", () => {
     assert.match(indexSource, /id="tiandao_status_bar"[^>]*style="display:none;"/);
     assert.match(indexSource, /statusBarHideTimer = setTimeout/);
@@ -167,6 +173,13 @@ test("story timeline paginates twenty entries with older and newer controls", ()
 test("pending automatic summaries queue instead of being dropped", () => {
     assert.match(indexSource, /function enqueuePendingAiTurns\(chat, upToIndex, options = \{\}\)[\s\S]{0,2600}enqueueBackgroundSummary\(async \(\) => \{[\s\S]{0,300}beginSummaryTask/);
     assert.doesNotMatch(indexSource, /function enqueuePendingAiTurns\(chat, upToIndex, options = \{\}\)[\s\S]{0,1000}if \(activeSummaryTask\) \{[\s\S]{0,200}return null;/);
+});
+
+test("welcome screen cannot report pending rounds or start automatic summaries", () => {
+    assert.match(indexSource, /function getPendingBacklog\(chat, memoryData\) \{\s*if \(!isActiveChatContext\(getSTContext\(\)\)\) return \[\];/);
+    assert.match(indexSource, /const activeChat = isActiveChatContext\(getSTContext\(\)\);[\s\S]{0,220}const error = activeChat \? memoryData\.lastSummaryError : null;/);
+    assert.match(indexSource, /const ctx = options\.ctx \|\| getSTContext\(\);\s*if \(!isActiveChatContext\(ctx\)\) return false;/);
+    assert.match(indexSource, /function enqueuePendingAiTurns[\s\S]{0,140}if \(!isActiveChatContext\(ctx\)\) return null;/);
 });
 
 test("legacy state snapshot migration is persisted after load", () => {
