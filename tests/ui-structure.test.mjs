@@ -47,7 +47,7 @@ test("summary progress is a separate persistent task panel with stop and progres
 
 test("backfill and story rebuild pass cancellation signals into summary work", () => {
     assert.match(indexSource, /backfillExistingChatHistory\([\s\S]{0,2200}shouldCommitTurn:[\s\S]{0,160}signal,/);
-    assert.match(indexSource, /runStoryResummarize[\s\S]{0,2200}beginSummaryTask/);
+    assert.match(indexSource, /runStoryResummarize[\s\S]{0,2600}acquireSummaryTask/);
     assert.match(indexSource, /rebuildMemoryHierarchy\([\s\S]{0,400}\{ signal \}/);
     assert.match(indexSource, /resummarizeRoundInPlace\([\s\S]{0,500}signal/);
     assert.match(indexSource, /isSummaryTaskCancelled\(task\)/);
@@ -162,16 +162,24 @@ test("long-chat performance paths avoid repeated full work", () => {
 
 test("story timeline paginates twenty entries with older and newer controls", () => {
     assert.match(indexSource, /const STORY_PAGE_SIZE = 20/);
-    assert.match(indexSource, /Math\.ceil\(entries\.length \/ STORY_PAGE_SIZE\)/);
+    assert.match(indexSource, /Math\.ceil\(displayEntries\.length \/ STORY_PAGE_SIZE\)/);
     assert.match(indexSource, /data-story-page="older"/);
     assert.match(indexSource, /data-story-page="newer"/);
-    assert.match(indexSource, /storyPage \+= button\.dataset\.storyPage === "older" \? 1 : -1/);
+    assert.match(indexSource, /storySortOrder === "desc"[\s\S]{0,180}storyPage \+= pageKey === "older" \? 1 : -1/);
     assert.match(styleSource, /\.tiandao-story-pager\s*\{/);
     assert.match(styleSource, /\.tiandao-story-page-btn\s*\{/);
 });
 
+test("story timeline defaults to descending order and exposes ascending order", () => {
+    assert.match(indexSource, /let storySortOrder = "desc"/);
+    assert.match(indexSource, /id="tiandao_story_sort_order"[\s\S]{0,220}<option value="desc" selected>倒序<\/option>[\s\S]{0,80}<option value="asc">正序<\/option>/);
+    assert.match(indexSource, /const displayEntries = storySortOrder === "desc"[\s\S]{0,60}entries\.slice\(\)\.reverse\(\)/);
+    assert.match(indexSource, /剧情时间线（\$\{storySortOrder === "desc" \? "由近及远" : "由远及近"\}）/);
+    assert.match(styleSource, /\.tiandao-story-sort-select\s*\{/);
+});
+
 test("pending automatic summaries queue instead of being dropped", () => {
-    assert.match(indexSource, /function enqueuePendingAiTurns\(chat, upToIndex, options = \{\}\)[\s\S]{0,2600}enqueueBackgroundSummary\(async \(\) => \{[\s\S]{0,300}beginSummaryTask/);
+    assert.match(indexSource, /function enqueuePendingAiTurns\(chat, upToIndex, options = \{\}\)[\s\S]{0,2600}enqueueBackgroundSummary\(async \(\) => \{[\s\S]{0,300}acquireSummaryTask/);
     assert.doesNotMatch(indexSource, /function enqueuePendingAiTurns\(chat, upToIndex, options = \{\}\)[\s\S]{0,1000}if \(activeSummaryTask\) \{[\s\S]{0,200}return null;/);
 });
 
@@ -190,6 +198,16 @@ test("legacy state snapshot migration is persisted after load", () => {
 test("story range stays on one compact row", () => {
     assert.match(styleSource, /\.tiandao-story-range-bar[\s\S]{0,160}flex-wrap:\s*nowrap/);
     assert.match(styleSource, /\.tiandao-story-range-bar \.tiandao-input-sm[\s\S]{0,140}width:\s*38px/);
+});
+
+test("todo ledger uses checkboxes that save completion immediately", () => {
+    assert.match(indexSource, /class="tiandao-todo-check" data-todo-id=/);
+    assert.match(indexSource, /function updateTodoCompletion\(todoId, completed\)/);
+    assert.match(indexSource, /todo\.completedBy = completed \? "player" : ""/);
+    assert.match(indexSource, /refreshPromptInjection\("", \{ skipRetrieval: true \}\)/);
+    assert.match(engineSource, /“询问某人……尚未回应”/);
+    assert.match(engineSource, /pruneExpiredCompletedTodos\(/);
+    assert.match(styleSource, /\.tiandao-todo-done \.tiandao-todo-text/);
 });
 
 test("widget card uses a fixed height instead of content-driven height", () => {
@@ -226,6 +244,74 @@ test("footer no longer exposes the old rebuild-current-round shortcut", () => {
 test("legacy migration can explicitly include native hidden floors", () => {
     assert.match(engineSource, /includeNativeHidden:\s*false/);
     assert.match(indexSource, /id="tiandao_include_native_hidden"/);
-    assert.match(indexSource, /bindCheck\("tiandao_include_native_hidden", "includeNativeHidden"\)/);
-    assert.match(indexSource, /isAiReplyMessage\(msg, settings\.includeNativeHidden\)/);
+    assert.match(indexSource, /bindCheck\("tiandao_include_native_hidden", "includeNativeHidden", \(\) =>/);
+    assert.match(indexSource, /buildRoundMessageIndex\(chat, settings\.includeNativeHidden\)/);
+    assert.match(indexSource, /轮次计算与总结包含酒馆原生隐藏楼层/);
+    assert.match(indexSource, /切换后建议立即重新扫描或重建/);
+});
+
+test("story range has an explicit settings binding", () => {
+    assert.match(indexSource, /function resummarizeStoryRange\(\) \{\s*const ctx = getSTContext\(\);\s*const settings = getSettings\(\);/);
+    assert.match(indexSource, /buildRoundMessageIndex\(chat, settings\.includeNativeHidden\)/);
+});
+
+test("fetched models open a dedicated clickable menu", () => {
+    assert.match(indexSource, /id="tiandao_model_toggle_btn"/);
+    assert.match(indexSource, /function openModelMenu\(/);
+    assert.match(indexSource, /function setFetchedModelNames\(/);
+    assert.match(indexSource, /ensureModelMenu\(\)/);
+    assert.match(indexSource, /modelInput\?\.addEventListener\("click"/);
+    assert.match(indexSource, /setFetchedModelNames\(names\)/);
+    assert.match(indexSource, /手动输入模型名称/);
+    assert.match(indexSource, /isMobileWidgetViewport\(\) && fetchedModelNames\.length > 0/);
+    assert.match(indexSource, /if \(!isMobileWidgetViewport\(\)\) input\.focus\(\)/);
+    assert.match(styleSource, /\.tiandao-model-menu\s*\{/);
+    assert.match(styleSource, /\.tiandao-model-option\.selected\s*\{/);
+    assert.match(styleSource, /\.tiandao-model-manual\s*\{/);
+});
+
+test("chat changes reset story editing and abort stale summaries", () => {
+    assert.match(indexSource, /if \(eventTypes\.CHAT_CHANGED\)[\s\S]{0,700}if \(activeSummaryTask\) requestSummaryTaskStop\(\)/);
+    assert.match(indexSource, /if \(eventTypes\.CHAT_CHANGED\)[\s\S]{0,900}storyEditingKey = null;/);
+    assert.match(indexSource, /if \(eventTypes\.CHAT_CHANGED\)[\s\S]{0,900}storyViewRange = null;/);
+});
+
+test("todo edits are blocked while the current chat is being summarized", () => {
+    assert.match(indexSource, /const memoryBusy = activeSummaryChats\.has\(chatKey\)/);
+    assert.match(indexSource, /\$\{memoryBusy \? "disabled" : ""\}/);
+    assert.match(indexSource, /async function updateTodoCompletion\(todoId, completed\) \{\s*const chatKey = getChatKey\(\);\s*if \(activeSummaryChats\.has\(chatKey\)/);
+});
+
+test("interrupted range rebuild invalidates contradictory high-level summaries", () => {
+    assert.match(indexSource, /const partial = completedRounds > 0 && !rebuiltSuccessfully;/);
+    assert.match(indexSource, /invalidateDerivedSummariesInRange\(memoryData, fromRound, toRound\)/);
+    assert.match(engineSource, /export function invalidateDerivedSummariesInRange/);
+});
+
+test("range fill explains prerequisite rounds before processing", () => {
+    assert.match(indexSource, /const pendingThroughRange = collectPendingAiTurns\(/);
+    assert.match(indexSource, /const prerequisiteCount = pendingThroughRange/);
+    assert.match(indexSource, /将先补齐范围前 \$\{prerequisiteCount\} 轮前置缺口/);
+    assert.match(indexSource, /补缺失\+前置/);
+});
+
+test("switching API profiles clears stale model options", () => {
+    assert.match(indexSource, /settings\.activeApiProfileId = profile\.id;\s*setFetchedModelNames\(\[\]\);/);
+    assert.match(indexSource, /模型列表已清空，请重新拉取/);
+});
+
+test("todo save failure restores the previous completion state", () => {
+    assert.match(indexSource, /const previousCompletion = \{/);
+    assert.match(indexSource, /Object\.assign\(todo, previousCompletion\)/);
+    assert.match(indexSource, /待办状态已保存，但刷新注入失败/);
+});
+
+test("placeholder cleanup schedules a chat save", () => {
+    assert.match(indexSource, /if \(cleanupPlaceholderCharacters\(memoryData, ctx\.name1 \|\| ""\)\) \{\s*scheduleChatSave\(\);/);
+});
+
+test("range resummarize passes precomputed round windows", () => {
+    assert.match(indexSource, /precomputedTurn\?\.window/);
+    assert.match(indexSource, /\.map\(\(\{ idx, round, msg, window \}\) => \(\{ idx, round, msg, window \}\)\)/);
+    assert.match(indexSource, /signal,\s*turn,\s*\);/);
 });

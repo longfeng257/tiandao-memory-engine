@@ -26,6 +26,9 @@ import {
     isOpeningAiMessage,
     getOpeningAiMessageIndex,
     getRoundMessageWindow,
+    buildRoundMessageIndex,
+    invalidateDerivedSummariesInRange,
+    readResponseText,
 } from "../memory-engine.js";
 
 function memoryWithRounds(lastRound = 5) {
@@ -131,6 +134,27 @@ test("rollback keeps L0 already covered by surviving higher levels out of active
     assert.deepEqual(data.levels[1].map(x => x.roundRange), ["1-4"]);
 });
 
+test("rollback invalidates far history that may contain removed rounds", () => {
+    const data = memoryWithRounds(4);
+    data.farHistory = {
+        text: "远史包含第 8 轮的旧剧情",
+        earliestRound: 1,
+        latestRound: 10,
+        updatedAt: 1,
+    };
+    data.pendingFarHistory = [
+        { roundRange: "1-2", text: "保留的旧阶段" },
+        { roundRange: "3-4", text: "失效的旧阶段" },
+        { roundRange: "8-10", text: "更晚的旧阶段" },
+    ];
+    data.fadedHistory = { earliestRound: 1, latestRound: 10, count: 3 };
+
+    assert.equal(rollbackMemoryFromMessageIndex(data, 4), true);
+    assert.deepEqual(data.pendingFarHistory.map(item => item.roundRange), ["1-2"]);
+    assert.equal(data.farHistory.text, "");
+    assert.equal(data.fadedHistory.count, 0);
+});
+
 test("merge failure keeps memory unchanged and retry does not duplicate L0", async () => {
     const data = memoryWithRounds(7);
     stubChatCompletion("第二轮摘要", true);
@@ -204,6 +228,74 @@ test("normalize repairs malformed imported memory", () => {
     assert.equal(Array.isArray(data.stateLedger.characters.A.inventory), true);
     assert.equal(Array.isArray(data.stateLedger.todosAndPromises), true);
     assert.equal(data.archivePool.length, 1);
+});
+
+test("legacy string todos migrate to checkable records with stable ids", () => {
+    const data = normalizeMemoryData({
+        levels: { 0: [] },
+        stateLedger: {
+            time: "傍晚",
+            characters: {},
+            todosAndPromises: ["明日在城门会合", "把钥匙还给苏晚"],
+        },
+        archivePool: [],
+    });
+
+    assert.equal(data.stateLedger.todosAndPromises.length, 2);
+    assert.match(data.stateLedger.todosAndPromises[0].id, /^todo_[a-z0-9]+$/);
+    assert.equal(data.stateLedger.todosAndPromises[0].text, "明日在城门会合");
+    assert.equal(data.stateLedger.todosAndPromises[0].completed, false);
+});
+
+test("model-completed todos stay visible for one round and are removed next round", () => {
+    const previous = {
+        time: "傍晚",
+        characters: {},
+        todosAndPromises: [
+            { id: "todo_gate", text: "明日在城门会合", completed: false },
+        ],
+    };
+    const marked = mergeStateLedger(previous, {
+        time: "入夜",
+        characters: {},
+        todosAndPromises: [
+            { id: "todo_gate", text: "明日在城门会合", completed: true },
+        ],
+    }, 3);
+
+    assert.equal(marked.todosAndPromises[0].completed, true);
+    assert.equal(marked.todosAndPromises[0].completedRound, 3);
+    assert.equal(marked.todosAndPromises[0].completedBy, "model");
+
+    const nextRound = mergeStateLedger(marked, {
+        time: "次日清晨",
+        characters: {},
+        todosAndPromises: [],
+    }, 4);
+    assert.deepEqual(nextRound.todosAndPromises, []);
+});
+
+test("player-completed todos are removed by the next archive update", () => {
+    const finished = {
+        time: "夜间",
+        characters: {},
+        todosAndPromises: [
+            {
+                id: "todo_player",
+                text: "把钥匙还给苏晚",
+                completed: true,
+                completedRound: 4,
+                completedBy: "player",
+            },
+        ],
+    };
+    const merged = mergeStateLedger(finished, {
+        time: "次日",
+        characters: {},
+        todosAndPromises: [],
+    }, 5);
+
+    assert.deepEqual(merged.todosAndPromises, []);
 });
 
 test("normalize does not reactivate archived L0 after a completed merge", () => {
@@ -603,6 +695,18 @@ test("injected ledger puts the user's own entry first", () => {
     assert.ok(prompt.indexOf("【玩家甲】") < prompt.indexOf("【群像卡】"));
 });
 
+test("completed todos are not injected as active tasks", () => {
+    const data = createEmptyMemoryData();
+    data.stateLedger.todosAndPromises = [
+        { id: "todo_open", text: " OPEN_TASK ", completed: false },
+        { id: "todo_done", text: "DONE_TASK", completed: true, completedRound: 4 },
+    ];
+    const prompt = buildInjectedMemoryPrompt(data, [], "玩家甲");
+
+    assert.match(prompt, /OPEN_TASK/);
+    assert.doesNotMatch(prompt, /DONE_TASK/);
+});
+
 test("pending AI turns include earlier gaps before the current reply", () => {
     const chat = [
         { is_user: true, mes: "u1" },
@@ -899,4 +1003,117 @@ test("rate limit responses expose Retry-After to the retry loop", async () => {
         () => callIndependentLLM({ ...SETTINGS, useJsonMode: false }, [{ role: "user", content: "测试" }]),
         error => error.status === 429 && error.retryAfterMs === 2000,
     );
+});
+
+test("truncated model output is reported instead of parsed as a valid response", async () => {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+        choices: [{
+            message: { content: "{\"l0_summary\":\"被截断" },
+            finish_reason: "length",
+        }],
+        usage: { completion_tokens: 4000 },
+    }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+    });
+
+    await assert.rejects(
+        () => callIndependentLLM(
+            { ...SETTINGS, maxTokens: 4000, useJsonMode: false },
+            [{ role: "user", content: "测试" }],
+        ),
+        error => error.code === "OUTPUT_TRUNCATED"
+            && error.finishReason === "length"
+            && /max_tokens=4000/.test(error.message),
+    );
+});
+
+test("finish reason variants and provider-specific fields are recognized", async () => {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+        candidates: [{ finishReason: "MAX_TOKENS" }],
+    }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+    });
+    await assert.rejects(
+        () => callIndependentLLM(
+            { ...SETTINGS, maxTokens: 2000, useJsonMode: false },
+            [{ role: "user", content: "测试" }],
+        ),
+        error => error.code === "OUTPUT_TRUNCATED"
+            && error.finishReason === "max_tokens"
+            && /max_tokens=2000/.test(error.message),
+    );
+});
+
+test("blocked provider responses are surfaced without retrying", async () => {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+        choices: [{
+            message: { content: "" },
+            finish_reason: "CONTENT_FILTER",
+        }],
+    }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+    });
+    await assert.rejects(
+        () => callIndependentLLM(
+            { ...SETTINGS, useJsonMode: false },
+            [{ role: "user", content: "测试" }],
+        ),
+        error => error.code === "OUTPUT_BLOCKED"
+            && error.finishReason === "content_filter",
+    );
+});
+
+test("response body reads cannot hang after headers have arrived", async () => {
+    const response = {
+        body: { cancel: () => Promise.resolve() },
+        text: () => new Promise(() => {}),
+    };
+    await assert.rejects(
+        () => readResponseText(response, 100),
+        /响应体读取超时/,
+    );
+});
+
+test("round index computes every window in one pass", () => {
+    const chat = [
+        { is_user: false, name: "角色", mes: "开场白" },
+        { is_user: true, mes: "第一句话" },
+        { is_user: false, name: "角色", mes: "第一个回复" },
+        { is_user: true, mes: "第二句话" },
+        { is_user: false, name: "角色", mes: "第二个回复" },
+    ];
+    const index = buildRoundMessageIndex(chat);
+    assert.equal(index.openingIndex, 0);
+    assert.deepEqual(index.aiTurns.map(turn => [turn.idx, turn.round]), [[2, 1], [4, 2]]);
+    assert.deepEqual(index.aiTurns[0].window, getRoundMessageWindow(chat, 2));
+    assert.deepEqual(index.aiTurns[1].window, getRoundMessageWindow(chat, 4));
+});
+
+test("range resummarize invalidation removes only overlapping derived summaries", () => {
+    const data = createEmptyMemoryData();
+    data.levels[1] = [
+        { id: "L1_a", level: 1, roundRange: "1-5", text: "保留" },
+        { id: "L1_b", level: 1, roundRange: "6-10", text: "失效" },
+        { id: "L1_c", level: 1, roundRange: "11-15", text: "保留" },
+    ];
+    data.pendingFarHistory = [
+        { roundRange: "6-10", text: "失效待合并" },
+        { roundRange: "16-20", text: "保留待合并" },
+    ];
+    data.farHistory = {
+        text: "包含第 6-10 轮的旧远史",
+        earliestRound: 1,
+        latestRound: 10,
+        updatedAt: 1,
+    };
+    data.fadedHistory = { earliestRound: 1, latestRound: 10, count: 2 };
+
+    assert.equal(invalidateDerivedSummariesInRange(data, 6, 10), true);
+    assert.deepEqual(data.levels[1].map(item => item.id), ["L1_a", "L1_c"]);
+    assert.deepEqual(data.pendingFarHistory.map(item => item.roundRange), ["16-20"]);
+    assert.equal(data.farHistory.text, "");
+    assert.equal(data.fadedHistory.count, 0);
 });

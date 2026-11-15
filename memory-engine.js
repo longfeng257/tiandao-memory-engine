@@ -55,12 +55,14 @@ export const DEFAULT_SETTINGS = {
 
 const LLM_REQUEST_TIMEOUT_MS = 60_000;
 const EMBEDDING_REQUEST_TIMEOUT_MS = 15_000;
+const RESPONSE_BODY_TIMEOUT_MS = 60_000;
 const MAX_ARCHIVE_EMBEDDINGS = 500;
 const MAX_MEMORY_LEVEL = 3;
 const ACTIVE_LEVEL_MIN_KEEP = { 0: 6, 1: 4, 2: 3 };
 const TOP_LEVEL_ANCHOR_COUNT = 4;
 const TOP_LEVEL_RECENT_COUNT = 12;
 const TOP_LEVEL_ACTIVE_CAP = TOP_LEVEL_ANCHOR_COUNT + TOP_LEVEL_RECENT_COUNT;
+const TODO_LIMIT = 8;
 const STATE_KEYFRAME_INTERVAL = 20;
 const STATE_STORAGE_VERSION = 2;
 let embeddingFailureUntil = 0;
@@ -168,6 +170,60 @@ export async function fetchWithTimeout(
         if (timedOut) {
             throw new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
         }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+        externalSignal?.removeEventListener?.("abort", onExternalAbort);
+    }
+}
+
+/**
+ * fetch() resolve 只代表响应头已到，部分代理会继续挂住响应体。
+ * 这里单独给 text()/json() 的读取过程加超时和外部取消。
+ */
+export async function readResponseText(
+    response,
+    timeoutMs = RESPONSE_BODY_TIMEOUT_MS,
+    externalSignal = null,
+) {
+    throwIfAborted(externalSignal);
+    if (!response || typeof response.text !== "function") return "";
+
+    let timedOut = false;
+    let rejectExternalAbort = null;
+    let rejectTimeout = null;
+    const externalAbortPromise = externalSignal
+        ? new Promise((_, reject) => {
+            rejectExternalAbort = reject;
+        })
+        : new Promise(() => {});
+    const timeoutPromise = new Promise((_, reject) => {
+        rejectTimeout = reject;
+    });
+    const onExternalAbort = () => {
+        rejectExternalAbort?.(createAbortError());
+    };
+    externalSignal?.addEventListener?.("abort", onExternalAbort, { once: true });
+    const timer = setTimeout(() => {
+        timedOut = true;
+        try {
+            const cancellation = response.body?.cancel?.();
+            cancellation?.catch?.(() => {});
+        } catch (_) {
+            // 流已被读取端锁定时无法取消，超时错误仍会正常返回。
+        }
+        rejectTimeout?.(new Error(`响应体读取超时（${Math.round(timeoutMs / 1000)} 秒）`));
+    }, Math.max(100, timeoutMs));
+
+    try {
+        return await Promise.race([
+            response.text(),
+            externalAbortPromise,
+            timeoutPromise,
+        ]);
+    } catch (error) {
+        if (externalSignal?.aborted) throw createAbortError();
+        if (timedOut) throw new Error(`响应体读取超时（${Math.round(timeoutMs / 1000)} 秒）`);
         throw error;
     } finally {
         clearTimeout(timer);
@@ -545,9 +601,7 @@ export function normalizeMemoryData(memoryData) {
                 },
             ])
     );
-    data.stateLedger.todosAndPromises = data.stateLedger.todosAndPromises
-        .filter(x => typeof x === "string" && x.trim())
-        .slice(0, 8);
+    data.stateLedger.todosAndPromises = normalizeTodoList(data.stateLedger.todosAndPromises);
 
     const hadLevelZero = Boolean(
         data.levels
@@ -923,6 +977,44 @@ export function calculateRoundForMessageIndex(chat, messageIndex, includeNativeH
 }
 
 /**
+ * 一次扫描生成全部 AI 轮次及其消息窗口，避免批量操作反复扫描整段聊天。
+ */
+export function buildRoundMessageIndex(chat, includeNativeHidden = false) {
+    if (!Array.isArray(chat)) {
+        return { openingIndex: -1, aiTurns: [], roundByIndex: new Map() };
+    }
+    const openingIndex = getOpeningAiMessageIndex(chat, includeNativeHidden);
+    const aiTurns = [];
+    const roundByIndex = new Map();
+    let round = 0;
+    for (let idx = 0; idx < chat.length; idx++) {
+        if (!isAiReplyMessage(chat[idx], includeNativeHidden) || idx === openingIndex) continue;
+        round++;
+        roundByIndex.set(idx, round);
+        const userMessageIndex = idx > 0 && chat[idx - 1]?.is_user ? idx - 1 : -1;
+        const openingMessageIndex = openingIndex >= 0 && round === 1 && idx > openingIndex
+            ? openingIndex
+            : -1;
+        const startMessageId = openingMessageIndex >= 0
+            ? openingMessageIndex
+            : (userMessageIndex >= 0 ? userMessageIndex : idx);
+        aiTurns.push({
+            idx,
+            round,
+            msg: chat[idx],
+            window: {
+                roundNumber: round,
+                startMessageId,
+                endMessageId: idx,
+                userMessageIndex,
+                openingMessageIndex,
+            },
+        });
+    }
+    return { openingIndex, aiTurns, roundByIndex };
+}
+
+/**
  * 汇总尚未归档的 AI 轮次。upToIndex 用于“本轮回合之前先补齐旧轮次”，
  * 避免 after_reply 模式在失败后直接跨到新回复。
  */
@@ -930,17 +1022,9 @@ export function collectPendingAiTurns(chat, lastProcessedMessageId = -1, upToInd
     if (!Array.isArray(chat)) return [];
     const start = Math.max(0, numOr(lastProcessedMessageId, -1) + 1);
     const end = Math.min(chat.length - 1, Number.isFinite(Number(upToIndex)) ? Number(upToIndex) : chat.length - 1);
-    const openingIndex = getOpeningAiMessageIndex(chat, includeNativeHidden);
-    const pending = [];
-    let round = 0;
-    for (let idx = 0; idx <= end; idx++) {
-        const msg = chat[idx];
-        if (!isAiReplyMessage(msg, includeNativeHidden)) continue;
-        if (idx === openingIndex) continue;
-        round++;
-        if (idx >= start) pending.push({ idx, round, msg });
-    }
-    return pending;
+    return buildRoundMessageIndex(chat, includeNativeHidden).aiTurns
+        .filter(turn => turn.idx >= start && turn.idx <= end)
+        .map(({ idx, round, msg }) => ({ idx, round, msg }));
 }
 
 /**
@@ -979,6 +1063,27 @@ export function getRoundMessageWindow(chat, messageIndex, includeNativeHidden = 
     };
 }
 
+function clearDerivedHistoryFromRound(memoryData, fromRound) {
+    const threshold = Math.max(1, numOr(fromRound, 1));
+    if (Array.isArray(memoryData.pendingFarHistory)) {
+        memoryData.pendingFarHistory = memoryData.pendingFarHistory.filter(item => {
+            const range = parseRoundRange(item?.roundRange);
+            return range.end < threshold;
+        });
+    }
+
+    const farLatest = numOr(memoryData.farHistory?.latestRound, 0);
+    if (memoryData.farHistory?.text && (farLatest <= 0 || farLatest >= threshold)) {
+        memoryData.farHistory = { text: "", earliestRound: 0, latestRound: 0, updatedAt: 0 };
+    }
+
+    const fadedLatest = numOr(memoryData.fadedHistory?.latestRound, 0);
+    const fadedCount = numOr(memoryData.fadedHistory?.count, 0);
+    if (fadedCount > 0 && (fadedLatest <= 0 || fadedLatest >= threshold)) {
+        memoryData.fadedHistory = { earliestRound: 0, latestRound: 0, count: 0 };
+    }
+}
+
 /**
  * 当发生重Roll (Swipe)、编辑或删除楼层时，回滚并清理 >= cutoffMessageId 的 L0 记忆与状态账本
  */
@@ -995,6 +1100,7 @@ export function rollbackMemoryFromMessageIndex(memoryData, cutoffMessageId) {
         memoryData.stateLedger = { time: "未知时间", characters: {}, todosAndPromises: [] };
         memoryData.lastProcessedMessageId = -1;
         memoryData.lastProcessedRound = 0;
+        clearDerivedHistoryFromRound(memoryData, 1);
         return true;
     }
     const removedFromArchive = archiveList
@@ -1013,6 +1119,9 @@ export function rollbackMemoryFromMessageIndex(memoryData, cutoffMessageId) {
     const minRemovedRound = removedRanges.length > 0
         ? Math.min(...removedRanges.map(r => r.start))
         : parseRoundRange(remainingArchive.at(-1)?.roundRange || "0").end + 1;
+    if (removedRanges.length > 0) {
+        clearDerivedHistoryFromRound(memoryData, minRemovedRound);
+    }
     const levels = {};
     let coveredRound = 0;
     for (const [level, list] of Object.entries(memoryData.levels || {})) {
@@ -1115,6 +1224,42 @@ function parseRetryAfterMs(response) {
     return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
 }
 
+function normalizeFinishReason(value) {
+    return String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[\s-]+/g, "_");
+}
+
+const OUTPUT_TRUNCATION_REASONS = new Set([
+    "length",
+    "max_tokens",
+    "max_output_tokens",
+    "max_completion_tokens",
+    "token_limit",
+    "model_length",
+]);
+const OUTPUT_BLOCKED_REASONS = new Set([
+    "content_filter",
+    "safety",
+    "recitation",
+    "blocked",
+    "sensitive",
+]);
+
+function getResponseFinishReasons(data, choice) {
+    return [...new Set([
+        choice?.finish_reason,
+        choice?.finishReason,
+        choice?.native_finish_reason,
+        data?.choices?.[0]?.native_finish_reason,
+        data?.finish_reason,
+        data?.finishReason,
+        data?.candidates?.[0]?.finishReason,
+        data?.candidates?.[0]?.finish_reason,
+    ].map(normalizeFinishReason).filter(Boolean))];
+}
+
 export async function callIndependentLLM(settings, messages, options = {}) {
     const signal = options.signal || null;
     throwIfAborted(signal);
@@ -1171,19 +1316,56 @@ export async function callIndependentLLM(settings, messages, options = {}) {
     }
 
     if (!response.ok) {
-        const errText = await response.text().catch(() => "");
+        const errText = await readResponseText(response, RESPONSE_BODY_TIMEOUT_MS, signal)
+            .catch(() => "");
         const error = new Error(`独立 API 请求失败 (${response.status}): ${errText.slice(0, 200)}`);
         error.status = response.status;
         error.retryAfterMs = parseRetryAfterMs(response);
         throw error;
     }
 
-    const data = await response.json().catch(() => null);
-    const rawContent = data?.choices?.[0]?.message?.content;
+    const responseText = await readResponseText(response, RESPONSE_BODY_TIMEOUT_MS, signal);
+    let data = null;
+    try {
+        data = JSON.parse(responseText);
+    } catch (_) {
+        throw new Error("独立 API 返回了无法解析的响应体");
+    }
+    const choice = data?.choices?.[0];
+    const finishReasons = getResponseFinishReasons(data, choice);
+    const finishReason = finishReasons.find(reason => OUTPUT_TRUNCATION_REASONS.has(reason))
+        || finishReasons.find(reason => OUTPUT_BLOCKED_REASONS.has(reason))
+        || finishReasons[0]
+        || "";
+    if (OUTPUT_TRUNCATION_REASONS.has(finishReason)) {
+        const error = new Error(
+            `模型输出已达到最大 Tokens 限制（max_tokens=${numOr(settings.maxTokens, 4000)}），响应可能被截断`,
+        );
+        error.code = "OUTPUT_TRUNCATED";
+        error.finishReason = finishReason;
+        error.usage = data?.usage || null;
+        throw error;
+    }
+    if (OUTPUT_BLOCKED_REASONS.has(finishReason)) {
+        const error = new Error(`模型输出被渠道安全策略中止（finish_reason=${finishReason}）`);
+        error.code = "OUTPUT_BLOCKED";
+        error.finishReason = finishReason;
+        error.usage = data?.usage || null;
+        throw error;
+    }
+    const rawContent = choice?.message?.content;
     const content = Array.isArray(rawContent)
         ? rawContent.map(part => typeof part === "string" ? part : (part?.text || "")).join("")
         : String(rawContent || "");
-    return content.trim();
+    const trimmed = content.trim();
+    if (options.returnMetadata) {
+        return {
+            content: trimmed,
+            finishReason,
+            usage: data?.usage || null,
+        };
+    }
+    return trimmed;
 }
 
 function tryParseJsonObject(candidate) {
@@ -1263,6 +1445,109 @@ function normalizeStringList(value, limit) {
         .slice(0, limit);
 }
 
+function hashTodoText(text) {
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+}
+
+function normalizeTodoItem(item, index, usedIds) {
+    const source = typeof item === "string" ? { text: item } : item;
+    if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+    const text = String(source.text ?? source.title ?? source.content ?? source.task ?? "").trim().slice(0, 300);
+    if (!text) return null;
+
+    const rawId = typeof source.id === "string" ? source.id.trim() : "";
+    const baseId = /^[A-Za-z0-9_.:-]{1,100}$/.test(rawId)
+        ? rawId
+        : `todo_${hashTodoText(text)}`;
+    let id = baseId;
+    let suffix = 2;
+    while (usedIds.has(id)) {
+        id = `${baseId}_${suffix++}`;
+    }
+    usedIds.add(id);
+
+    const status = String(source.status || "").toLowerCase();
+    const completed = source.completed === true
+        || source.done === true
+        || String(source.completed || "").toLowerCase() === "true"
+        || status === "completed";
+    const completedBy = completed && ["player", "model"].includes(source.completedBy)
+        ? source.completedBy
+        : "";
+    return {
+        id,
+        text,
+        completed,
+        completedRound: completed ? Math.max(0, numOr(source.completedRound, 0)) : 0,
+        completedBy,
+    };
+}
+
+export function normalizeTodoList(value, limit = TODO_LIMIT) {
+    if (!Array.isArray(value)) return [];
+    const usedIds = new Set();
+    const todos = [];
+    for (let index = 0; index < value.length && todos.length < limit; index++) {
+        const todo = normalizeTodoItem(value[index], index, usedIds);
+        if (todo) todos.push(todo);
+    }
+    return todos;
+}
+
+export function pruneExpiredCompletedTodos(value, roundNumber = 0) {
+    const round = Math.max(0, numOr(roundNumber, 0));
+    return normalizeTodoList(value, TODO_LIMIT)
+        .filter(todo => !todo.completed || round <= 0 || todo.completedRound >= round);
+}
+
+function todoMatchKey(text) {
+    return String(text || "").toLowerCase().replace(/\s+/g, "");
+}
+
+export function mergeTodoList(previousValue, incomingValue, roundNumber = 0) {
+    const round = Math.max(0, numOr(roundNumber, 0));
+    const previous = pruneExpiredCompletedTodos(previousValue, round);
+    if (!Array.isArray(incomingValue)) return previous;
+
+    const incoming = normalizeTodoList(incomingValue, TODO_LIMIT);
+    const previousById = new Map(previous.map(todo => [todo.id, todo]));
+    const previousByText = new Map();
+    for (const todo of previous) {
+        const key = todoMatchKey(todo.text);
+        if (key && !previousByText.has(key)) previousByText.set(key, todo);
+    }
+
+    const merged = [];
+    const seen = new Set();
+    for (const todo of incoming) {
+        const matched = previousById.get(todo.id)
+            || previousByText.get(todoMatchKey(todo.text))
+            || null;
+        const next = {
+            id: matched?.id || todo.id,
+            text: todo.text,
+            completed: todo.completed,
+            completedRound: todo.completed
+                ? Math.max(round, todo.completedRound, matched?.completedRound || 0)
+                : 0,
+            completedBy: todo.completed
+                ? (todo.completedBy || matched?.completedBy || "model")
+                : "",
+        };
+        const dedupeKey = next.id || todoMatchKey(next.text);
+        if (seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
+        merged.push(next);
+        if (merged.length >= TODO_LIMIT) break;
+    }
+    return merged;
+}
+
 function characterAliases(name, info) {
     return new Set([
         name,
@@ -1335,14 +1620,17 @@ export function mergeStateLedger(oldLedger, parsedLedger, roundNumber = 0) {
     const nextChars = next.characters && typeof next.characters === "object" && !Array.isArray(next.characters)
         ? next.characters
         : null;
+    const mergedTodos = mergeTodoList(
+        previous.todosAndPromises,
+        next.todosAndPromises,
+        roundNumber,
+    );
 
     if (!nextChars) {
         return {
             time: asString(next.time, asString(previous.time, "未知时间")),
             characters: deepClone(previousChars),
-            todosAndPromises: Array.isArray(next.todosAndPromises)
-                ? normalizeStringList(next.todosAndPromises, 8)
-                : normalizeStringList(previous.todosAndPromises, 8),
+            todosAndPromises: mergedTodos,
         };
     }
 
@@ -1374,9 +1662,7 @@ export function mergeStateLedger(oldLedger, parsedLedger, roundNumber = 0) {
     return {
         time: asString(next.time, asString(previous.time, "未知时间")),
         characters: mergedChars,
-        todosAndPromises: Array.isArray(next.todosAndPromises)
-            ? normalizeStringList(next.todosAndPromises, 8)
-            : normalizeStringList(previous.todosAndPromises, 8),
+        todosAndPromises: mergedTodos,
     };
 }
 
@@ -1412,7 +1698,8 @@ export async function getEmbeddingVector(
             embeddingFailureUntil = Date.now() + 60_000;
             return null;
         }
-        const data = await res.json();
+        const responseText = await readResponseText(res, timeoutMs, signal);
+        const data = JSON.parse(responseText);
         embeddingFailureUntil = 0;
         return data?.data?.[0]?.embedding || null;
     } catch (e) {
@@ -1440,6 +1727,10 @@ export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
     if (working.lastProcessedMessageId >= startMessageId) {
         rollbackMemoryFromMessageIndex(working, startMessageId);
     }
+    working.stateLedger.todosAndPromises = pruneExpiredCompletedTodos(
+        working.stateLedger.todosAndPromises,
+        currentRound,
+    );
 
     const currentStateJson = JSON.stringify(working.stateLedger, null, 2);
 
@@ -1475,7 +1766,13 @@ export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
        - **继承铁律**：上轮账本中该个体已有的已摘除饰品锁，只要本轮剧情未明确描写重新戴上，**必须原封不动保留**，严禁擅自清空！
        - 只有剧情明确描写重新戴上某件物品时，才把该物品写入同一个个体的 unlockedItems 数组；不确定时不要写。
      * **inventory**：该个体随身携带的重要信物、道具、钥匙、手机或关键物品（随身道具，上限 6 条）。
-3. **todosAndPromises**：尚未完成的约定、日程或待办（已完成的事项移除，新约定加入）。不要强行把约定归到某个角色名下。
+3. **todosAndPromises（只记真正需要跨轮跟进的事项）**：
+   - 只记录会影响后续剧情、需要持续跟进的事项：明确承诺、约定、期限、计划，或确有叙事分量的未决选择。
+   - 不要记录一次性的询问与回答、普通寒暄、日常动作、瞬时情绪，或剧情可以自然忽略的小问题。
+   - “询问某人……尚未回应”“某事尚未决定是否……”这类细节，除非确实构成关键伏笔，否则不要列入待办。
+   - 每条写成独立、可判断是否完成的事项；沿用上一轮对象的 id，新条目的 id 使用空字符串。
+   - 未完成时 completed=false；本轮明确完成的事项 completed=true，下一轮会被自动移除。
+   - 最多保留 8 条，按对后续剧情的重要性取舍。不要强行把约定归到某个角色名下。
 
 请严格按以下 JSON 结构返回：
 {
@@ -1497,7 +1794,11 @@ export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
       }
     },
     "todosAndPromises": [
-      "未完成的约定或待办事项"
+      {
+        "id": "沿用上一轮的 id；新条目留空",
+        "text": "需要跨轮跟进的重要约定或待办",
+        "completed": false
+      }
     ]
   }
 }`;
@@ -1556,7 +1857,9 @@ ${dialogueText}
             lastError = error;
             const message = String(error?.message || error);
             const status = Number(error?.status);
-            if (/未配置/.test(message) || [400, 401, 403, 404, 422].includes(status)) {
+            if (["OUTPUT_TRUNCATED", "OUTPUT_BLOCKED"].includes(error?.code)
+                || /未配置/.test(message)
+                || [400, 401, 403, 404, 422].includes(status)) {
                 throw error;
             }
         }
@@ -1890,8 +2193,10 @@ export function buildInjectedMemoryPrompt(
         });
     }
 
-    const todoLines = (ledger.todosAndPromises || []).length > 0
-        ? ledger.todosAndPromises.map(x => `  * 📌 ${x}`).join("\n")
+    const activeTodos = normalizeTodoList(ledger.todosAndPromises)
+        .filter(todo => !todo.completed);
+    const todoLines = activeTodos.length > 0
+        ? activeTodos.map(todo => `  * 📌 ${todo.text}`).join("\n")
         : "  * 无";
 
     const timelineItems = [];
@@ -2059,8 +2364,10 @@ export function buildNarrativeStoryView(memoryData) {
         lines.push(`🕰 远史编年：\n${farHistoryText}\n`);
     }
 
-    if ((ledger.todosAndPromises || []).length > 0) {
-        lines.push(`📌 待办与约定事项：\n${ledger.todosAndPromises.map(x => "  • " + x).join("\n")}\n`);
+    const activeTodos = normalizeTodoList(ledger.todosAndPromises)
+        .filter(todo => !todo.completed);
+    if (activeTodos.length > 0) {
+        lines.push(`📌 待办与约定事项：\n${activeTodos.map(todo => "  • " + todo.text).join("\n")}\n`);
     }
 
     lines.push(`📜 剧情时间线脉络（按一问一答轮数）：`);
@@ -2092,6 +2399,57 @@ export function buildNarrativeStoryView(memoryData) {
     }
 
     return lines.join("\n");
+}
+
+/**
+ * 重新总结一段原始剧情前，先移除与这段轮次相交的高层摘要，
+ * 避免任务中途停止后 L0 与 L1~L3 长期互相矛盾。
+ */
+export function invalidateDerivedSummariesInRange(memoryData, fromRound, toRound) {
+    if (!memoryData || typeof memoryData !== "object") return false;
+    const from = Math.max(1, numOr(fromRound, 1));
+    const to = Math.max(from, numOr(toRound, from));
+    let changed = false;
+    for (let level = 1; level <= MAX_MEMORY_LEVEL; level++) {
+        const list = memoryData.levels?.[level];
+        if (!Array.isArray(list)) continue;
+        const kept = list.filter(item => {
+            const range = parseRoundRange(item?.roundRange);
+            return range.end < from || range.start > to;
+        });
+        if (kept.length !== list.length) {
+            memoryData.levels[level] = kept;
+            changed = true;
+        }
+    }
+
+    const pending = Array.isArray(memoryData.pendingFarHistory) ? memoryData.pendingFarHistory : [];
+    const keptPending = pending.filter(item => {
+        const range = parseRoundRange(item?.roundRange);
+        return range.end < from || range.start > to;
+    });
+    if (keptPending.length !== pending.length) {
+        memoryData.pendingFarHistory = keptPending;
+        changed = true;
+    }
+
+    const farRange = {
+        start: Math.max(0, numOr(memoryData.farHistory?.earliestRound, 0)),
+        end: Math.max(0, numOr(memoryData.farHistory?.latestRound, 0)),
+    };
+    if (memoryData.farHistory?.text && farRange.end >= from && farRange.start <= to) {
+        memoryData.farHistory = { text: "", earliestRound: 0, latestRound: 0, updatedAt: 0 };
+        changed = true;
+    }
+    const fadedEarliest = numOr(memoryData.fadedHistory?.earliestRound, 0);
+    const fadedLatest = numOr(memoryData.fadedHistory?.latestRound, 0);
+    if (numOr(memoryData.fadedHistory?.count, 0) > 0
+        && fadedLatest >= from
+        && (fadedEarliest <= 0 || fadedEarliest <= to)) {
+        memoryData.fadedHistory = { earliestRound: 0, latestRound: 0, count: 0 };
+        changed = true;
+    }
+    return changed;
 }
 
 /**
@@ -2182,41 +2540,29 @@ export async function backfillExistingChatHistory(
     }
     normalizeMemoryData(memoryData);
 
-    // 开场白是序章，会并入第一轮；这里只扫描真正的 AI 回复轮次。
-    const aiMessageIndices = [];
-    for (let idx = 0; idx < chatMessages.length; idx++) {
-        const m = chatMessages[idx];
-        if (isAiReplyMessage(m, settings.includeNativeHidden)
-            && !isOpeningAiMessage(chatMessages, idx, settings.includeNativeHidden)) {
-            aiMessageIndices.push(idx);
-        }
-    }
-
-    if (aiMessageIndices.length === 0) {
+    // 开场白是序章，会并入第一轮；一次扫描同时得到轮次和消息窗口。
+    const roundIndex = buildRoundMessageIndex(chatMessages, settings.includeNativeHidden);
+    if (roundIndex.aiTurns.length === 0) {
         return { processedCount: 0, aborted: false };
     }
 
     const lastProcessedMessageId = memoryData.lastProcessedMessageId ?? -1;
-    const pendingAiIndices = aiMessageIndices.filter(i => i > lastProcessedMessageId);
-    const roundByMessageId = new Map(aiMessageIndices.map((idx, position) => [idx, position + 1]));
+    const pendingTurns = roundIndex.aiTurns.filter(turn => turn.idx > lastProcessedMessageId);
 
-    if (pendingAiIndices.length === 0) {
+    if (pendingTurns.length === 0) {
         return { processedCount: 0, aborted: false };
     }
 
     let processedCount = 0;
-    const totalRounds = pendingAiIndices.length;
+    const totalRounds = pendingTurns.length;
 
-    for (let i = 0; i < pendingAiIndices.length; i++) {
+    for (let i = 0; i < pendingTurns.length; i++) {
         throwIfAborted(signal);
         if (typeof shouldAbort === "function" && shouldAbort()) {
             return { processedCount, aborted: true };
         }
 
-        const msgIdx = pendingAiIndices[i];
-        const turnWindow = getRoundMessageWindow(chatMessages, msgIdx, settings.includeNativeHidden);
-        if (!turnWindow) continue;
-        const roundNumber = turnWindow.roundNumber || roundByMessageId.get(msgIdx) || 1;
+        const { idx: msgIdx, round: roundNumber, window: turnWindow } = pendingTurns[i];
 
         let startFloor = turnWindow.startMessageId;
         const batchMsgs = [];
@@ -2261,7 +2607,7 @@ export async function backfillExistingChatHistory(
         processedCount++;
 
         if (typeof onChunkSaved === "function"
-            && ((i + 1) % batchSaveSize === 0 || i === pendingAiIndices.length - 1)) {
+            && ((i + 1) % batchSaveSize === 0 || i === pendingTurns.length - 1)) {
             await onChunkSaved(msgIdx);
         }
     }
