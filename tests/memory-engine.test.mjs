@@ -583,6 +583,30 @@ test("normalize drops out-of-range memory levels", () => {
     assert.ok(Object.keys(data.levels).every(key => Number(key) <= 3));
 });
 
+test("normalize does not promote a malformed higher-level archive entry to L0", () => {
+    const data = normalizeMemoryData({
+        levels: {
+            0: [],
+            1: [{
+                id: "L1_import",
+                level: 1,
+                roundRange: "1-5",
+                text: "已有高层摘要",
+            }],
+        },
+        stateLedger: { time: "t", characters: {}, todosAndPromises: [] },
+        archivePool: [{
+            id: "L1_stray",
+            level: 1,
+            roundRange: "1-5",
+            text: "不应进入回溯池的高层摘要",
+        }],
+    });
+
+    assert.equal(data.levels[1][0].id, "L1_import");
+    assert.equal(data.archivePool.length, 0);
+});
+
 test("model-completed todos stay visible for one round and are removed next round", () => {
     const previous = {
         time: "傍晚",

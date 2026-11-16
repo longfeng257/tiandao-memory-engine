@@ -156,13 +156,8 @@ function scheduleChatSave() {
     chatSaveTimer = setTimeout(async () => {
         chatSaveTimer = null;
         if (!isCurrentChat(chatKey)) return;
-        const ctx = getSTContext();
         try {
-            if (typeof ctx.saveChat === "function") {
-                await ctx.saveChat();
-            } else if (typeof ctx.saveMetadataDebounced === "function") {
-                ctx.saveMetadataDebounced();
-            }
+            await saveChatMemory();
         } catch (error) {
             console.warn("[溯微] 保存聊天状态失败:", error);
         }
@@ -453,23 +448,32 @@ function getChatMemory() {
 
 async function saveChatMemory() {
     const ctx = getSTContext();
+    const savers = [];
     if (typeof ctx.saveMetadata === "function") {
-        await ctx.saveMetadata();
-        return;
+        savers.push(() => ctx.saveMetadata());
     }
     if (typeof ctx.saveChat === "function") {
-        await ctx.saveChat();
-        return;
+        savers.push(() => ctx.saveChat());
     }
     if (typeof window.saveMetadata === "function") {
-        await window.saveMetadata();
-        return;
+        savers.push(() => window.saveMetadata());
     }
     if (typeof ctx.saveMetadataDebounced === "function") {
-        ctx.saveMetadataDebounced();
-        return;
+        savers.push(() => ctx.saveMetadataDebounced());
     }
-    throw new Error("当前酒馆版本没有可用的聊天元数据保存接口");
+    if (savers.length === 0) {
+        throw new Error("当前酒馆版本没有可用的聊天元数据保存接口");
+    }
+    let lastError = null;
+    for (const save of savers) {
+        try {
+            await save();
+            return;
+        } catch (error) {
+            lastError = error;
+        }
+    }
+    throw lastError || new Error("聊天元数据保存失败");
 }
 
 function updateStatusBar(text, isError = false) {

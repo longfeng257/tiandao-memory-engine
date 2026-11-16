@@ -932,8 +932,8 @@ export function normalizeMemoryData(memoryData) {
         data.archivePool = [];
     }
     data.archivePool = data.archivePool
-        .map(item => sanitizeMemoryEntry(item, 0))
-        .filter(Boolean)
+        .map(item => sanitizeMemoryEntry(item))
+        .filter(item => item && item.level === 0)
         .sort((a, b) => {
             return numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
                 - numOr(b.startMessageId, parseRoundRange(b.roundRange).start);

@@ -522,7 +522,8 @@ test("legacy settings backups strip nested API keys before restore", () => {
 
 test("metadata saves have concrete fallbacks and failed destructive writes roll back", () => {
     assert.match(indexSource, /async function saveChatMemory\(\)[\s\S]{0,500}ctx\.saveChat/);
-    assert.match(indexSource, /saveMetadataDebounced\(\)[\s\S]{0,120}return/);
+    assert.match(indexSource, /savers\.push\(\(\) => ctx\.saveMetadataDebounced\(\)\)/);
+    assert.match(indexSource, /for \(const save of savers\)[\s\S]{0,220}await save\(\)/);
     assert.match(
         indexSource,
         /const previousMemory = metadata\.tiandao_memory;\s*metadata\.tiandao_memory = createEmptyMemoryData\(\)[\s\S]{0,520}metadata\.tiandao_memory = previousMemory/,
