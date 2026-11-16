@@ -49,11 +49,11 @@ test("summary progress is a separate persistent task panel with stop and progres
 test("editing or swiping archived rounds restores hidden raw context immediately", () => {
     assert.match(
         indexSource,
-        /eventTypes\.MESSAGE_EDITED[\s\S]{0,1200}rollbackMemoryFromMessageIndex\(memoryData, idx\);[\s\S]{0,500}syncHiddenMessagesState\(\)/,
+        /eventTypes\.MESSAGE_EDITED[\s\S]{0,1200}rollbackMemoryFromMessageIndex\(memoryData, idx, \{ skipNormalize: true \}\);[\s\S]{0,500}syncHiddenMessagesState\(\)/,
     );
     assert.match(
         indexSource,
-        /eventTypes\.MESSAGE_SWIPED[\s\S]{0,1000}rollbackMemoryFromMessageIndex\(memoryData, startFloor\);[\s\S]{0,500}syncHiddenMessagesState\(\)/,
+        /eventTypes\.MESSAGE_SWIPED[\s\S]{0,1000}rollbackMemoryFromMessageIndex\(memoryData, startFloor, \{ skipNormalize: true \}\);[\s\S]{0,500}syncHiddenMessagesState\(\)/,
     );
 });
 
@@ -76,6 +76,7 @@ test("story range exposes fill, view and rebuild modes plus recovery entry", () 
     assert.match(indexSource, /id="tiandao_story_range_from"/);
     assert.match(indexSource, /id="tiandao_story_range_to"/);
     assert.match(indexSource, /id="tiandao_story_range_mode"[\s\S]*?value="fill"/);
+    assert.match(indexSource, /value="merge_l0">手动合 L0<\/option>/);
     assert.match(indexSource, /value="view"/);
     assert.match(indexSource, /value="rebuild"/);
     assert.match(indexSource, /id="tiandao_story_error_box"/);
@@ -87,6 +88,14 @@ test("story range exposes fill, view and rebuild modes plus recovery entry", () 
 test("API controls expose retry and JSON mode without an output token cap", () => {
     assert.match(indexSource, /id="tiandao_summary_retry"/);
     assert.match(indexSource, /id="tiandao_use_json_mode"/);
+    assert.match(indexSource, /id="tiandao_request_timeout"/);
+    assert.match(indexSource, /bindInput\("tiandao_request_timeout", "requestTimeoutSeconds", true\)/);
+    assert.match(indexSource, /id="tiandao_stream_mode"/);
+    assert.match(indexSource, /bindInput\("tiandao_stream_mode", "streamMode"\)/);
+    assert.match(engineSource, /requestTimeoutSeconds:\s*""/);
+    assert.match(engineSource, /streamMode:\s*"non_stream"/);
+    assert.match(engineSource, /resolveLlmRequestTimeoutMs/);
+    assert.match(engineSource, /readStreamingChatCompletion/);
     assert.doesNotMatch(indexSource, /id="tiandao_max_tokens"/);
     assert.doesNotMatch(engineSource, /max_tokens:\s*numOr/);
 });
@@ -101,6 +110,13 @@ test("character cards expose away state and alias styles", () => {
     assert.match(indexSource, /tiandao-char-alias/);
     assert.match(indexSource, /tiandao-char-avatar/);
     assert.match(styleSource, /\.tiandao-char-card\.tiandao-char-away/);
+});
+
+test("character private views are escaped and injected as isolated data", () => {
+    assert.match(indexSource, /escapeHTML\(info\.viewTarget\)/);
+    assert.match(indexSource, /escapeHTML\(info\.viewSeenRound\)/);
+    assert.match(engineSource, /viewTargetVisible/);
+    assert.match(engineSource, /仅此角色知晓，严禁外传/);
 });
 
 test("parse failure logs no raw story excerpt", () => {
@@ -274,6 +290,10 @@ test("API settings expose saved profiles and keep profile keys out of local back
     assert.match(indexSource, /id="tiandao_api_profile_select"/);
     assert.match(indexSource, /id="tiandao_api_profile_save_btn"/);
     assert.match(indexSource, /function saveCurrentApiProfile\(\)/);
+    assert.match(indexSource, /API_PROFILE_FIELDS = \[[^\]]*requestTimeoutSeconds/);
+    assert.match(indexSource, /API_PROFILE_FIELDS = \[[^\]]*streamMode/);
+    assert.match(indexSource, /requestTimeoutSeconds: "tiandao_request_timeout"/);
+    assert.match(indexSource, /streamMode: "tiandao_stream_mode"/);
     assert.match(indexSource, /delete safeProfile\.apiKey/);
 });
 
@@ -359,13 +379,26 @@ test("todo save failure restores the previous completion state", () => {
 });
 
 test("placeholder cleanup schedules a chat save", () => {
-    assert.match(indexSource, /if \(cleanupPlaceholderCharacters\(memoryData, ctx\.name1 \|\| ""\)\) \{\s*scheduleChatSave\(\);/);
+    assert.match(indexSource, /if \(cleanupPlaceholderCharacters\(memoryData, ctx\.name1 \|\| "", true\)\) \{\s*scheduleChatSave\(\);/);
+});
+
+test("memory import is size limited", () => {
+    assert.match(indexSource, /MAX_IMPORT_FILE_BYTES = 20 \* 1024 \* 1024/);
+    assert.match(indexSource, /MAX_IMPORT_MEMORY_ENTRIES = 50_000/);
+    assert.match(indexSource, /file\.size > MAX_IMPORT_FILE_BYTES/);
+    assert.match(indexSource, /超过 20MB/);
+    assert.match(indexSource, /记忆条目超过/);
 });
 
 test("range resummarize passes precomputed round windows", () => {
     assert.match(indexSource, /precomputedTurn\?\.window/);
     assert.match(indexSource, /\.map\(\(\{ idx, round, msg, window \}\) => \(\{ idx, round, msg, window \}\)\)/);
-    assert.match(indexSource, /signal,\s*turn,\s*\);/);
+    assert.match(indexSource, /group\.length === 1 \? group\[0\] : null/);
+    assert.match(indexSource, /group\.length > 1 \? group : null/);
+    assert.match(
+        indexSource,
+        /precomputedTurn\?\.msg[\s\S]{0,100}chat\[msgIdx\] === precomputedTurn\.msg/,
+    );
 });
 
 test("character cards and their inventory lists are collapsed disclosures", () => {
@@ -402,8 +435,128 @@ test("embedding models have a separate fetch action and embedding-only filter", 
     assert.match(engineSource, /embeddingModelFilterOnly:\s*true/);
     assert.match(indexSource, /id="tiandao_fetch_embedding_models_btn"/);
     assert.match(indexSource, /id="tiandao_emb_model_toggle_btn"/);
+    assert.match(indexSource, /id="tiandao_emb_model_select"/);
+    assert.match(indexSource, /function getSelectableEmbeddingModelNames\(\)/);
+    assert.match(indexSource, /select\.hidden = visibleNames\.length === 0/);
     assert.match(indexSource, /id="tiandao_emb_filter_models"/);
     assert.match(indexSource, /function isEmbeddingModelName\(name\)/);
     assert.match(indexSource, /function getVisibleEmbeddingModelNames\(\)/);
     assert.match(indexSource, /bindCheck\("tiandao_emb_filter_models", "embeddingModelFilterOnly"/);
+    assert.match(styleSource, /\.tiandao-emb-model-select\s*\{/);
+});
+
+test("editing an unmerged L0 leaves higher summaries untouched", () => {
+    assert.match(indexSource, /const needsHierarchyRebuild = numericLevel > 0\s*\|\| isMemoryEntryCoveredByHigherLevels\(memoryData, item, 0\)/);
+    assert.match(indexSource, /该范围尚未并入高层，L1～L3 未改动/);
+});
+
+test("L0 grouping has automatic and manual modes with a configurable round count", () => {
+    assert.match(engineSource, /l0RoundsPerSummary:\s*1/);
+    assert.match(engineSource, /l0MergeMode:\s*"auto"/);
+    assert.match(engineSource, /export function resolveL0RoundsPerSummary\(/);
+    assert.match(engineSource, /export function groupAiTurnsForL0\(/);
+    assert.match(indexSource, /id="tiandao_l0_chunk"/);
+    assert.match(indexSource, /id="tiandao_l0_merge_mode"/);
+    assert.match(indexSource, /bindInput\("tiandao_l0_chunk", "l0RoundsPerSummary", true/);
+    assert.match(indexSource, /bindInput\("tiandao_l0_merge_mode", "l0MergeMode"/);
+    assert.match(indexSource, /settings\.l0MergeMode === "manual"/);
+    assert.match(indexSource, /groupAiTurnsForL0\(\s*pending,\s*resolveL0RoundsPerSummary\(settings\),\s*!isManual/);
+    assert.match(indexSource, /singleGroup: true/);
+    assert.match(indexSource, /下一段自动计数会从第 \$\{toRound \+ 1\} 轮重新开始/);
+    assert.match(indexSource, /连续轮次微摘要/);
+});
+
+test("message deletion reconciles surviving summaries instead of rolling back the whole archive", () => {
+    assert.match(engineSource, /export function reconcileMemoryAfterMessageDeletion\(/);
+    assert.match(engineSource, /remapRangeFromSurvivingL0/);
+    assert.match(engineSource, /lastProcessedMessageId = Math\.max\(\.\.\.archivedEnds\)/);
+    assert.match(indexSource, /eventTypes\.MESSAGE_DELETED[\s\S]{0,700}reconcileMemoryAfterMessageDeletion\(/);
+    assert.match(indexSource, /const roundRange = startRound === roundNumber \? String\(roundNumber\)/);
+    assert.doesNotMatch(
+        indexSource,
+        /eventTypes\.MESSAGE_DELETED[\s\S]{0,800}rollbackMemoryFromMessageIndex\(/,
+    );
+});
+
+test("resummarize expands overlapping L0 and hidden raw rounds keep their summary", () => {
+    assert.match(indexSource, /expandResummarizeRanges\(requestedRanges, existingL0\)/);
+    assert.match(indexSource, /replaceL0EntryInMemory\(memoryData, target, replacement\)/);
+    assert.match(indexSource, /recentRawRoundNumbers:\s*recentRawRounds > 0[\s\S]{0,180}getSendableRawRoundNumbers\(chat, settings, currentRound, recentRawRounds\)/);
+    assert.match(indexSource, /function getSendableRawRoundNumbers\(chat, settings, currentRound = 0, recentRawRounds = 0\)/);
+    assert.match(indexSource, /msg\.is_system \|\| !String\(msg\.mes \|\| ""\)\.trim\(\)/);
+    assert.match(indexSource, /eventTypes\.MESSAGE_SWIPED[\s\S]{0,1800}scheduleAfterReplySwipeRepair\(getChatKey\(\)\)/);
+    assert.match(indexSource, /clearEntryEmbedding\(item\)/);
+    assert.match(indexSource, /embeddingDimension: archiveEntry\.embeddingDimension/);
+});
+
+test("manual backfill ignores stale summaries after chat mutations", () => {
+    assert.match(indexSource, /const backfillEpoch = summaryEpoch;/);
+    assert.match(
+        indexSource,
+        /shouldAbort: \(\) => abortBackfillFlag[\s\S]{0,220}backfillEpoch !== summaryEpoch/,
+    );
+    assert.match(
+        indexSource,
+        /shouldCommitTurn: \(\) => isCurrentChat\(backfillChatKey\)\s*&& backfillEpoch === summaryEpoch/,
+    );
+});
+
+test("story timeline mirrors prompt visibility for hidden raw rounds", () => {
+    assert.match(indexSource, /function isL0FullyCoveredByRaw\(/);
+    assert.match(
+        indexSource,
+        /rawRoundNumbers = rawKeep > 0[\s\S]{0,140}getSendableRawRoundNumbers\(chat, settings, currentRound, rawKeep\)/,
+    );
+    assert.match(
+        indexSource,
+        /isL0FullyCoveredByRaw\(it, rawWindowStart, currentRound, rawRoundNumbers\)/,
+    );
+});
+
+test("legacy settings backups strip nested API keys before restore", () => {
+    assert.match(indexSource, /function sanitizeSettingsBackup\(backup\)/);
+    assert.match(indexSource, /safeProfile\.apiKey !== undefined[\s\S]{0,120}delete safeProfile\.apiKey/);
+    assert.match(indexSource, /const sanitized = sanitizeSettingsBackup\(backup\)/);
+    assert.match(indexSource, /if \(sanitized\.redacted\)/);
+});
+
+test("metadata saves have concrete fallbacks and failed destructive writes roll back", () => {
+    assert.match(indexSource, /async function saveChatMemory\(\)[\s\S]{0,500}ctx\.saveChat/);
+    assert.match(indexSource, /saveMetadataDebounced\(\)[\s\S]{0,120}return/);
+    assert.match(
+        indexSource,
+        /const previousMemory = metadata\.tiandao_memory;\s*metadata\.tiandao_memory = createEmptyMemoryData\(\)[\s\S]{0,520}metadata\.tiandao_memory = previousMemory/,
+    );
+    assert.match(
+        indexSource,
+        /metadata\.tiandao_memory = merged;[\s\S]{0,320}metadata\.tiandao_memory = previousMemory/,
+    );
+});
+
+test("chat mutations abort in-flight summaries instead of wasting the request", () => {
+    assert.match(indexSource, /function invalidateActiveSummaryWork\(reason = "聊天内容已变化"\)/);
+    assert.match(
+        indexSource,
+        /function invalidateActiveSummaryWork\([\s\S]{0,420}task\.controller\.abort\(\)/,
+    );
+    assert.match(indexSource, /eventTypes\.MESSAGE_DELETED[\s\S]{0,700}invalidateActiveSummaryWork\("消息已删除"\)/);
+    assert.match(indexSource, /eventTypes\.MESSAGE_EDITED[\s\S]{0,400}invalidateActiveSummaryWork\("消息已编辑"\)/);
+    assert.match(indexSource, /eventTypes\.MESSAGE_SWIPED[\s\S]{0,400}invalidateActiveSummaryWork\("已切换 Swipe"\)/);
+});
+
+test("long-chat hot paths reuse normalized memory and cap raw scanning", () => {
+    assert.match(indexSource, /cleanupPlaceholderCharacters\(memoryData, ctx\.name1 \|\| "", true\)/);
+    assert.match(indexSource, /retrieveRelevantArchivedMemories\([\s\S]{0,180}\{ skipNormalize: true \}/);
+    assert.match(indexSource, /pruneStaleCharacters\([\s\S]{0,180}skipNormalize: true/);
+    assert.match(
+        indexSource,
+        /function getSendableRawRoundNumbers\([\s\S]{0,500}Math\.max\(1, currentRound - recentRawRounds \+ 1\)/,
+    );
+    assert.match(indexSource, /renderStoryTimeline\(memoryData\)/);
+    assert.match(engineSource, /function cloneMemoryForUpdate\(memoryData, skipNormalize = false\)/);
+    assert.match(engineSource, /cloneMemoryForUpdate\(memoryData, true\)/);
+    assert.match(engineSource, /memoryAlreadyNormalized: true/);
+    assert.match(indexSource, /rollbackMemoryFromMessageIndex\(memoryData, idx, \{ skipNormalize: true \}\)/);
+    assert.match(engineSource, /rollbackMemoryFromMessageIndex\(working, startMessageId, \{ skipNormalize: true \}\)/);
+    assert.match(indexSource, /getSettings\(\)\.includeNativeHidden,\s*\{ skipNormalize: true \}/);
 });

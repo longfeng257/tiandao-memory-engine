@@ -32,13 +32,23 @@ import {
     captureLatestL0StateStorage,
     stampLatestL0StateSnapshot,
     restoreLatestL0StateStorage,
+    buildChatMessageFingerprint,
+    reconcileMemoryAfterMessageDeletion,
+    isMemoryEntryCoveredByHigherLevels,
+    resolveL0RoundsPerSummary,
+    groupAiTurnsForL0,
+    expandResummarizeRanges,
+    replaceL0EntryInMemory,
 } from "./memory-engine.js";
 
 const EXTENSION_NAME = "tiandao-memory-engine";
 const PROMPT_KEY = "tiandao_memory_prompt";
 const LS_SETTINGS_KEY = "suwei_memory_settings_backup_v1";
+const MAX_IMPORT_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_IMPORT_MEMORY_ENTRIES = 50_000;
+const MAX_FETCHED_MODELS = 500;
 const SENSITIVE_SETTING_KEYS = new Set(["apiKey", "embeddingApiKey"]);
-const API_PROFILE_FIELDS = ["apiUrl", "apiKey", "model", "temperature", "useJsonMode"];
+const API_PROFILE_FIELDS = ["apiUrl", "apiKey", "model", "temperature", "requestTimeoutSeconds", "streamMode", "useJsonMode"];
 
 // 运行时状态控制
 let isBackfilling = false;
@@ -133,29 +143,11 @@ function invalidateRoundIndexCache(chat) {
 }
 
 function buildChatFingerprint(chat) {
-    if (!Array.isArray(chat)) return [];
-    return chat.map(msg => {
-        if (!msg) return "";
-        return [
-            msg.send_date || "",
-            msg.name || "",
-            msg.is_user ? "u" : "a",
-            msg.is_system ? "s" : "n",
-            String(msg.mes || "").slice(0, 120),
-        ].join("|");
-    });
+    return buildChatMessageFingerprint(chat);
 }
 
 function refreshChatFingerprint(chat = getSTContext().chat || []) {
     lastChatFingerprint = buildChatFingerprint(chat);
-}
-
-function findFirstChangedMessageIndex(previous, current) {
-    const max = Math.max(previous.length, current.length);
-    for (let i = 0; i < max; i++) {
-        if (previous[i] !== current[i]) return i;
-    }
-    return -1;
 }
 
 function scheduleChatSave() {
@@ -183,7 +175,7 @@ function enqueueBackgroundSummary(task, label = "自动归档") {
             await task();
         })
         .catch(error => {
-            console.error(`[溯微] ${label}失败:`, error);
+            console.error(`[溯微] ${label}失败:`, error?.code || error?.status || "unknown");
             updateStatusBar(`❌ ${error.message || label + "失败"}`, true);
         });
     return summaryQueue;
@@ -203,7 +195,7 @@ const LEGACY_PREFILLED_DEFAULTS = {
 function sanitizeApiProfiles(value) {
     const profiles = [];
     const seenIds = new Set();
-    for (const [index, raw] of (Array.isArray(value) ? value : []).entries()) {
+    for (const [index, raw] of (Array.isArray(value) ? value.slice(0, 100) : []).entries()) {
         if (!raw || typeof raw !== "object") continue;
         const name = String(raw.name || "").trim().slice(0, 80);
         if (!name) continue;
@@ -214,6 +206,12 @@ function sanitizeApiProfiles(value) {
         for (const field of API_PROFILE_FIELDS) {
             profile[field] = field === "useJsonMode"
                 ? raw[field] !== false
+                : field === "streamMode"
+                ? (raw[field] === "stream" ? "stream" : "non_stream")
+                : field === "apiUrl" || field === "apiKey"
+                ? String(raw[field] ?? "").slice(0, 2000)
+                : field === "model"
+                ? String(raw[field] ?? "").slice(0, 200)
                 : (raw[field] ?? "");
         }
         profiles.push(profile);
@@ -230,18 +228,12 @@ function getSettings() {
         try {
             const backup = JSON.parse(localStorage.getItem(LS_SETTINGS_KEY) || "null");
             if (backup && typeof backup === "object") {
-                let containedSensitiveKey = false;
-                for (const [key, value] of Object.entries(backup)) {
-                    if (SENSITIVE_SETTING_KEYS.has(key)) {
-                        containedSensitiveKey = true;
-                    } else {
-                        extSettings[EXTENSION_NAME][key] = value;
-                    }
+                const sanitized = sanitizeSettingsBackup(backup);
+                for (const [key, value] of Object.entries(sanitized.backup)) {
+                    extSettings[EXTENSION_NAME][key] = value;
                 }
-                if (containedSensitiveKey) {
-                    const sanitized = { ...backup };
-                    for (const key of SENSITIVE_SETTING_KEYS) delete sanitized[key];
-                    localStorage.setItem(LS_SETTINGS_KEY, JSON.stringify(sanitized));
+                if (sanitized.redacted) {
+                    localStorage.setItem(LS_SETTINGS_KEY, JSON.stringify(sanitized.backup));
                 }
             }
         } catch (_) { /* 备份损坏时忽略 */ }
@@ -258,7 +250,18 @@ function getSettings() {
         }
     }
     s.apiProfiles = sanitizeApiProfiles(s.apiProfiles);
-    s.activeApiProfileId = String(s.activeApiProfileId || "");
+    s.activeApiProfileId = String(s.activeApiProfileId || "").slice(0, 200);
+    s.apiUrl = String(s.apiUrl || "").slice(0, 2000);
+    s.apiKey = String(s.apiKey || "").slice(0, 2000);
+    s.model = String(s.model || "").slice(0, 200);
+    s.embeddingApiUrl = String(s.embeddingApiUrl || "").slice(0, 2000);
+    s.embeddingApiKey = String(s.embeddingApiKey || "").slice(0, 2000);
+    s.embeddingModel = String(s.embeddingModel || "").slice(0, 200);
+    s.streamMode = s.streamMode === "stream" ? "stream" : "non_stream";
+    s.l0RoundsPerSummary = resolveL0RoundsPerSummary(s);
+    s.l0MergeMode = s.l0MergeMode === "manual" ? "manual" : "auto";
+    s.targetContentTags = String(s.targetContentTags || "").slice(0, 500);
+    s.customStripTags = String(s.customStripTags || "").slice(0, 500);
     // 清空旧版本自动预填的示例值（不影响用户自行配置过的真实值）
     if (!s.apiKey) {
         if (s.apiUrl === LEGACY_PREFILLED_DEFAULTS.apiUrl) s.apiUrl = "";
@@ -273,6 +276,31 @@ function getSettings() {
     return s;
 }
 
+function sanitizeSettingsBackup(backup) {
+    const safeBackup = { ...(backup && typeof backup === "object" ? backup : {}) };
+    let redacted = false;
+    for (const key of Object.keys(safeBackup)) {
+        if (SENSITIVE_SETTING_KEYS.has(key)
+            || ["__proto__", "prototype", "constructor"].includes(key)) {
+            delete safeBackup[key];
+            redacted = true;
+        }
+    }
+    if (Array.isArray(safeBackup.apiProfiles)) {
+        safeBackup.apiProfiles = safeBackup.apiProfiles
+            .filter(profile => profile && typeof profile === "object")
+            .map(profile => {
+                const safeProfile = { ...profile };
+                if (safeProfile.apiKey !== undefined) {
+                    delete safeProfile.apiKey;
+                    redacted = true;
+                }
+                return safeProfile;
+            });
+    }
+    return { backup: safeBackup, redacted };
+}
+
 function saveSettings() {
     const ctx = getSTContext();
     if (typeof ctx.saveSettingsDebounced === "function") {
@@ -280,15 +308,7 @@ function saveSettings() {
     }
     // 本地双保险备份：保存非敏感配置；API Key 只留在酒馆设置中，不额外镜像到 localStorage。
     try {
-        const backup = { ...getSettings() };
-        for (const key of SENSITIVE_SETTING_KEYS) delete backup[key];
-        if (Array.isArray(backup.apiProfiles)) {
-            backup.apiProfiles = backup.apiProfiles.map(profile => {
-                const safeProfile = { ...profile };
-                delete safeProfile.apiKey;
-                return safeProfile;
-            });
-        }
+        const { backup } = sanitizeSettingsBackup(getSettings());
         localStorage.setItem(LS_SETTINGS_KEY, JSON.stringify(backup));
     } catch (_) { /* 隐私模式等场景忽略 */ }
 }
@@ -320,12 +340,16 @@ function applyApiProfileToForm(profile) {
         apiKey: "tiandao_api_key",
         model: "tiandao_model",
         temperature: "tiandao_temp",
+        requestTimeoutSeconds: "tiandao_request_timeout",
+        streamMode: "tiandao_stream_mode",
         useJsonMode: "tiandao_use_json_mode",
     };
     for (const [field, id] of Object.entries(bindings)) {
         const el = document.getElementById(id);
         if (!el) continue;
-        const value = profile[field] ?? (field === "useJsonMode" ? true : "");
+        const value = field === "streamMode"
+            ? (profile[field] === "stream" ? "stream" : "non_stream")
+            : (profile[field] ?? (field === "useJsonMode" ? true : ""));
         settings[field] = value;
         if (field === "useJsonMode") {
             el.checked = Boolean(value);
@@ -373,6 +397,8 @@ function saveCurrentApiProfile() {
     for (const field of API_PROFILE_FIELDS) {
         profile[field] = field === "useJsonMode"
             ? settings.useJsonMode !== false
+            : field === "streamMode"
+            ? (settings.streamMode === "stream" ? "stream" : "non_stream")
             : (settings[field] ?? "");
     }
     if (existingIndex >= 0) {
@@ -419,7 +445,7 @@ function getChatMemory() {
         || previousMemoryVersion !== memoryData.version) {
         scheduleChatSave();
     }
-    if (cleanupPlaceholderCharacters(memoryData, ctx.name1 || "")) {
+    if (cleanupPlaceholderCharacters(memoryData, ctx.name1 || "", true)) {
         scheduleChatSave();
     }
     return memoryData;
@@ -429,9 +455,21 @@ async function saveChatMemory() {
     const ctx = getSTContext();
     if (typeof ctx.saveMetadata === "function") {
         await ctx.saveMetadata();
-    } else if (typeof window.saveMetadata === "function") {
-        await window.saveMetadata();
+        return;
     }
+    if (typeof ctx.saveChat === "function") {
+        await ctx.saveChat();
+        return;
+    }
+    if (typeof window.saveMetadata === "function") {
+        await window.saveMetadata();
+        return;
+    }
+    if (typeof ctx.saveMetadataDebounced === "function") {
+        ctx.saveMetadataDebounced();
+        return;
+    }
+    throw new Error("当前酒馆版本没有可用的聊天元数据保存接口");
 }
 
 function updateStatusBar(text, isError = false) {
@@ -511,6 +549,18 @@ function requestSummaryTaskStop() {
     updateStatusBar("⏸️ 已请求停止总结");
 }
 
+function invalidateActiveSummaryWork(reason = "聊天内容已变化") {
+    summaryEpoch++;
+    clearSwipeRepairTimer();
+    const task = activeSummaryTask;
+    if (!task || task.cancelRequested) return;
+    task.cancelRequested = true;
+    task.cancelDetail = reason;
+    task.detail = `${reason}，正在停止旧总结`;
+    task.controller.abort();
+    renderSummaryProgress();
+}
+
 function isSummaryTaskCancelled(task = activeSummaryTask) {
     return Boolean(task?.cancelRequested || task?.controller?.signal?.aborted);
 }
@@ -585,6 +635,36 @@ function buildRecentContextQuery(chat, targetContentTags, customStripTags) {
     return snippets.reverse().join("\n");
 }
 
+function getSendableRawRoundNumbers(chat, settings, currentRound = 0, recentRawRounds = 0) {
+    const sendable = new Set();
+    if (!Array.isArray(chat)) return sendable;
+    if (currentRound <= 0) return sendable;
+    const minRound = currentRound > 0 && recentRawRounds > 0
+        ? Math.max(1, currentRound - recentRawRounds + 1)
+        : 1;
+    const roundIndex = getCachedRoundIndex(chat, settings.includeNativeHidden);
+    for (const turn of roundIndex.aiTurns) {
+        if (turn.round < minRound) continue;
+        if (currentRound > 0 && turn.round > currentRound) continue;
+        const indexes = [
+            turn.window?.openingMessageIndex,
+            turn.window?.userMessageIndex,
+            turn.window?.startMessageId,
+            turn.idx,
+        ].filter(index => Number.isInteger(index) && index >= 0);
+        let complete = true;
+        for (const index of new Set(indexes)) {
+            const msg = chat[index];
+            if (!msg || msg.is_system || !String(msg.mes || "").trim()) {
+                complete = false;
+                break;
+            }
+        }
+        if (complete) sendable.add(turn.round);
+    }
+    return sendable;
+}
+
 async function refreshPromptInjection(customQuery = "", options = {}) {
     const ctx = getSTContext();
     const settings = getSettings();
@@ -617,7 +697,12 @@ async function refreshPromptInjection(customQuery = "", options = {}) {
 
     let retrieved = [];
     if (settings.enableRetrieval && queryText && !options.skipRetrieval) {
-        retrieved = await retrieveRelevantArchivedMemories(settings, memoryData, queryText);
+        retrieved = await retrieveRelevantArchivedMemories(
+            settings,
+            memoryData,
+            queryText,
+            { skipNormalize: true },
+        );
     }
     if (!isCurrentChat(chatKey)) return;
 
@@ -632,16 +717,20 @@ async function refreshPromptInjection(customQuery = "", options = {}) {
     const currentRound = latestAiIndex >= 0
         ? calculateRoundForMessageIndex(chat, latestAiIndex, settings.includeNativeHidden)
         : 0;
+    const recentRawRounds = settings.autoHideOldMessages
+        ? Math.max(1, numOr(settings.keepRecentRoundsCount, 5))
+        : 0;
     const promptText = buildInjectedMemoryPrompt(
         memoryData,
         retrieved,
         ctx.name1 || "",
         5000,
         {
-            recentRawRounds: settings.autoHideOldMessages
-                ? Math.max(1, numOr(settings.keepRecentRoundsCount, 5))
-                : 0,
+            recentRawRounds,
             currentRound,
+            recentRawRoundNumbers: recentRawRounds > 0
+                ? getSendableRawRoundNumbers(chat, settings, currentRound, recentRawRounds)
+                : null,
         },
     );
     lastMemoryPromptTokens = estimatePromptTokens(promptText);
@@ -661,65 +750,79 @@ function clonePlainData(value) {
     return value == null ? value : JSON.parse(JSON.stringify(value));
 }
 
+function clearEntryEmbedding(item) {
+    if (!item || typeof item !== "object") return;
+    item.embedding = null;
+    item.embeddingModel = null;
+    item.embeddingDimension = null;
+}
+
+function buildL0GroupSummaryInput(chat, turns, settings, ctx) {
+    if (!Array.isArray(turns) || turns.length === 0) return null;
+    const validTurns = turns.filter(turn =>
+        turn
+        && Number.isInteger(turn.idx)
+        && turn.msg
+        && isAiReplyMessage(turn.msg, settings.includeNativeHidden)
+    );
+    if (validTurns.length === 0) return null;
+
+    const userName = ctx.name1 || "User";
+    const charName = validTurns.at(-1)?.msg?.name || ctx.name2 || "Character";
+    const blocks = [];
+    for (const turn of validTurns) {
+        const roundWindow = turn.window
+            || getRoundMessageWindow(chat, turn.idx, settings.includeNativeHidden);
+        if (!roundWindow) continue;
+        const lines = [];
+        if (roundWindow.openingMessageIndex >= 0) {
+            const openingMsg = chat[roundWindow.openingMessageIndex];
+            const openingText = cleanMessageText(openingMsg.mes, settings.targetContentTags, settings.customStripTags);
+            if (openingText) lines.push(`【开场白·${openingMsg.name || charName}】：\n${openingText}`);
+        }
+        if (roundWindow.userMessageIndex >= 0) {
+            const userText = cleanMessageText(chat[roundWindow.userMessageIndex].mes, settings.targetContentTags, settings.customStripTags);
+            if (userText) lines.push(`【${userName}】：\n${userText}`);
+        }
+        const aiText = cleanMessageText(chat[turn.idx].mes, settings.targetContentTags, settings.customStripTags);
+        const aiName = chat[turn.idx].name || charName;
+        if (aiText) lines.push(`【${aiName}】：\n${aiText}`);
+        if (lines.length > 0) {
+            blocks.push(`【第 ${turn.round} 轮】\n${lines.join("\n\n")}`);
+        }
+    }
+    if (blocks.length === 0) return null;
+    const first = validTurns[0];
+    const last = validTurns.at(-1);
+    const firstWindow = first.window || getRoundMessageWindow(chat, first.idx, settings.includeNativeHidden);
+    return {
+        roundNumber: last.round,
+        startRound: first.round,
+        endRound: last.round,
+        startMessageId: firstWindow?.startMessageId ?? first.idx,
+        endMessageId: last.idx,
+        userName,
+        charName,
+        dialogueText: blocks.join("\n\n"),
+    };
+}
+
 function buildTurnSummaryInput(chat, msgIdx, settings, ctx, precomputedTurn = null) {
     const targetMsg = chat[msgIdx];
     if (!isAiReplyMessage(targetMsg, settings.includeNativeHidden)) return null;
     const roundWindow = precomputedTurn?.window
         || getRoundMessageWindow(chat, msgIdx, settings.includeNativeHidden);
     if (!roundWindow) return null;
-    const userName = ctx.name1 || "User";
-    const charName = targetMsg.name || ctx.name2 || "Character";
-    const lines = [];
-    if (roundWindow.openingMessageIndex >= 0) {
-        const openingMsg = chat[roundWindow.openingMessageIndex];
-        const openingText = cleanMessageText(openingMsg.mes, settings.targetContentTags, settings.customStripTags);
-        if (openingText) lines.push(`【开场白·${openingMsg.name || charName}】：\n${openingText}`);
-    }
-    if (roundWindow.userMessageIndex >= 0) {
-        const userText = cleanMessageText(chat[roundWindow.userMessageIndex].mes, settings.targetContentTags, settings.customStripTags);
-        if (userText) lines.push(`【${userName}】：\n${userText}`);
-    }
-    const aiText = cleanMessageText(targetMsg.mes, settings.targetContentTags, settings.customStripTags);
-    if (aiText) lines.push(`【${charName}】：\n${aiText}`);
-    if (lines.length === 0) return null;
-    return {
-        roundNumber: roundWindow.roundNumber,
-        startMessageId: roundWindow.startMessageId,
-        endMessageId: roundWindow.endMessageId,
-        userName,
-        charName,
-        dialogueText: lines.join("\n\n"),
-    };
+    return buildL0GroupSummaryInput(chat, [{
+        idx: msgIdx,
+        round: roundWindow.roundNumber,
+        msg: targetMsg,
+        window: roundWindow,
+    }], settings, ctx);
 }
 
 function replaceL0Entry(memoryData, target, replacement) {
-    const targetId = target?.id || "";
-    const targetStart = numOr(target?.startMessageId, -1);
-    const targetEnd = numOr(target?.endMessageId, -1);
-    const isTarget = item => item && item.level === 0 && (
-        (targetId && item.id === targetId)
-        || (targetStart >= 0 && targetEnd >= 0
-            && numOr(item.startMessageId, -2) === targetStart
-            && numOr(item.endMessageId, -3) === targetEnd)
-    );
-
-    memoryData.archivePool = (memoryData.archivePool || []).filter(item => !isTarget(item));
-    memoryData.archivePool.push(replacement);
-    memoryData.archivePool.sort((a, b) =>
-        numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
-        - numOr(b.startMessageId, parseRoundRange(b.roundRange).start)
-    );
-
-    const activeL0 = Array.isArray(memoryData.levels?.[0]) ? memoryData.levels[0] : [];
-    const targetWasActive = activeL0.some(isTarget);
-    memoryData.levels[0] = activeL0.filter(item => !isTarget(item));
-    if (targetWasActive) {
-        memoryData.levels[0].push(replacement);
-        memoryData.levels[0].sort((a, b) =>
-            numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
-            - numOr(b.startMessageId, parseRoundRange(b.roundRange).start)
-        );
-    }
+    replaceL0EntryInMemory(memoryData, target, replacement);
 }
 
 function refreshLedgerFromLatestL0(memoryData) {
@@ -746,16 +849,23 @@ async function resummarizeRoundInPlace(
     epoch,
     signal = null,
     precomputedTurn = null,
+    groupTurns = null,
 ) {
-    const turn = buildTurnSummaryInput(chat, msgIdx, settings, ctx, precomputedTurn);
+    const turn = Array.isArray(groupTurns) && groupTurns.length > 1
+        ? buildL0GroupSummaryInput(chat, groupTurns, settings, ctx)
+        : buildTurnSummaryInput(chat, msgIdx, settings, ctx, precomputedTurn);
     if (!turn) return true;
+    const groupStartMessageId = turn.startMessageId;
+    const groupEndMessageId = turn.endMessageId;
+    const groupStartRound = turn.startRound ?? turn.roundNumber;
+    const groupEndRound = turn.endRound ?? turn.roundNumber;
     const target = (memoryData.archivePool || []).find(item =>
         item?.level === 0
-        && numOr(item.endMessageId, parseRoundRange(item.roundRange).end) === msgIdx
+        && numOr(item.endMessageId, parseRoundRange(item.roundRange).end) === groupEndMessageId
     );
     const before = (memoryData.archivePool || [])
         .filter(item => item?.level === 0
-            && numOr(item.endMessageId, parseRoundRange(item.roundRange).end) < turn.startMessageId)
+            && numOr(item.endMessageId, parseRoundRange(item.roundRange).end) < groupStartMessageId)
         .sort((a, b) =>
             numOr(a.endMessageId, parseRoundRange(a.roundRange).end)
             - numOr(b.endMessageId, parseRoundRange(b.roundRange).end)
@@ -769,16 +879,22 @@ async function resummarizeRoundInPlace(
         (previousEntry ? resolveStateLedgerAfterEntry(memoryData, previousEntry) : null)
         || createEmptyMemoryData().stateLedger
     );
-    working.lastProcessedMessageId = turn.startMessageId - 1;
-    working.lastProcessedRound = Math.max(0, turn.roundNumber - 1);
+    working.lastProcessedMessageId = groupStartMessageId - 1;
+    working.lastProcessedRound = Math.max(0, groupStartRound - 1);
 
     const replacement = await summarizeSingleTurn(settings, working, {
         ...turn,
+        memoryAlreadyNormalized: true,
         shouldCommit: () =>
             isCurrentChat(chatKey)
             && epoch === summaryEpoch
             && !signal?.aborted
-            && chat[msgIdx] && memoryData === getChatMemory(),
+            && memoryData === getChatMemory()
+            && (Array.isArray(groupTurns) && groupTurns.length > 0
+                ? groupTurns.every(item => chat[item.idx] === item.msg)
+                : (precomputedTurn?.msg
+                    ? chat[msgIdx] === precomputedTurn.msg
+                    : Boolean(chat[msgIdx]))),
         signal,
     });
     if (!replacement) return false;
@@ -787,7 +903,46 @@ async function resummarizeRoundInPlace(
     return true;
 }
 
-function runStoryResummarize(turns, { button = null, requireConfirm = true, title = "重新总结" } = {}) {
+function buildResummarizePlan(turns, groups, chat, settings, memoryData) {
+    const requestedGroups = Array.isArray(groups) && groups.length > 0
+        ? groups
+        : turns.map(turn => [turn]);
+    const requestedRanges = requestedGroups
+        .map(group => {
+            const rounds = (Array.isArray(group) ? group : [])
+                .map(turn => Number(turn?.round))
+                .filter(Number.isFinite);
+            return rounds.length > 0
+                ? [Math.min(...rounds), Math.max(...rounds)]
+                : null;
+        })
+        .filter(Boolean);
+    const existingL0 = [
+        ...(memoryData.archivePool || []),
+        ...(memoryData.levels?.[0] || []),
+    ].filter(item => item?.level === 0);
+    const expandedRanges = expandResummarizeRanges(requestedRanges, existingL0);
+    const allTurns = getCachedRoundIndex(chat, settings.includeNativeHidden).aiTurns
+        .map(({ idx, round, msg, window }) => ({ idx, round, msg, window }));
+    const resummarizeGroups = expandedRanges
+        .map(range => allTurns.filter(turn => turn.round >= range.start && turn.round <= range.end))
+        .filter(group => group.length > 0);
+    if (resummarizeGroups.length === 0) return null;
+    const resummarizeTurns = resummarizeGroups.flat();
+    return {
+        resummarizeGroups,
+        resummarizeTurns,
+        fromRound: resummarizeTurns[0].round,
+        toRound: resummarizeTurns.at(-1).round,
+    };
+}
+
+function runStoryResummarize(turns, {
+    button = null,
+    requireConfirm = true,
+    title = "重新总结",
+    groups = null,
+} = {}) {
     if (!Array.isArray(turns) || turns.length === 0) {
         updateStatusBar("⚠️ 没有可重新总结的剧情轮次", true);
         return null;
@@ -801,16 +956,21 @@ function runStoryResummarize(turns, { button = null, requireConfirm = true, titl
         updateStatusBar("⏳ 当前存档正在总结，请稍后再试", true);
         return null;
     }
-    const fromRound = turns[0].round;
-    const toRound = turns.at(-1).round;
+    const ctx = getSTContext();
+    const chat = ctx.chat || [];
+    const settings = getSettings();
+    const memoryData = getChatMemory();
+    const plan = buildResummarizePlan(turns, groups, chat, settings, memoryData);
+    if (!plan) {
+        updateStatusBar("⚠️ 没有可重新总结的剧情轮次", true);
+        return null;
+    }
+    const { resummarizeGroups, resummarizeTurns, fromRound, toRound } = plan;
     if (requireConfirm && !confirm(
-        `将重新总结第 ${fromRound}-${toRound} 轮，共 ${turns.length} 轮。\n` +
+        `将重新总结第 ${fromRound}-${toRound} 轮，共 ${resummarizeTurns.length} 轮，生成 ${resummarizeGroups.length} 条 L0。\n` +
         "会调用独立总结 API，并重建受影响的高层摘要。确定继续吗？"
     )) return null;
 
-    const ctx = getSTContext();
-    const chat = ctx.chat || [];
-    const memoryData = getChatMemory();
     const epoch = summaryEpoch;
     storyViewRange = null;
     storyPage = 0;
@@ -827,43 +987,53 @@ function runStoryResummarize(turns, { button = null, requireConfirm = true, titl
     const job = enqueueBackgroundSummary(async () => {
         task = await acquireSummaryTask({
             label: title,
-            total: turns.length,
+            total: resummarizeGroups.length,
             canCancel: true,
         }, () => isCurrentChat(chatKey) && epoch === summaryEpoch);
         if (!task) return;
         signal = task.controller.signal;
         updateFloatingWidgetUI();
         try {
-            for (let i = 0; i < turns.length; i++) {
+            for (let i = 0; i < resummarizeGroups.length; i++) {
                 if (isSummaryTaskCancelled(task)) {
                     cancelled = true;
                     break;
                 }
                 if (!isCurrentChat(chatKey) || epoch !== summaryEpoch) return;
-                const turn = turns[i];
-                if (chat[turn.idx] !== turn.msg) continue;
+                const group = resummarizeGroups[i];
+                if (!Array.isArray(group) || group.length === 0) continue;
+                if (group.some(turn => chat[turn.idx] !== turn.msg)) {
+                    updateStatusBar("⚠️ 聊天楼层已变化，已停止重新总结", true);
+                    return;
+                }
+                const firstRound = group[0].round;
+                const lastRound = group.at(-1).round;
+                const roundRange = firstRound === lastRound
+                    ? String(lastRound)
+                    : `${firstRound}-${lastRound}`;
                 updateSummaryTask(task, {
                     current: i + 1,
-                    roundNumber: turn.round,
-                    detail: `正在重新总结第 ${turn.round} 轮`,
+                    roundNumber: lastRound,
+                    detail: `正在重新总结第 ${roundRange} 轮`,
                 });
                 try {
                     const ok = await resummarizeRoundInPlace(
                         getSettings(),
                         ctx,
                         chat,
-                        turn.idx,
+                        group.at(-1).idx,
                         memoryData,
                         chatKey,
                         epoch,
                         signal,
-                        turn,
+                        group.length === 1 ? group[0] : null,
+                        group.length > 1 ? group : null,
                     );
                     if (!ok) {
                         if (isSummaryTaskCancelled(task)) cancelled = true;
                         break;
                     }
-                    completedRounds++;
+                    completedRounds += group.length;
                 } catch (error) {
                     if (signal.aborted || error?.name === "AbortError") {
                         cancelled = true;
@@ -918,8 +1088,8 @@ function runStoryResummarize(turns, { button = null, requireConfirm = true, titl
                 renderStoryTimeline();
                 updateStatusBar(
                     cancelled
-                        ? `⏸️ 已停止重新总结：完成 ${completedRounds}/${turns.length} 轮；未完成轮次保留原摘要`
-                        : `⚠️ 重新总结未完成：完成 ${completedRounds}/${turns.length} 轮；已移除受影响的高层摘要`,
+                        ? `⏸️ 已停止重新总结：完成 ${completedRounds}/${resummarizeTurns.length} 轮；未完成轮次保留原摘要`
+                        : `⚠️ 重新总结未完成：完成 ${completedRounds}/${resummarizeTurns.length} 轮；已移除受影响的高层摘要`,
                     !cancelled,
                 );
             }
@@ -953,7 +1123,7 @@ globalThis.tiandaoMemoryInterceptor = async function (chat, _contextSize, _abort
         const query = buildRecentContextQuery(fullChat, settings.targetContentTags, settings.customStripTags);
         await refreshPromptInjection(query);
     } catch (e) {
-        console.warn("[溯微] Interceptor refresh error:", e);
+        console.warn("[溯微] Interceptor refresh error:", e?.name || "refresh failed");
     }
 };
 
@@ -1041,42 +1211,44 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
     if (activeSummaryChats.has(chatKey)) return false;
 
     const msgIdx = typeof targetMessageId === "number" ? targetMessageId : chat.length - 1;
-    const targetMsg = chat[msgIdx];
-    if (!isAiReplyMessage(targetMsg, settings.includeNativeHidden)) return false;
-    const roundWindow = getRoundMessageWindow(chat, msgIdx, settings.includeNativeHidden);
-    if (!roundWindow) return false;
-
+    const requestedTurns = Array.isArray(options.groupTurns) && options.groupTurns.length > 0
+        ? options.groupTurns
+        : [{ idx: msgIdx }];
+    const groupTurns = [];
+    for (const requested of requestedTurns) {
+        const idx = Number(requested?.idx);
+        const msg = chat[idx];
+        if (!Number.isInteger(idx)
+            || !msg
+            || (requested?.msg && requested.msg !== msg)
+            || !isAiReplyMessage(msg, settings.includeNativeHidden)) {
+            return false;
+        }
+        const roundWindow = getRoundMessageWindow(chat, idx, settings.includeNativeHidden);
+        if (!roundWindow) return false;
+        groupTurns.push({
+            idx,
+            msg,
+            round: roundWindow.roundNumber,
+            window: roundWindow,
+        });
+    }
+    groupTurns.sort((a, b) => a.idx - b.idx);
+    const lastTurn = groupTurns.at(-1);
+    const firstTurn = groupTurns[0];
     const memoryData = options.memoryData || getChatMemory();
-    const userName = ctx.name1 || "User";
-    const charName = targetMsg.name || ctx.name2 || "Character";
-    const roundNumber = options.roundNumber || roundWindow.roundNumber;
-
-    const lines = [];
-    if (roundWindow.openingMessageIndex >= 0) {
-        const openingMsg = chat[roundWindow.openingMessageIndex];
-        const openingText = cleanMessageText(openingMsg.mes, settings.targetContentTags, settings.customStripTags);
-        if (openingText) {
-            lines.push(`【开场白·${openingMsg.name || charName}】：\n${openingText}`);
-        }
-    }
-    if (roundWindow.userMessageIndex >= 0) {
-        const userMsg = chat[roundWindow.userMessageIndex];
-        const userCleaned = cleanMessageText(userMsg.mes, settings.targetContentTags, settings.customStripTags);
-        if (userCleaned) {
-            lines.push(`【${userName}】：\n${userCleaned}`);
-        }
-    }
-    const aiCleaned = cleanMessageText(targetMsg.mes, settings.targetContentTags, settings.customStripTags);
-    if (aiCleaned) {
-        lines.push(`【${charName}】：\n${aiCleaned}`);
-    }
-    if (lines.length === 0) {
+    const summaryInput = buildL0GroupSummaryInput(chat, groupTurns, settings, ctx);
+    if (!summaryInput) {
         // 空回复无需调用 API，但必须推进游标，避免后台队列永远卡在同一楼。
-        memoryData.lastProcessedMessageId = msgIdx;
-        memoryData.lastProcessedRound = roundNumber;
+        memoryData.lastProcessedMessageId = lastTurn.idx;
+        memoryData.lastProcessedRound = lastTurn.round;
         if (isCurrentChat(chatKey)) await saveChatMemory();
         return true;
     }
+    const startRound = firstTurn.round;
+    const roundNumber = lastTurn.round;
+    const roundRange = startRound === roundNumber ? String(roundNumber) : `${startRound}-${roundNumber}`;
+    const aiCleaned = cleanMessageText(lastTurn.msg.mes, settings.targetContentTags, settings.customStripTags);
 
     activeSummaryChats.add(chatKey);
     const ownsTask = !options.summaryTask;
@@ -1090,35 +1262,43 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
         return false;
     }
     const signal = task?.controller?.signal || null;
-    updateSummaryTask(task, {
-        current: 1,
-        total: 1,
-        roundNumber,
-        detail: `正在总结第 ${roundNumber} 轮`,
-    });
+    updateSummaryTask(task, options.summaryTask
+        ? {
+            roundNumber,
+            detail: `正在总结第 ${roundRange} 轮`,
+        }
+        : {
+            current: 1,
+            total: 1,
+            roundNumber,
+            detail: `正在总结第 ${roundRange} 轮`,
+        });
     updateFloatingWidgetUI();
     try {
-        updateStatusBar(`⏳ 正在总结第 ${roundNumber} 轮对话并更新状态账本...`);
+        updateStatusBar(`⏳ 正在总结第 ${roundRange} 轮对话并更新状态账本...`);
         const result = await summarizeSingleTurn(settings, memoryData, {
+            memoryAlreadyNormalized: true,
             roundNumber,
-            startMessageId: roundWindow.startMessageId,
+            startRound,
+            endRound: roundNumber,
+            startMessageId: summaryInput.startMessageId,
             endMessageId: msgIdx,
-            userName,
-            charName,
-            dialogueText: lines.join("\n\n"),
+            userName: summaryInput.userName,
+            charName: summaryInput.charName,
+            dialogueText: summaryInput.dialogueText,
             onRetry: (attempt, total, error) => {
                 if (!isCurrentChat(chatKey)) return;
                 updateSummaryTask(task, {
-                    detail: `第 ${roundNumber} 轮解析失败，正在自动重试 (${attempt - 1}/${total - 1})`,
+                    detail: `第 ${roundRange} 轮解析失败，正在自动重试 (${attempt - 1}/${total - 1})`,
                 });
-                updateStatusBar(`⏳ 第 ${roundNumber} 轮解析失败，正在自动重试 (${attempt - 1}/${total - 1})：${String(error?.message || "等待重新解析").slice(0, 80)}`, true);
+                updateStatusBar(`⏳ 第 ${roundRange} 轮解析失败，正在自动重试 (${attempt - 1}/${total - 1})：${String(error?.message || "等待重新解析").slice(0, 80)}`, true);
             },
             shouldCommit: () => isCurrentChat(chatKey)
                 && epoch === summaryEpoch
                 && (isManual || getSettings().enabled)
                 && !signal?.aborted
                 && getChatMemory() === memoryData
-                && chat[msgIdx] === targetMsg,
+                && groupTurns.every(turn => chat[turn.idx] === turn.msg),
             signal,
         });
         if (!result) {
@@ -1129,7 +1309,10 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
             }
             return false;
         }
-        pruneStaleCharacters(memoryData, roundNumber, { keepNames: [ctx.name1 || ""] });
+        pruneStaleCharacters(memoryData, roundNumber, {
+            keepNames: [ctx.name1 || ""],
+            skipNormalize: true,
+        });
         memoryData.lastSummaryError = null;
         memoryData.lastProcessedMessageId = msgIdx;
         memoryData.lastProcessedRound = roundNumber;
@@ -1137,20 +1320,24 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
         await saveChatMemory();
         if (isCurrentChat(chatKey) && epoch === summaryEpoch) {
             await refreshPromptInjection(aiCleaned).catch(error => {
-                console.warn("[溯微] 归档已保存，但刷新提示词注入失败:", error);
+                console.warn("[溯微] 归档已保存，但刷新提示词注入失败:", error?.name || "refresh failed");
             });
             syncHiddenMessagesState();
         }
         if (isCurrentChat(chatKey)) {
-            updateStatusBar(`✅ 第 ${roundNumber} 轮已归档`);
+            updateStatusBar(`✅ 第 ${roundRange} 轮已归档为 L0`);
         }
         return true;
     } catch (err) {
         if (signal?.aborted || err?.name === "AbortError") {
-            if (isCurrentChat(chatKey)) updateStatusBar("⏸️ 总结已停止");
+            if (isCurrentChat(chatKey)) {
+                updateStatusBar(task?.cancelDetail
+                    ? `⏸️ ${task.cancelDetail}，旧总结已停止`
+                    : "⏸️ 总结已停止");
+            }
             return false;
         }
-        console.error("[溯微] Summarize turn error:", err?.message || err);
+        console.error("[溯微] Summarize turn error:", err?.code || err?.status || "unknown");
         if (isCurrentChat(chatKey)) {
             memoryData.lastSummaryError = {
                 message: String(err?.message || "总结失败").slice(0, 300),
@@ -1178,48 +1365,69 @@ function enqueuePendingAiTurns(chat, upToIndex, options = {}) {
     const chatKey = options.chatKey || getChatKey();
     const epoch = options.epoch ?? summaryEpoch;
     const memoryData = options.memoryData || getChatMemory();
+    const settings = getSettings();
+    const isManual = Boolean(options.isManual);
+    if (!isManual && settings.l0MergeMode === "manual") return null;
     const pending = collectPendingAiTurns(
         chat,
         memoryData.lastProcessedMessageId,
         upToIndex,
-        getSettings().includeNativeHidden,
+        settings.includeNativeHidden,
     );
     if (pending.length === 0) return null;
 
+    const l0Groups = options.singleGroup
+        ? [pending]
+        : groupAiTurnsForL0(
+            pending,
+            resolveL0RoundsPerSummary(settings),
+            !isManual,
+        );
+    if (l0Groups.length === 0) return null;
     const label = options.label || "补齐待归档轮次";
-    const isManual = Boolean(options.isManual);
     let task = null;
     let stopped = false;
     let processedAny = false;
     const job = enqueueBackgroundSummary(async () => {
         task = await acquireSummaryTask({
             label,
-            total: pending.length,
+            total: l0Groups.length,
             canCancel: true,
         }, () => isCurrentChat(chatKey) && epoch === summaryEpoch);
         if (!task) return;
         try {
-            for (let i = 0; i < pending.length; i++) {
+            for (let i = 0; i < l0Groups.length; i++) {
                 if (isSummaryTaskCancelled(task)) {
                     stopped = true;
                     return;
                 }
                 if (!isCurrentChat(chatKey) || epoch !== summaryEpoch) return;
-                const pendingTurn = pending[i];
-                if (chat[pendingTurn.idx] !== pendingTurn.msg) continue;
-                if (memoryData.lastProcessedMessageId >= pendingTurn.idx) continue;
+                const group = l0Groups[i];
+                if (group.some(pendingTurn => chat[pendingTurn.idx] !== pendingTurn.msg)) {
+                    updateStatusBar("⚠️ 聊天楼层已变化，已停止待归档总结", true);
+                    return;
+                }
+                if (group.some(pendingTurn =>
+                    memoryData.lastProcessedMessageId >= pendingTurn.idx
+                )) continue;
+                const firstRound = group[0].round;
+                const lastRound = group.at(-1).round;
+                const roundRange = firstRound === lastRound
+                    ? String(lastRound)
+                    : `${firstRound}-${lastRound}`;
                 updateSummaryTask(task, {
                     current: i + 1,
-                    roundNumber: pendingTurn.round,
-                    detail: `正在总结第 ${pendingTurn.round} 轮`,
+                    roundNumber: lastRound,
+                    detail: `正在总结第 ${roundRange} 轮`,
                 });
-                const ok = await processSingleAiTurn(pendingTurn.idx, isManual, {
+                const ok = await processSingleAiTurn(group.at(-1).idx, isManual, {
                     ctx,
                     chat,
                     chatKey,
                     memoryData,
                     epoch,
                     summaryTask: task,
+                    groupTurns: group,
                 });
                 if (!ok) return;
                 if (isSummaryTaskCancelled(task)) {
@@ -1228,7 +1436,10 @@ function enqueuePendingAiTurns(chat, upToIndex, options = {}) {
                 }
                 processedAny = true;
             }
-            if (processedAny && isCurrentChat(chatKey) && typeof options.onDone === "function") {
+            if (processedAny
+                && isCurrentChat(chatKey)
+                && epoch === summaryEpoch
+                && typeof options.onDone === "function") {
                 await options.onDone();
             }
         } finally {
@@ -1249,6 +1460,7 @@ function enqueuePendingAiTurns(chat, upToIndex, options = {}) {
 function schedulePendingTurnsBeforeGeneration(chat, generationType) {
     const settings = getSettings();
     if (!settings.enabled || !settings.autoSummarizePerTurn) return false;
+    if (settings.l0MergeMode === "manual") return false;
     if (!shouldSettleBeforeGeneration(generationType)) return false;
     if (!isActiveChatContext(getSTContext())) return false;
 
@@ -1280,6 +1492,7 @@ function scheduleAfterReplySwipeRepair(chatKey) {
     const settings = getSettings();
     if (!settings.enabled
         || !settings.autoSummarizePerTurn
+        || settings.l0MergeMode === "manual"
         || settings.summarizeTiming !== "after_reply") {
         return;
     }
@@ -1319,9 +1532,11 @@ function getPendingBacklog(chat, memoryData) {
     if (!Array.isArray(chat) || chat.length === 0) return [];
     let upToIndex = chat.length - 1;
     const settings = getSettings();
-    if (!settings.autoSummarizePerTurn && !memoryData.lastSummaryError) return [];
+    const manualL0 = settings.l0MergeMode === "manual";
+    if (!manualL0 && !settings.autoSummarizePerTurn && !memoryData.lastSummaryError) return [];
     const lastMsg = chat[chat.length - 1];
     if (settings.summarizeTiming === "on_next_send"
+        && !manualL0
         && lastMsg
         && !lastMsg.is_user
         && !memoryData.lastSummaryError) {
@@ -1355,8 +1570,15 @@ function renderStoryRecoveryState(memoryData = getChatMemory(), pendingOverride 
     const errorText = error
         ? `第 ${error.roundNumber || "?"} 轮总结失败：${String(error.message || "未知错误").slice(0, 120)}`
         : "有历史轮次尚未归档。";
+    const settings = getSettings();
+    const l0Chunk = resolveL0RoundsPerSummary(settings);
+    const pendingText = settings.l0MergeMode === "manual"
+        ? `已有 ${pending.length} 轮等待手动合并 L0。`
+        : (pending.length < l0Chunk
+            ? `已积累 ${pending.length}/${l0Chunk} 轮，满 ${l0Chunk} 轮自动归档；也可现在手动合并。`
+            : `有 ${pending.length} 轮等待归档。`);
     messageEl.textContent = pending.length > 0
-        ? `${errorText} 待补 ${pending.length} 轮。`
+        ? `${errorText} ${pendingText}`
         : errorText;
     box.style.display = "flex";
     if (recoverBtn) {
@@ -1450,6 +1672,62 @@ function resummarizeStoryRange() {
     const epoch = summaryEpoch;
     const btn = document.getElementById("tiandao_story_range_btn");
 
+    if (mode === "merge_l0") {
+        const pending = collectPendingAiTurns(
+            chat,
+            memoryData.lastProcessedMessageId,
+            Infinity,
+            settings.includeNativeHidden,
+        );
+        const firstPending = pending[0];
+        if (!firstPending) {
+            updateStatusBar("✅ 当前没有尚未合并的新轮次", true);
+            return;
+        }
+        if (fromRound !== firstPending.round) {
+            updateStatusBar(
+                `⚠️ 手动合并必须从最新未归档轮次开始；当前应从第 ${firstPending.round} 轮起`,
+                true,
+            );
+            return;
+        }
+        const selected = pending.filter(turn => turn.round >= fromRound && turn.round <= toRound);
+        const expectedCount = toRound - fromRound + 1;
+        if (selected.length !== expectedCount
+            || selected.at(-1)?.round !== toRound) {
+            updateStatusBar(
+                `⚠️ 第 ${fromRound}-${toRound} 轮不是完整的连续待归档范围，请检查范围或等待 AI 回复完成`,
+                true,
+            );
+            return;
+        }
+        if (!confirm(`将第 ${fromRound}-${toRound} 轮合并为一条 L0？\n下一段自动计数会从第 ${toRound + 1} 轮重新开始。`)) {
+            return;
+        }
+        const upToIndex = selected.at(-1).idx;
+        const job = enqueuePendingAiTurns(chat, upToIndex, {
+            ctx,
+            chatKey,
+            epoch,
+            memoryData,
+            isManual: true,
+            singleGroup: true,
+            label: `手动合并 L0 · 第 ${fromRound}-${toRound} 轮`,
+            onDone: async () => {
+                memoryData.lastSummaryError = null;
+                await saveChatMemory().catch(() => {});
+                updateFloatingWidgetUI();
+                renderStoryTimeline();
+                updateStatusBar(`✅ 已将第 ${fromRound}-${toRound} 轮合并为一条 L0`);
+            },
+        });
+        if (btn && job) {
+            btn.disabled = true;
+            job.finally(() => { btn.disabled = false; });
+        }
+        return;
+    }
+
     if (mode === "fill") {
         storyViewRange = null;
         renderStoryTimeline();
@@ -1504,7 +1782,15 @@ function resummarizeStoryRange() {
         updateStatusBar(`⚠️ 第 ${fromRound}-${toRound} 轮没有可重新总结的 AI 回复`, true);
         return;
     }
-    runStoryResummarize(rebuildTurns, { button: btn, title: "重新总结范围" });
+    runStoryResummarize(rebuildTurns, {
+        button: btn,
+        title: "重新总结范围",
+        groups: groupAiTurnsForL0(
+            rebuildTurns,
+            resolveL0RoundsPerSummary(settings),
+            false,
+        ),
+    });
 }
 
 function rebuildAllStorySummaries() {
@@ -1513,7 +1799,15 @@ function rebuildAllStorySummaries() {
     const aiTurns = buildRoundMessageIndex(chat, settings.includeNativeHidden).aiTurns
         .map(({ idx, round, msg, window }) => ({ idx, round, msg, window }));
     const btn = document.getElementById("tiandao_story_rebuild_all_btn");
-    runStoryResummarize(aiTurns, { button: btn, title: "重新总结全部" });
+    runStoryResummarize(aiTurns, {
+        button: btn,
+        title: "重新总结全部",
+        groups: groupAiTurnsForL0(
+            aiTurns,
+            resolveL0RoundsPerSummary(settings),
+            false,
+        ),
+    });
 }
 
 function resummarizeStoryEntry(lvl, idx, button = null) {
@@ -1536,6 +1830,7 @@ function resummarizeStoryEntry(lvl, idx, button = null) {
         button,
         requireConfirm: turns.length > 1,
         title: `重新总结第 ${item.roundRange} 轮`,
+        groups: Number(lvl) === 0 ? [turns] : null,
     });
 }
 
@@ -1696,8 +1991,8 @@ function openModelMenu() {
 
 function setFetchedModelNames(names) {
     fetchedModelNames = [...new Set((Array.isArray(names) ? names : [])
-        .map(name => String(name || "").trim())
-        .filter(Boolean))].sort((a, b) => a.localeCompare(b));
+        .map(name => String(name || "").trim().slice(0, 200))
+        .filter(Boolean))].sort((a, b) => a.localeCompare(b)).slice(0, MAX_FETCHED_MODELS);
     const datalist = document.getElementById("tiandao_model_datalist");
     if (datalist) {
         const frag = document.createDocumentFragment();
@@ -1737,8 +2032,16 @@ function getVisibleEmbeddingModelNames() {
         : fetchedEmbeddingModelNames.slice();
 }
 
+function getSelectableEmbeddingModelNames() {
+    const filtered = getVisibleEmbeddingModelNames();
+    // 某些渠道的向量模型命名不含常见关键词。筛选无命中时仍展示渠道结果，
+    // 避免“拉取成功但没有下拉框可选”的假成功。
+    return filtered.length > 0 ? filtered : fetchedEmbeddingModelNames.slice();
+}
+
 function refreshEmbeddingModelOptions() {
-    const visibleNames = getVisibleEmbeddingModelNames();
+    const visibleNames = getSelectableEmbeddingModelNames();
+    const current = String(getSettings().embeddingModel || "").trim();
     const datalist = document.getElementById("tiandao_emb_model_datalist");
     if (datalist) {
         const frag = document.createDocumentFragment();
@@ -1748,6 +2051,24 @@ function refreshEmbeddingModelOptions() {
             frag.appendChild(option);
         }
         datalist.replaceChildren(frag);
+    }
+    const select = document.getElementById("tiandao_emb_model_select");
+    if (select) {
+        const frag = document.createDocumentFragment();
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = "选择已拉取的向量模型";
+        frag.appendChild(placeholder);
+        for (const name of visibleNames) {
+            const option = document.createElement("option");
+            option.value = name;
+            option.textContent = name;
+            frag.appendChild(option);
+        }
+        select.replaceChildren(frag);
+        select.hidden = visibleNames.length === 0;
+        select.disabled = visibleNames.length === 0;
+        select.value = visibleNames.includes(current) ? current : "";
     }
     const toggle = document.getElementById("tiandao_emb_model_toggle_btn");
     if (toggle) toggle.disabled = visibleNames.length === 0;
@@ -1770,7 +2091,7 @@ function closeEmbeddingModelMenu() {
 function openEmbeddingModelMenu() {
     const input = document.getElementById("tiandao_emb_model");
     const menu = ensureEmbeddingModelMenu();
-    const names = getVisibleEmbeddingModelNames();
+    const names = getSelectableEmbeddingModelNames();
     if (!input || names.length === 0) {
         closeEmbeddingModelMenu();
         return;
@@ -1808,8 +2129,8 @@ function openEmbeddingModelMenu() {
 
 function setFetchedEmbeddingModelNames(names) {
     fetchedEmbeddingModelNames = [...new Set((Array.isArray(names) ? names : [])
-        .map(name => String(name || "").trim())
-        .filter(Boolean))].sort((a, b) => a.localeCompare(b));
+        .map(name => String(name || "").trim().slice(0, 200))
+        .filter(Boolean))].sort((a, b) => a.localeCompare(b)).slice(0, MAX_FETCHED_MODELS);
     refreshEmbeddingModelOptions();
 }
 
@@ -1888,6 +2209,7 @@ function initFloatingWidget() {
                         <input id="tiandao_story_range_to" type="number" min="1" class="tiandao-input tiandao-input-sm" placeholder="结束" aria-label="结束轮次" />
                         <select id="tiandao_story_range_mode" class="tiandao-select tiandao-story-range-mode" aria-label="总结范围操作">
                             <option value="fill">补缺失+前置</option>
+                            <option value="merge_l0">手动合 L0</option>
                             <option value="view">仅筛选查看</option>
                             <option value="rebuild">重新总结</option>
                         </select>
@@ -1932,11 +2254,11 @@ function initFloatingWidget() {
                                     <input id="tiandao_enabled" type="checkbox" class="tiandao-checkbox" />
                                 </label>
                                 <label class="tiandao-toggle-row">
-                                    <span class="tiandao-toggle-label">自动调用独立 API 总结每轮</span>
+                                    <span class="tiandao-toggle-label">自动调用独立 API 归档 L0</span>
                                     <input id="tiandao_auto_summarize" type="checkbox" class="tiandao-checkbox" />
                                 </label>
                                 <div class="tiandao-form-row">
-                                    <span class="tiandao-field-label">解析/请求失败自动重试次数</span>
+                                    <span class="tiandao-field-label">模型输出解析/临时 HTTP 失败自动重试次数</span>
                                     <input id="tiandao_summary_retry" type="number" class="tiandao-input tiandao-input-sm" min="0" max="5" placeholder="2" />
                                 </div>
                                 <div class="tiandao-form-row">
@@ -1973,7 +2295,21 @@ function initFloatingWidget() {
                                 <i class="fa-solid fa-layer-group"></i> 记忆金字塔与提示词注入
                             </div>
                             <div class="tiandao-form-row">
-                                <span class="tiandao-field-label">向上合并步长 (满 K 轮合并为 1 条)</span>
+                                <span class="tiandao-field-label">L0 归档方式</span>
+                                <select id="tiandao_l0_merge_mode" class="tiandao-select">
+                                    <option value="auto">满指定轮数自动合并</option>
+                                    <option value="manual">仅手动合并 L0</option>
+                                </select>
+                            </div>
+                            <div class="tiandao-form-row">
+                                <span class="tiandao-field-label">每几轮合成一条 L0</span>
+                                <input id="tiandao_l0_chunk" type="number" class="tiandao-input tiandao-input-sm" min="1" max="50" placeholder="1" />
+                            </div>
+                            <div class="tiandao-field-caption" style="margin:0 0 8px;">
+                                自动模式满 N 轮才归档；手动模式不会自动生成 L0，仍可在剧情页选择连续轮次手动合并。手动合并后，下一段从合并结束后的第一轮重新计数。
+                            </div>
+                            <div class="tiandao-form-row">
+                                <span class="tiandao-field-label">L1+ 向上合并步长</span>
                                 <input id="tiandao_merge_chunk" type="number" class="tiandao-input tiandao-input-sm" min="2" max="15" placeholder="5" />
                             </div>
                             <div class="tiandao-form-row">
@@ -2024,10 +2360,11 @@ function initFloatingWidget() {
                                 <div class="tiandao-input-block">
                                     <label class="tiandao-field-caption">Embedding URL</label>
                                     <input id="tiandao_emb_url" type="text" class="tiandao-input" placeholder="https://api.siliconflow.cn/v1" />
+                                    <div class="tiandao-field-caption" style="margin:5px 0 0;">建议使用 HTTPS；HTTP 会明文传输 Embedding API Key。</div>
                                 </div>
                                 <div class="tiandao-input-block">
                                     <label class="tiandao-field-caption">Embedding API Key</label>
-                                    <input id="tiandao_emb_key" type="password" class="tiandao-input" placeholder="sk-..." />
+                                    <input id="tiandao_emb_key" type="password" class="tiandao-input" placeholder="sk-..." autocomplete="off" spellcheck="false" />
                                 </div>
                                 <div class="tiandao-input-block">
                                     <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:6px 8px; margin-bottom:4px;">
@@ -2044,6 +2381,9 @@ function initFloatingWidget() {
                                         </button>
                                         <datalist id="tiandao_emb_model_datalist"></datalist>
                                     </div>
+                                    <select id="tiandao_emb_model_select" class="tiandao-select tiandao-emb-model-select" aria-label="已拉取的向量模型" hidden disabled>
+                                        <option value="">选择已拉取的向量模型</option>
+                                    </select>
                                     <label class="tiandao-inline-check" title="关闭后会显示该渠道返回的全部模型">
                                         <input id="tiandao_emb_filter_models" type="checkbox" class="tiandao-checkbox" checked />
                                         <span>只显示向量 / Embedding 模型</span>
@@ -2072,7 +2412,7 @@ function initFloatingWidget() {
                                 </button>
                             </div>
                             <div class="tiandao-field-caption tiandao-api-profile-hint">
-                                保存地址、Key、模型与生成参数，切换后立即生效。
+                                保存地址、Key、模型、请求模式与生成参数，切换后立即生效。
                             </div>
                         </div>
 
@@ -2088,13 +2428,14 @@ function initFloatingWidget() {
                                     <i class="fa-solid fa-link tiandao-input-icon"></i>
                                     <input id="tiandao_api_url" type="text" class="tiandao-input with-icon" placeholder="https://api.deepseek.com/v1" />
                                 </div>
+                                <div class="tiandao-field-caption" style="margin:5px 0 0;">建议使用 HTTPS；HTTP 会明文传输 API Key 与剧情内容。</div>
                             </div>
 
                             <div class="tiandao-input-block">
                                 <label class="tiandao-field-caption">API Key</label>
                                 <div class="tiandao-input-wrapper">
                                     <i class="fa-solid fa-key tiandao-input-icon"></i>
-                                    <input id="tiandao_api_key" type="password" class="tiandao-input with-icon" placeholder="sk-..." />
+                                    <input id="tiandao_api_key" type="password" class="tiandao-input with-icon" placeholder="sk-..." autocomplete="off" spellcheck="false" />
                                 </div>
                             </div>
 
@@ -2119,6 +2460,23 @@ function initFloatingWidget() {
                                 <span class="tiandao-field-label">总结温度 (Temperature)</span>
                                 <input id="tiandao_temp" type="number" step="0.05" min="0" max="1.5" class="tiandao-input tiandao-input-sm" placeholder="0.2" />
                             </div>
+                            <div class="tiandao-form-row">
+                                <span class="tiandao-field-label">请求超时 (秒)</span>
+                                <input id="tiandao_request_timeout" type="number" step="10" min="0" max="86400" class="tiandao-input tiandao-input-sm" placeholder="600" aria-label="请求超时秒数" />
+                            </div>
+                            <div class="tiandao-field-caption" style="margin:5px 0 0;">
+                                留空按 600 秒；填 0 表示不限时，最多 86400 秒。长思维链模型建议 600~1800 秒；超时和流式格式错误不会自动重试，可随时在进度框点停止。
+                            </div>
+                            <div class="tiandao-form-row">
+                                <span class="tiandao-field-label">请求模式</span>
+                                <select id="tiandao_stream_mode" class="tiandao-select" aria-label="总结请求模式">
+                                    <option value="non_stream">非流式（兼容优先）</option>
+                                    <option value="stream">流式（长思维链）</option>
+                                </select>
+                            </div>
+                            <div class="tiandao-field-caption" style="margin:5px 0 0;">
+                                流式会边生成边读取，适合长思维链；若渠道忽略或拒绝 stream，会自动回退普通 JSON。空闲超时仍按上方设置。
+                            </div>
                             <label class="tiandao-toggle-row">
                                 <span class="tiandao-toggle-label">启用 JSON 模式（不支持时自动回退）</span>
                                 <input id="tiandao_use_json_mode" type="checkbox" class="tiandao-checkbox" />
@@ -2126,7 +2484,7 @@ function initFloatingWidget() {
 
                             <div class="tiandao-input-block" style="margin-top: 8px;">
                                 <label class="tiandao-field-caption">🎯 目标正文提取标签（白名单优先）</label>
-                                <input id="tiandao_target_tags" type="text" class="tiandao-input" placeholder="" />
+                                <input id="tiandao_target_tags" type="text" class="tiandao-input" placeholder="" maxlength="500" />
                                 <div class="tiandao-field-caption" style="margin:5px 0 0;">
                                     英文逗号、中文逗号或空格均可分隔，例如 content, story, reply。标签名不必带尖括号，大小写不敏感；多个目标标签会按填写顺序尝试。
                                 </div>
@@ -2134,9 +2492,9 @@ function initFloatingWidget() {
 
                             <div class="tiandao-input-block">
                                 <label class="tiandao-field-caption">备用排除标签（黑名单）</label>
-                                <input id="tiandao_strip_tags" type="text" class="tiandao-input" placeholder="" />
+                                <input id="tiandao_strip_tags" type="text" class="tiandao-input" placeholder="" maxlength="500" />
                                 <div class="tiandao-field-caption" style="margin:5px 0 0;">
-                                    同样使用英文逗号、中文逗号或空格分隔，例如 thinking, status_bar。匹配到的整个标签块会从正文中移除。两项都留空时，玩家输入与 AI 回复会完整进入单轮总结；楼层显示时间属于酒馆元数据，不等同于剧情内时间。
+                                    同样使用英文逗号、中文逗号或空格分隔，例如 thinking, status_bar。匹配到的整个标签块会从正文中移除。两项都留空时，玩家输入与 AI 回复会完整进入 L0 总结；楼层显示时间属于酒馆元数据，不等同于剧情内时间。
                                 </div>
                             </div>
 
@@ -2290,7 +2648,15 @@ function initFloatingWidget() {
         }
     });
     const embModelInput = document.getElementById("tiandao_emb_model");
+    const embModelSelect = document.getElementById("tiandao_emb_model_select");
     const embModelToggle = document.getElementById("tiandao_emb_model_toggle_btn");
+    embModelSelect?.addEventListener("change", () => {
+        const name = embModelSelect.value;
+        if (!name || !embModelInput) return;
+        embModelInput.value = name;
+        embModelInput.dispatchEvent(new Event("change", { bubbles: true }));
+        closeEmbeddingModelMenu();
+    });
     embModelToggle?.addEventListener("click", () => {
         const menu = document.getElementById("tiandao_emb_model_menu");
         if (!menu || menu.hidden) openEmbeddingModelMenu();
@@ -2298,18 +2664,18 @@ function initFloatingWidget() {
     });
     embModelInput?.addEventListener("click", () => {
         const menu = document.getElementById("tiandao_emb_model_menu");
-        if (getVisibleEmbeddingModelNames().length > 0 && (!menu || menu.hidden)) {
+        if (getSelectableEmbeddingModelNames().length > 0 && (!menu || menu.hidden)) {
             openEmbeddingModelMenu();
         }
     });
     embModelInput?.addEventListener("pointerdown", (event) => {
-        if (isMobileWidgetViewport() && getVisibleEmbeddingModelNames().length > 0) {
+        if (isMobileWidgetViewport() && getSelectableEmbeddingModelNames().length > 0) {
             event.preventDefault();
             openEmbeddingModelMenu();
         }
     });
     embModelInput?.addEventListener("keydown", (event) => {
-        if (event.key === "ArrowDown" && getVisibleEmbeddingModelNames().length > 0) {
+        if (event.key === "ArrowDown" && getSelectableEmbeddingModelNames().length > 0) {
             event.preventDefault();
             openEmbeddingModelMenu();
             document.querySelector("#tiandao_emb_model_menu .tiandao-model-option")?.focus();
@@ -2549,7 +2915,7 @@ function initFloatingWidget() {
                 const responseText = await readResponseText(res, 20_000);
                 const data = JSON.parse(responseText);
                 const raw = Array.isArray(data?.data) ? data.data : (Array.isArray(data?.models) ? data.models : (Array.isArray(data) ? data : []));
-                const names = raw
+                const names = raw.slice(0, MAX_FETCHED_MODELS)
                     .map(x => (typeof x === "string" ? x : (x?.id || x?.name || "")))
                     .filter(Boolean);
                 setFetchedModelNames(names);
@@ -2594,19 +2960,20 @@ function initFloatingWidget() {
                 const raw = Array.isArray(data?.data)
                     ? data.data
                     : (Array.isArray(data?.models) ? data.models : (Array.isArray(data) ? data : []));
-                const names = raw
+                const names = raw.slice(0, MAX_FETCHED_MODELS)
                     .map(x => (typeof x === "string" ? x : (x?.id || x?.name || "")))
                     .filter(Boolean);
                 setFetchedEmbeddingModelNames(names);
                 const visibleNames = getVisibleEmbeddingModelNames();
-                if (visibleNames.length > 0) {
-                    updateStatusBar(`✅ 已拉取 ${visibleNames.length} 个向量模型，点击输入框或右侧箭头即可选择`);
-                    openEmbeddingModelMenu();
-                } else if (fetchedEmbeddingModelNames.length > 0) {
+                const selectableNames = getSelectableEmbeddingModelNames();
+                if (selectableNames.length > 0) {
+                    const filterNote = visibleNames.length > 0
+                        ? ""
+                        : "；未识别出向量关键词，已临时显示渠道返回的全部模型";
                     updateStatusBar(
-                        `⚠️ 已拉取 ${fetchedEmbeddingModelNames.length} 个模型，但未识别出向量模型；可关闭筛选后手动选择`,
-                        true,
+                        `✅ 已拉取 ${selectableNames.length} 个模型，可在下拉框中选择${filterNote}`,
                     );
+                    openEmbeddingModelMenu();
                 } else {
                     updateStatusBar("⚠️ 渠道未返回模型列表，请手动输入向量模型名称", true);
                 }
@@ -2846,6 +3213,7 @@ function renderFloatingWidgetUI({ forceLedger = false } = {}) {
 
     if (!bodyInner) return;
     const memoryBusy = activeSummaryChats.has(getChatKey())
+        || pendingHierarchyEdits.has(getChatKey())
         || (isBackfilling && activeBackfillChatKey === getChatKey());
     const ledgerRenderKey = `${getChatKey()}|${getSTContext().name1 || ""}|${memoryBusy ? 1 : 0}|${JSON.stringify(memoryData.stateLedger || {})}`;
     if (forceLedger || ledgerRenderKey !== lastLedgerRenderKey) {
@@ -2856,7 +3224,7 @@ function renderFloatingWidgetUI({ forceLedger = false } = {}) {
     // 时间线较重，只在剧情页可见时重建，避免每轮总结都刷新隐藏页签。
     const storyVisible = document.getElementById("tiandao_tab_story_content")?.style.display !== "none";
     if (storyVisible) {
-        renderStoryTimeline();
+        renderStoryTimeline(memoryData);
         renderStoryRecoveryState(memoryData, pendingBacklog);
     }
 }
@@ -2883,6 +3251,7 @@ function buildLedgerHtml(memoryData) {
     const ctx = getSTContext();
     const chatKey = getChatKey();
     const memoryBusy = activeSummaryChats.has(chatKey)
+        || pendingHierarchyEdits.has(chatKey)
         || (isBackfilling && activeBackfillChatKey === chatKey);
     const userNames = new Set(
         [ctx.name1, ...(Array.isArray(ctx.chat) ? ctx.chat.filter(msg => msg?.is_user).map(msg => msg?.name) : [])]
@@ -2976,6 +3345,9 @@ function buildLedgerHtml(memoryData) {
         const initial = escapeHTML(Array.from(String(name || "?"))[0] || "?");
         const characterExpanded = expandedCharacterCards.has(`${chatKey}::${name}`);
         const bodyId = `tiandao-char-body-${charCards.length}`;
+        const viewHtml = info.viewTarget && info.viewTargetVisible !== false
+            ? `<div class="tiandao-char-prop"><b>本轮私下所见</b>: ${escapeHTML(info.viewTarget)}${info.viewSeenRound ? `（第 ${escapeHTML(info.viewSeenRound)} 轮）` : ""}</div>`
+            : "";
 
         charCards.push(`
             <div class="tiandao-char-card${away ? " tiandao-char-away" : ""}${characterExpanded ? " tiandao-char-expanded" : ""}">
@@ -2997,6 +3369,7 @@ function buildLedgerHtml(memoryData) {
                     ${aliasHtml}
                     <div class="tiandao-char-prop"><b>状态行动</b>: ${escapeHTML(info.statusAndAction || "平静")}</div>
                     <div class="tiandao-char-prop"><b>当前衣着</b>: ${escapeHTML(info.wear || "常规穿戴")}</div>
+                    ${viewHtml}
                     ${itemHtml}
                 </div>
             </div>
@@ -3163,6 +3536,16 @@ const STORY_PAGE_SIZE = 20;
 let storyPage = 0;
 let storySortOrder = "desc";
 
+function isL0FullyCoveredByRaw(item, rawWindowStart, currentRound, rawRoundNumbers) {
+    const range = parseRoundRange(item?.roundRange);
+    if (range.start < rawWindowStart || range.end > currentRound) return false;
+    if (!rawRoundNumbers) return true;
+    for (let round = range.start; round <= range.end; round++) {
+        if (!rawRoundNumbers.has(round)) return false;
+    }
+    return true;
+}
+
 function buildTimelineHtml(memoryData) {
     const entries = [];
     const levels = memoryData.levels || {};
@@ -3182,7 +3565,13 @@ function buildTimelineHtml(memoryData) {
         ? Math.max(1, numOr(settings.keepRecentRoundsCount, 5))
         : 0;
     const rawWindowStart = currentRound > 0 ? currentRound - rawKeep + 1 : Infinity;
-    const maxLvl = Math.max(...Object.keys(levels).map(Number), 1);
+    const rawRoundNumbers = rawKeep > 0
+        ? getSendableRawRoundNumbers(chat, settings, currentRound, rawKeep)
+        : null;
+    const maxLvl = Math.min(
+        3,
+        Object.keys(levels).reduce((max, key) => Math.max(max, Number(key) || 0), 1),
+    );
     const inViewRange = (item) => {
         if (!storyViewRange) return true;
         const range = parseRoundRange(item?.roundRange);
@@ -3204,7 +3593,12 @@ function buildTimelineHtml(memoryData) {
             </div>`;
         }
         const badgeClass = lvl >= 2 ? "tiandao-lvl-2" : (lvl === 1 ? "tiandao-lvl-1" : "tiandao-lvl-0");
-        const kindText = lvl >= 2 ? "大阶段脉络" : (lvl === 1 ? "阶段脉络" : "单轮微摘要");
+        const itemRange = parseRoundRange(item.roundRange);
+        const kindText = lvl >= 2
+            ? "大阶段脉络"
+            : (lvl === 1
+                ? "阶段脉络"
+                : (itemRange.start === itemRange.end ? "单轮微摘要" : "连续轮次微摘要"));
         return `
             <div class="tiandao-story-entry${lvl >= 2 ? " strong" : ""}" data-lvl="${lvl}" data-idx="${idx}">
                 <div class="tiandao-entry-meta">
@@ -3231,9 +3625,8 @@ function buildTimelineHtml(memoryData) {
         });
     }
     (levels[0] || []).forEach((it, idx) => {
-        const range = parseRoundRange(it?.roundRange);
         if (rawKeep > 0 && rawWindowStart !== Infinity
-            && range.end >= rawWindowStart && range.start <= currentRound) {
+            && isL0FullyCoveredByRaw(it, rawWindowStart, currentRound, rawRoundNumbers)) {
             return;
         }
         if (inViewRange(it)) pushEntry(0, it, idx);
@@ -3294,10 +3687,10 @@ function buildTimelineHtml(memoryData) {
 let storyEditingKey = null; // 正在编辑的条目键（"层级:序号"）
 let storyEditingId = null;
 
-function renderStoryTimeline() {
+function renderStoryTimeline(memoryData = null) {
     const page = document.getElementById("tiandao_story_page_timeline");
     if (!page || storyEditingKey) return;
-    page.innerHTML = buildTimelineHtml(getChatMemory());
+    page.innerHTML = buildTimelineHtml(memoryData || getChatMemory());
 }
 
 // ==================== 剧情总结内联编辑 ====================
@@ -3412,7 +3805,7 @@ async function rebuildHierarchyLevelsFromL0(settings, memoryData, textOverrides,
             const override = getHierarchyTextOverride(textOverrides, 0, copy);
             if (override !== null) {
                 copy.text = override;
-                copy.embedding = null;
+                clearEntryEmbedding(copy);
             }
             return copy;
         });
@@ -3455,6 +3848,8 @@ function restoreHierarchyEditFallback(memoryData, fallbackHierarchy, archiveRest
     if (archiveRestore?.entry) {
         archiveRestore.entry.text = archiveRestore.text;
         archiveRestore.entry.embedding = archiveRestore.embedding;
+        archiveRestore.entry.embeddingModel = archiveRestore.embeddingModel;
+        archiveRestore.entry.embeddingDimension = archiveRestore.embeddingDimension;
     }
 }
 
@@ -3504,7 +3899,7 @@ function startHierarchyRebuildTransaction({
         try {
             updateSummaryTask(task, {
                 current: 0,
-                detail: "正在从单轮摘要重建 L1～L3 与远史",
+                detail: "正在从 L0 摘要重建 L1～L3 与远史",
             });
 
             let rebuiltLevels = null;
@@ -3528,7 +3923,7 @@ function startHierarchyRebuildTransaction({
 
             if (!rebuiltLevels) {
                 if (await restoreStagedIfNeeded()) {
-                    updateStatusBar("⚠️ 没有足够的单轮摘要可供重建，本次修改未保存", true);
+                    updateStatusBar("⚠️ 没有足够的 L0 摘要可供重建，本次修改未保存", true);
                 }
                 return;
             }
@@ -3641,6 +4036,8 @@ window.tiandaoSaveStoryEntry = async (lvl, idx) => {
             entry: archiveEntry,
             text: archiveEntry.text,
             embedding: archiveEntry.embedding,
+            embeddingModel: archiveEntry.embeddingModel,
+            embeddingDimension: archiveEntry.embeddingDimension,
         }
         : null;
     const fallbackHierarchy = {
@@ -3653,12 +4050,34 @@ window.tiandaoSaveStoryEntry = async (lvl, idx) => {
     const chatKey = getChatKey();
     const epoch = summaryEpoch;
     item.text = newText;
-    item.embedding = null; // 文本已变化，旧向量不再可信；召回会回退到本地词法检索。
+    // 文本已变化，旧向量不再可信；召回会回退到本地词法检索。
+    clearEntryEmbedding(item);
     if (archiveEntry) {
         archiveEntry.text = newText;
-        archiveEntry.embedding = null;
+        clearEntryEmbedding(archiveEntry);
     }
     storyEditingKey = null;
+
+    const needsHierarchyRebuild = numericLevel > 0
+        || isMemoryEntryCoveredByHigherLevels(memoryData, item, 0);
+    if (!needsHierarchyRebuild) {
+        try {
+            await saveChatMemory();
+        } catch (error) {
+            restoreHierarchyEditFallback(memoryData, fallbackHierarchy, archiveRestore);
+            await saveChatMemory().catch(() => {});
+            updateFloatingWidgetUI();
+            updateStatusBar(`❌ 保存剧情总结失败：${String(error?.message || error).slice(0, 160)}`, true);
+            storyEditingId = null;
+            return;
+        }
+        await refreshPromptInjection().catch(() => {});
+        renderStoryTimeline();
+        updateFloatingWidgetUI();
+        updateStatusBar(`✅ 已修改第 ${item.roundRange} 轮 L0 摘要；该范围尚未并入高层，L1～L3 未改动`);
+        storyEditingId = null;
+        return;
+    }
 
     const textOverrides = new Map();
     if (numericLevel === 0) {
@@ -3682,7 +4101,7 @@ window.tiandaoSaveStoryEntry = async (lvl, idx) => {
             const override = getHierarchyTextOverride(textOverrides, 0, copy);
             if (override !== null) {
                 copy.text = override;
-                copy.embedding = null;
+                clearEntryEmbedding(copy);
             }
             return copy;
         });
@@ -3734,7 +4153,11 @@ function exportMemoryJson() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `suwei_memory_${ctx.name2 || "chat"}_${Date.now()}.json`;
+    const safeChatName = String(ctx.name2 || "chat")
+        .slice(0, 500)
+        .replace(/[\\/:*?"<>|\x00-\x1f]+/g, "_")
+        .slice(0, 80);
+    a.download = `suwei_memory_${safeChatName || "chat"}_${Date.now()}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 0);
 }
@@ -3744,12 +4167,24 @@ function exportMemoryJson() {
  */
 function importMemoryJsonFile(file) {
     if (!file) return;
+    if (file.size > MAX_IMPORT_FILE_BYTES) {
+        updateStatusBar("⚠️ 记忆文件超过 20MB，已拒绝导入以避免界面卡死", true);
+        return;
+    }
     const reader = new FileReader();
     reader.onload = async () => {
         try {
             const imported = JSON.parse(String(reader.result));
             if (!imported || typeof imported !== "object" || !imported.levels || !imported.stateLedger) {
                 throw new Error("文件缺少 levels / stateLedger 字段，不是溯微记忆数据");
+            }
+            const levelEntries = Object.values(imported.levels || {})
+                .reduce((count, list) => count + (Array.isArray(list) ? list.length : 0), 0);
+            const archiveEntries = Array.isArray(imported.archivePool)
+                ? imported.archivePool.length
+                : 0;
+            if (levelEntries + archiveEntries > MAX_IMPORT_MEMORY_ENTRIES) {
+                throw new Error(`记忆条目超过 ${MAX_IMPORT_MEMORY_ENTRIES} 条，已拒绝导入`);
             }
             if (!confirm("导入会覆盖当前存档的全部记忆数据，确定继续吗？")) return;
             summaryEpoch++;
@@ -3764,8 +4199,14 @@ function importMemoryJsonFile(file) {
             const metadata = ctx.chatMetadata || window.chat_metadata;
             if (metadata) {
                 invalidateRoundIndexCache(ctx.chat || []);
+                const previousMemory = metadata.tiandao_memory;
                 metadata.tiandao_memory = merged;
-                await saveChatMemory();
+                try {
+                    await saveChatMemory();
+                } catch (error) {
+                    metadata.tiandao_memory = previousMemory;
+                    throw error;
+                }
                 await refreshPromptInjection();
                 syncHiddenMessagesState();
                 updateFloatingWidgetUI();
@@ -3810,12 +4251,36 @@ function bindSettingsUI() {
     };
 
     bindCheck("tiandao_enabled", "enabled", () => {
-        summaryEpoch++;
+        invalidateActiveSummaryWork("插件开关已变更");
         refreshPromptInjection();
         syncHiddenMessagesState();
         updateFloatingWidgetUI();
     });
     bindCheck("tiandao_auto_summarize", "autoSummarizePerTurn");
+    const syncL0ModeUi = () => {
+        const autoSummarizeEl = document.getElementById("tiandao_auto_summarize");
+        if (autoSummarizeEl) autoSummarizeEl.disabled = getSettings().l0MergeMode === "manual";
+    };
+    bindInput("tiandao_l0_chunk", "l0RoundsPerSummary", true, (value) => {
+        const chunk = resolveL0RoundsPerSummary({ l0RoundsPerSummary: value });
+        settings.l0RoundsPerSummary = chunk;
+        const input = document.getElementById("tiandao_l0_chunk");
+        if (input) input.value = String(chunk);
+        saveSettings();
+        updateStatusBar(getSettings().l0MergeMode === "manual"
+            ? `✅ L0 手动模式；后续手动合并的起算轮数仍从最新未归档轮开始`
+            : `✅ 后续每满 ${chunk} 轮自动归档为一条 L0`);
+        updateFloatingWidgetUI();
+    });
+    bindInput("tiandao_l0_merge_mode", "l0MergeMode", false, (value) => {
+        syncL0ModeUi();
+        updateStatusBar(value === "manual"
+            ? "✅ 已切换为手动合并 L0；可在剧情页选择连续轮次执行"
+            : "✅ 已切换为满指定轮数自动合并 L0");
+        renderStoryRecoveryState();
+        updateFloatingWidgetUI();
+    });
+    syncL0ModeUi();
     bindInput("tiandao_summary_retry", "summaryRetryCount", true);
     bindInput("tiandao_summarize_timing", "summarizeTiming");
     bindInput("tiandao_widget_theme", "widgetTheme", false, () => applyWidgetAppearance());
@@ -3838,7 +4303,7 @@ function bindSettingsUI() {
     }
     bindCheck("tiandao_use_json_mode", "useJsonMode");
     bindCheck("tiandao_include_native_hidden", "includeNativeHidden", () => {
-        summaryEpoch++;
+        invalidateActiveSummaryWork("隐藏楼层轮次规则已变更");
         syncHiddenMessagesState();
         refreshPromptInjection().catch(() => {});
         updateFloatingWidgetUI();
@@ -3866,6 +4331,8 @@ function bindSettingsUI() {
     bindInput("tiandao_api_key", "apiKey");
     bindInput("tiandao_model", "model");
     bindInput("tiandao_temp", "temperature", true);
+    bindInput("tiandao_request_timeout", "requestTimeoutSeconds", true);
+    bindInput("tiandao_stream_mode", "streamMode");
     bindInput("tiandao_target_tags", "targetContentTags");
     bindInput("tiandao_strip_tags", "customStripTags");
     const apiProfileSelect = document.getElementById("tiandao_api_profile_select");
@@ -3905,7 +4372,10 @@ function bindSettingsUI() {
     });
     bindInput("tiandao_emb_url", "embeddingApiUrl", false, () => setFetchedEmbeddingModelNames([]));
     bindInput("tiandao_emb_key", "embeddingApiKey");
-    bindInput("tiandao_emb_model", "embeddingModel");
+    bindInput("tiandao_emb_model", "embeddingModel", false, (value) => {
+        const select = document.getElementById("tiandao_emb_model_select");
+        if (select) select.value = String(value || "");
+    });
     bindCheck("tiandao_emb_filter_models", "embeddingModelFilterOnly", () => {
         const visibleNames = refreshEmbeddingModelOptions();
         if (visibleNames.length > 0) {
@@ -3921,7 +4391,7 @@ function bindSettingsUI() {
             const reply = await callIndependentLLM(
                 getSettings(),
                 [{ role: "user", content: "请仅回复“连接成功”四个字。" }],
-                { jsonMode: false },
+                { jsonMode: false, timeoutMs: 120_000 },
             );
             updateStatusBar(`✅ API 测试通过！模型回复: ${reply.slice(0, 30)}`);
         } catch (e) {
@@ -3971,6 +4441,7 @@ function bindSettingsUI() {
         isBackfilling = true;
         abortBackfillFlag = false;
         summaryEpoch++;
+        const backfillEpoch = summaryEpoch;
         const backfillChatKey = getChatKey();
         activeBackfillChatKey = backfillChatKey;
         const task = beginSummaryTask({
@@ -4003,17 +4474,27 @@ function bindSettingsUI() {
                     );
                 },
                 onChunkSaved: async () => {
-                    if (!isCurrentChat(backfillChatKey)) return;
+                    if (!isCurrentChat(backfillChatKey) || backfillEpoch !== summaryEpoch) return;
                     await saveChatMemory();
                     await refreshPromptInjection();
                 },
                 shouldAbort: () => abortBackfillFlag
                     || isSummaryTaskCancelled(task)
-                    || !isCurrentChat(backfillChatKey),
-                shouldCommitTurn: () => isCurrentChat(backfillChatKey),
+                    || !isCurrentChat(backfillChatKey)
+                    || backfillEpoch !== summaryEpoch,
+                shouldCommitTurn: () => isCurrentChat(backfillChatKey)
+                    && backfillEpoch === summaryEpoch,
                 signal,
             });
             if (!isCurrentChat(backfillChatKey)) return;
+            if (backfillEpoch !== summaryEpoch) {
+                await saveChatMemory().catch(() => {});
+                updateFloatingWidgetUI();
+                updateStatusBar(task?.cancelRequested || abortBackfillFlag
+                    ? "⏸️ 已停止历史回溯，已保存进度。"
+                    : "⏸️ 聊天内容已变化，已停止历史回溯。");
+                return;
+            }
             memoryData.lastSummaryError = null;
             syncHiddenMessagesState();
             updateFloatingWidgetUI();
@@ -4021,6 +4502,7 @@ function bindSettingsUI() {
                 ? `⏸️ 已暂停，当前已处理 ${result.processedCount} 轮；再次点击可继续。`
                 : `✅ 存量历史按轮次扫描构建完成！`);
         } catch (e) {
+            if (!isCurrentChat(backfillChatKey) || backfillEpoch !== summaryEpoch) return;
             if (signal?.aborted || e?.name === "AbortError") {
                 memoryData.lastSummaryError = null;
                 await saveChatMemory().catch(() => {});
@@ -4069,9 +4551,30 @@ function bindSettingsUI() {
             storyPage = 0;
             syncHiddenMessagesState(true);
             invalidateRoundIndexCache(ctx.chat || []);
+            const previousMemory = metadata.tiandao_memory;
             metadata.tiandao_memory = createEmptyMemoryData();
-            await saveChatMemory();
-            await refreshPromptInjection();
+            try {
+                await saveChatMemory();
+            } catch (error) {
+                metadata.tiandao_memory = previousMemory;
+                syncHiddenMessagesState();
+                updateFloatingWidgetUI({ forceLedger: true });
+                updateStatusBar(
+                    `❌ 清空记忆失败，原存档已恢复：${String(error?.message || error).slice(0, 160)}`,
+                    true,
+                );
+                return;
+            }
+            try {
+                await refreshPromptInjection();
+            } catch (error) {
+                updateFloatingWidgetUI();
+                updateStatusBar(
+                    `⚠️ 记忆已清空，但刷新注入失败：${String(error?.message || error).slice(0, 160)}`,
+                    true,
+                );
+                return;
+            }
             updateStatusBar("🗑️ 已清空本存档记忆账本");
             updateFloatingWidgetUI();
         }
@@ -4150,38 +4653,40 @@ function bindSettingsUI() {
                     });
                 }
             });
-            if (eventTypes.MESSAGE_DELETED) eventSource.on(eventTypes.MESSAGE_DELETED, async (newLength) => {
+            if (eventTypes.MESSAGE_DELETED) eventSource.on(eventTypes.MESSAGE_DELETED, async () => {
                 clearSwipeRepairTimer();
                 const chat = getSTContext().chat || [];
                 invalidateRoundIndexCache(chat);
-                const previousFingerprint = lastChatFingerprint;
+                const previousFingerprint = lastChatFingerprint.slice();
                 const currentFingerprint = buildChatFingerprint(chat);
-                const changedIndex = findFirstChangedMessageIndex(previousFingerprint, currentFingerprint);
-                const cutoff = changedIndex >= 0
-                    ? changedIndex
-                    : Math.min(chat.length, Number.isFinite(Number(newLength)) ? Number(newLength) : chat.length);
-                summaryEpoch++;
+                invalidateActiveSummaryWork("消息已删除");
                 refreshChatFingerprint(chat);
                 const memoryData = getChatMemory();
-                if (cutoff >= 0 && memoryData.lastProcessedMessageId >= cutoff) {
-                    if (rollbackMemoryFromMessageIndex(memoryData, cutoff)) {
-                        memoryData.lastSummaryError = null;
-                        await saveChatMemory();
-                        await refreshPromptInjection();
-                    }
+                const reconciled = reconcileMemoryAfterMessageDeletion(
+                    memoryData,
+                    chat,
+                    previousFingerprint,
+                    currentFingerprint,
+                    getSettings().includeNativeHidden,
+                    { skipNormalize: true },
+                );
+                if (reconciled) {
+                    memoryData.lastSummaryError = null;
+                    await saveChatMemory();
+                    await refreshPromptInjection().catch(() => {});
                 }
                 syncHiddenMessagesState(); updateFloatingWidgetUI();
             });
             if (eventTypes.MESSAGE_EDITED) eventSource.on(eventTypes.MESSAGE_EDITED, async (idx) => {
                 clearSwipeRepairTimer();
-                summaryEpoch++;
+                invalidateActiveSummaryWork("消息已编辑");
                 const currentCtx = getSTContext();
                 const chat = currentCtx.chat || [];
                 invalidateRoundIndexCache(chat);
                 refreshChatFingerprint(chat);
                 const memoryData = getChatMemory();
                 if (memoryData.lastProcessedMessageId >= idx) {
-                    rollbackMemoryFromMessageIndex(memoryData, idx);
+                    rollbackMemoryFromMessageIndex(memoryData, idx, { skipNormalize: true });
                     memoryData.lastSummaryError = null;
                     await saveChatMemory();
                     syncHiddenMessagesState();
@@ -4190,6 +4695,7 @@ function bindSettingsUI() {
                 const settings = getSettings();
                 if (settings.enabled
                     && settings.autoSummarizePerTurn
+                    && settings.l0MergeMode !== "manual"
                     && settings.summarizeTiming === "after_reply") {
                     const chatKey = getChatKey();
                     const epoch = summaryEpoch;
@@ -4199,13 +4705,18 @@ function bindSettingsUI() {
                         epoch,
                         label: "编辑后重建",
                     });
-                } else if (targetMsg && !targetMsg.is_user && settings.enabled && settings.autoSummarizePerTurn) {
+                } else if (targetMsg && !targetMsg.is_user
+                    && settings.enabled
+                    && settings.autoSummarizePerTurn
+                    && settings.l0MergeMode !== "manual") {
                     const chatKey = getChatKey();
                     const epoch = summaryEpoch;
-                    enqueueBackgroundSummary(async () => {
-                        if (!isCurrentChat(chatKey) || epoch !== summaryEpoch || chat[idx] !== targetMsg) return;
-                        await processSingleAiTurn(idx, false, { ctx: currentCtx, chat, chatKey, epoch });
-                    }, "编辑后重建");
+                    enqueuePendingAiTurns(chat, idx, {
+                        ctx: currentCtx,
+                        chatKey,
+                        epoch,
+                        label: "编辑后重建",
+                    });
                 } else {
                     await refreshPromptInjection().catch(() => {});
                 }
@@ -4213,21 +4724,21 @@ function bindSettingsUI() {
             });
             if (eventTypes.MESSAGE_SWIPED) eventSource.on(eventTypes.MESSAGE_SWIPED, async (idx) => {
                 clearSwipeRepairTimer();
-                summaryEpoch++;
+                invalidateActiveSummaryWork("已切换 Swipe");
                 const chat = getSTContext().chat || [];
                 invalidateRoundIndexCache(chat);
                 refreshChatFingerprint(chat);
                 const memoryData = getChatMemory();
                 const startFloor = idx > 0 && chat[idx - 1]?.is_user ? idx - 1 : idx;
                 if (memoryData.lastProcessedMessageId >= startFloor) {
-                    rollbackMemoryFromMessageIndex(memoryData, startFloor);
+                    rollbackMemoryFromMessageIndex(memoryData, startFloor, { skipNormalize: true });
                     memoryData.lastSummaryError = null;
                     await saveChatMemory();
                     syncHiddenMessagesState();
                     await refreshPromptInjection().catch(() => {});
                     updateFloatingWidgetUI();
-                    scheduleAfterReplySwipeRepair(getChatKey());
                 }
+                scheduleAfterReplySwipeRepair(getChatKey());
             });
             if (eventTypes.MESSAGE_UPDATED) eventSource.on(eventTypes.MESSAGE_UPDATED, () => {
                 const chat = getSTContext().chat || [];
@@ -4236,6 +4747,6 @@ function bindSettingsUI() {
             });
         }
         updateFloatingWidgetUI();
-        console.log("[溯微] v1.13.2 (回滚一致性·事务重建·队列停止) 加载完毕！");
+        console.log("[溯微] v1.14.0 (多轮 L0·自动阈值·手动合并) 加载完毕！");
     } catch (err) { console.error("[溯微] 初始化异常:", err); }
 })();

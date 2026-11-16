@@ -1339,6 +1339,16 @@
     cursor: pointer;
 }
 
+.tiandao-emb-model-select {
+    width: 100%;
+    max-width: none;
+    margin-top: 6px;
+}
+
+.tiandao-emb-model-select[hidden] {
+    display: none;
+}
+
 .tiandao-select option {
     background: var(--sw-card-bg);
     color: var(--sw-text);
