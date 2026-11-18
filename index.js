@@ -77,7 +77,7 @@ const pendingLedgerRender = { force: false };
 // 设置输入框登记表：支持“输入即保存”，并在按钮点击前强制落盘
 const settingsInputRegistry = [];
 
-function commitSettingInput(entry) {
+function commitSettingInput(entry, notify = true, notifyIfUnchanged = false) {
     const raw = String(entry.el.value ?? "").trim();
     let value = raw;
     if (entry.isNum) {
@@ -85,17 +85,18 @@ function commitSettingInput(entry) {
     }
     const settings = getSettings();
     if (settings[entry.key] === value) {
+        if (notify && notifyIfUnchanged && entry.onChange) entry.onChange(value);
         return;
     }
     settings[entry.key] = value;
     saveSettings();
-    if (entry.onChange) entry.onChange(value);
+    if (notify && entry.onChange) entry.onChange(value);
 }
 
 function flushSettingInputs() {
     for (const entry of settingsInputRegistry) {
         clearTimeout(entry.timer);
-        commitSettingInput(entry);
+        commitSettingInput(entry, true, entry.notifyIfUnchanged);
     }
 }
 
@@ -1566,7 +1567,14 @@ function renderStoryRecoveryState(memoryData = getChatMemory(), pendingOverride 
         ? (pendingOverride || getPendingBacklog(getSTContext().chat || [], memoryData))
         : [];
     const error = activeChat ? memoryData.lastSummaryError : null;
-    if (pending.length === 0 && !error) {
+    const settings = getSettings();
+    const l0Chunk = resolveL0RoundsPerSummary(settings);
+    const normalPartialBatch = settings.l0MergeMode !== "manual"
+        && pending.length > 0
+        && pending.length < l0Chunk;
+    const dismissErrorBtn = document.getElementById("tiandao_story_dismiss_error_btn");
+    if (dismissErrorBtn) dismissErrorBtn.style.display = error ? "inline-flex" : "none";
+    if ((pending.length === 0 && !error) || (normalPartialBatch && !error)) {
         box.style.display = "none";
         return;
     }
@@ -1574,8 +1582,6 @@ function renderStoryRecoveryState(memoryData = getChatMemory(), pendingOverride 
     const errorText = error
         ? `第 ${error.roundNumber || "?"} 轮总结失败：${String(error.message || "未知错误").slice(0, 120)}`
         : "有历史轮次尚未归档。";
-    const settings = getSettings();
-    const l0Chunk = resolveL0RoundsPerSummary(settings);
     const pendingText = settings.l0MergeMode === "manual"
         ? `已有 ${pending.length} 轮等待手动合并 L0。`
         : (pending.length < l0Chunk
@@ -2202,9 +2208,14 @@ function initFloatingWidget() {
                             <i class="fa-solid fa-triangle-exclamation"></i>
                             <span id="tiandao_story_error_message"></span>
                         </div>
-                        <button type="button" id="tiandao_story_recover_btn" class="tiandao-btn tiandao-btn-sm">
-                            <i class="fa-solid fa-rotate-right"></i> 立即补总结
-                        </button>
+                        <div class="tiandao-story-error-actions">
+                            <button type="button" id="tiandao_story_recover_btn" class="tiandao-btn tiandao-btn-sm">
+                                <i class="fa-solid fa-rotate-right"></i> 立即补总结
+                            </button>
+                            <button type="button" id="tiandao_story_dismiss_error_btn" class="tiandao-btn tiandao-btn-sm" title="清除失败提示；未归档轮次仍保留">
+                                <i class="fa-solid fa-xmark"></i> 清除失败提示
+                            </button>
+                        </div>
                     </div>
                     <div class="tiandao-story-range-bar">
                         <span class="tiandao-story-range-label">轮次</span>
@@ -2307,10 +2318,10 @@ function initFloatingWidget() {
                             </div>
                             <div class="tiandao-form-row">
                                 <span class="tiandao-field-label">每几轮合成一条 L0</span>
-                                <input id="tiandao_l0_chunk" type="number" class="tiandao-input tiandao-input-sm" min="1" max="50" placeholder="1" />
+                                <input id="tiandao_l0_chunk" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" class="tiandao-input tiandao-input-sm" placeholder="1" aria-label="每几轮合成一条 L0" />
                             </div>
                             <div class="tiandao-field-caption" style="margin:0 0 8px;">
-                                自动模式满 N 轮才归档；手动模式不会自动生成 L0，仍可在剧情页选择连续轮次手动合并。手动合并后，下一段从合并结束后的第一轮重新计数。
+                                自动模式满 N 轮才归档；手动模式不会自动生成 L0，仍可在剧情页选择连续轮次手动合并。手动合并后，下一段从合并结束后的第一轮重新计数。多轮 L0 会整组总结并更新状态看板；希望状态每轮同步时设为 1 轮。
                             </div>
                             <div class="tiandao-form-row">
                                 <span class="tiandao-field-label">L1+ 向上合并步长</span>
@@ -2747,9 +2758,15 @@ function initFloatingWidget() {
         }
     });
 
-    closeBtn.addEventListener("click", (e) => {
+    closeBtn.addEventListener("click", async (e) => {
         e.stopPropagation();
         setWidgetExpanded(false);
+        const memoryData = getChatMemory();
+        if (memoryData.lastSummaryError) {
+            memoryData.lastSummaryError = null;
+            renderStoryRecoveryState(memoryData);
+            await saveChatMemory().catch(() => {});
+        }
     });
 
     const ledgerBody = document.getElementById("tiandao_widget_body_inner");
@@ -2857,6 +2874,15 @@ function initFloatingWidget() {
     }
     const storyRecoverBtn = document.getElementById("tiandao_story_recover_btn");
     if (storyRecoverBtn) storyRecoverBtn.addEventListener("click", recoverPendingSummaries);
+    const storyDismissErrorBtn = document.getElementById("tiandao_story_dismiss_error_btn");
+    if (storyDismissErrorBtn) storyDismissErrorBtn.addEventListener("click", async () => {
+        const memoryData = getChatMemory();
+        if (!memoryData.lastSummaryError) return;
+        memoryData.lastSummaryError = null;
+        await saveChatMemory().catch(() => {});
+        renderStoryRecoveryState(memoryData);
+        updateFloatingWidgetUI();
+    });
     tabStoryContent.addEventListener("click", (event) => {
         const button = event.target.closest("[data-story-page]");
         if (!button || button.disabled) return;
@@ -3184,18 +3210,24 @@ function renderFloatingWidgetUI({ forceLedger = false } = {}) {
     const pendingBacklog = getPendingBacklog(getSTContext().chat || [], memoryData);
     const pendingBacklogCount = pendingBacklog.length;
     const summaryError = isActiveChatContext(getSTContext()) ? memoryData.lastSummaryError : null;
+    const l0Chunk = resolveL0RoundsPerSummary(settings);
 
     if (badge) {
+        const pendingLabel = settings.l0MergeMode === "manual"
+            ? `待合并 ${pendingBacklogCount}`
+            : (pendingBacklogCount < l0Chunk
+                ? `L0 ${pendingBacklogCount}/${l0Chunk}`
+                : `待补 ${pendingBacklogCount}`);
         const badgeText = !settings.enabled
             ? "已暂停"
             : (isBackfilling && activeBackfillChatKey === getChatKey()
                 ? "回溯中"
                 : (activeSummaryChats.has(getChatKey())
                     ? "整理中"
-                    : (pendingBacklogCount > 0
-                        ? `待补 ${pendingBacklogCount}`
-                        : (summaryError
-                            ? "需检查"
+                    : (summaryError
+                        ? (pendingBacklogCount > 0 ? `重试 ${pendingBacklogCount}/${l0Chunk}` : "需检查")
+                        : (pendingBacklogCount > 0
+                            ? pendingLabel
                             : (memoryData.lastProcessedRound > 0 ? `第${memoryData.lastProcessedRound}轮` : "就绪")))));
         badge.textContent = badgeText;
     }
@@ -4238,19 +4270,28 @@ function bindSettingsUI() {
     };
 
     // 输入即保存（350ms 防抖），失焦时立即落盘；数值留空保存为空串并回退内置默认值
-    const bindInput = (id, key, isNum = false, onChange = null) => {
+    const bindInput = (id, key, isNum = false, onChange = null, options = {}) => {
         const el = document.getElementById(id);
         if (!el) return;
         el.value = settings[key] ?? "";
-        const entry = { el, key, isNum, onChange, timer: null };
+        const entry = { el, key, isNum, onChange, timer: null, notifyIfUnchanged: Boolean(options.notifyIfUnchanged) };
         settingsInputRegistry.push(entry);
+        if (options.selectOnFocus) {
+            el.addEventListener("focus", () => {
+                // 选中旧值，避免在默认的“1”后输入“5”变成“15”。
+                el.select?.();
+            });
+        }
         el.addEventListener("input", () => {
             clearTimeout(entry.timer);
-            entry.timer = setTimeout(() => commitSettingInput(entry), 350);
+            entry.timer = setTimeout(
+                () => commitSettingInput(entry, !options.deferCallbackUntilCommit),
+                350,
+            );
         });
         el.addEventListener("change", () => {
             clearTimeout(entry.timer);
-            commitSettingInput(entry);
+            commitSettingInput(entry, true, entry.notifyIfUnchanged);
         });
     };
 
@@ -4275,7 +4316,7 @@ function bindSettingsUI() {
             ? `✅ L0 手动模式；后续手动合并的起算轮数仍从最新未归档轮开始`
             : `✅ 后续每满 ${chunk} 轮自动归档为一条 L0`);
         updateFloatingWidgetUI();
-    });
+    }, { deferCallbackUntilCommit: true, notifyIfUnchanged: true, selectOnFocus: true });
     bindInput("tiandao_l0_merge_mode", "l0MergeMode", false, (value) => {
         syncL0ModeUi();
         updateStatusBar(value === "manual"
@@ -4607,6 +4648,11 @@ function bindSettingsUI() {
         const ctx = getSTContext();
         const eventSource = ctx.eventSource || window.eventSource;
         const eventTypes = ctx.eventTypes || ctx.event_types || window.event_types || window.eventTypes || {};
+        const startupMemory = getChatMemory();
+        if (startupMemory.lastSummaryError) {
+            startupMemory.lastSummaryError = null;
+            await saveChatMemory().catch(() => {});
+        }
         refreshChatFingerprint(ctx.chat || []);
         syncHiddenMessagesState();
 
@@ -4623,6 +4669,11 @@ function bindSettingsUI() {
                 storyEditingId = null;
                 storyViewRange = null;
                 storyPage = 0;
+                const changedChatMemory = getChatMemory();
+                if (changedChatMemory.lastSummaryError) {
+                    changedChatMemory.lastSummaryError = null;
+                    await saveChatMemory().catch(() => {});
+                }
                 expandedCharacterCards.clear();
                 expandedInventoryCards.clear();
                 refreshChatFingerprint(getSTContext().chat || []);
@@ -4674,7 +4725,9 @@ function bindSettingsUI() {
                     getSettings().includeNativeHidden,
                     { skipNormalize: true },
                 );
-                if (reconciled) {
+                const clearedDeletedRoundError = Boolean(memoryData.lastSummaryError);
+                if (reconciled || clearedDeletedRoundError) {
+                    // 删除的可能正是失败轮次；即使存档游标未变化，也清除过期错误并保存。
                     memoryData.lastSummaryError = null;
                     await saveChatMemory();
                     await refreshPromptInjection().catch(() => {});

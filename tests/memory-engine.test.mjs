@@ -200,6 +200,32 @@ test("deleting a trailing unsummarized user floor preserves every archived summa
     assert.equal(data.lastProcessedRound, 3);
 });
 
+test("deleting an unarchived floor repairs a stale cursor so later rounds remain recoverable", () => {
+    const chat = [];
+    for (let round = 1; round <= 5; round++) {
+        chat.push({ is_user: true, mes: `第${round}轮输入` });
+        chat.push({ is_user: false, name: "角色", mes: `第${round}轮回复` });
+    }
+    const previousFingerprint = buildChatMessageFingerprint(chat);
+    chat.splice(4, 2); // 删除尚未归档的第三轮，后续轮次向前移动。
+
+    const data = memoryWithRounds(2);
+    data.lastProcessedMessageId = 9; // 模拟旧版本曾越过已删除楼层的游标。
+    data.lastProcessedRound = 5;
+    assert.equal(reconcileMemoryAfterMessageDeletion(
+        data,
+        chat,
+        previousFingerprint,
+        buildChatMessageFingerprint(chat),
+        false,
+        { skipNormalize: true },
+    ), true);
+    assert.equal(data.lastProcessedMessageId, 3);
+    assert.equal(data.lastProcessedRound, 2);
+    const pending = collectPendingAiTurns(chat, data.lastProcessedMessageId);
+    assert.deepEqual(pending.map(turn => turn.round), [3, 4]);
+});
+
 test("deleting later unarchived rounds keeps L0 20/21 and starts the backlog at round 22", () => {
     const chat = [];
     for (let round = 1; round <= 30; round++) {
@@ -791,6 +817,74 @@ test("memory prompt respects the configured token budget", () => {
 
     const prompt = buildInjectedMemoryPrompt(data, [], "", 1000);
     assert.ok(estimatePromptTokens(prompt) <= 1000);
+});
+
+test("injected timeline is always ordered from distant rounds to recent rounds", () => {
+    const data = createEmptyMemoryData();
+    data.stateLedger = { time: "未知", characters: {}, todosAndPromises: [] };
+    data.farHistory.text = "第1-10轮远史";
+    data.levels[3] = [{ id: "L3", level: 3, roundRange: "11-30", text: "第11-30轮" }];
+    data.levels[2] = [{ id: "L2", level: 2, roundRange: "31-60", text: "第31-60轮" }];
+    data.levels[1] = [
+        { id: "L1a", level: 1, roundRange: "61-80", text: "第61-80轮" },
+        { id: "L1b", level: 1, roundRange: "81-100", text: "第81-100轮" },
+    ];
+    data.levels[0] = [{ id: "L0", level: 0, roundRange: "101-105", text: "第101-105轮" }];
+
+    const prompt = buildInjectedMemoryPrompt(data, [], "", 5000);
+    const positions = ["第1-10轮远史", "第11-30轮", "第31-60轮", "第61-80轮", "第81-100轮", "第101-105轮"]
+        .map(text => prompt.indexOf(text));
+    assert.ok(positions.every(position => position >= 0));
+    assert.deepEqual(positions, positions.slice().sort((a, b) => a - b));
+});
+
+test("far-history coverage survives timeline trimming before newer L1 summaries", () => {
+    const data = createEmptyMemoryData();
+    data.stateLedger = { time: "未知", characters: {}, todosAndPromises: [] };
+    data.farHistory.text = "第1-335轮早期剧情的压缩远史";
+    data.levels[1] = Array.from({ length: 20 }, (_, index) => ({
+        id: `L1_${index}`,
+        level: 1,
+        roundRange: `${336 + index * 5}-${340 + index * 5}`,
+        text: "近期阶段摘要".repeat(300),
+    }));
+
+    const prompt = buildInjectedMemoryPrompt(data, [], "", 1000);
+    assert.match(prompt, /第1-335轮早期剧情的压缩远史/);
+    assert.ok(estimatePromptTokens(prompt) <= 1000);
+});
+
+test("timeline budget trimming keeps earliest and latest L1 coverage before middle details", () => {
+    const data = createEmptyMemoryData();
+    data.stateLedger = { time: "未知", characters: {}, todosAndPromises: [] };
+    data.levels[1] = Array.from({ length: 8 }, (_, index) => ({
+        id: `L1_${index}`,
+        level: 1,
+        roundRange: `${index * 10 + 1}-${index * 10 + 10}`,
+        text: index === 0
+            ? "最早阶段锚点·第1至10轮"
+            : index === 7
+                ? "最近阶段锚点·第71至80轮"
+                : `中间阶段${index} · ${"详细剧情".repeat(180)}`,
+    }));
+
+    const prompt = buildInjectedMemoryPrompt(data, [], "", 1000);
+    assert.match(prompt, /最早阶段锚点/);
+    assert.match(prompt, /最近阶段锚点/);
+    assert.ok(estimatePromptTokens(prompt) <= 1000);
+});
+
+test("grouped L0 text is injected once rather than duplicated per round", () => {
+    const data = createEmptyMemoryData();
+    data.stateLedger = { time: "未知", characters: {}, todosAndPromises: [] };
+    data.levels[0] = [{
+        id: "L0_1_5",
+        level: 0,
+        roundRange: "1-5",
+        text: "五轮合并摘要唯一文本",
+    }];
+    const prompt = buildInjectedMemoryPrompt(data, [], "", 5000);
+    assert.equal(prompt.split("五轮合并摘要唯一文本").length - 1, 1);
 });
 
 test("raw recent rounds are not duplicated as injected L0 summaries", () => {

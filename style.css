@@ -1641,6 +1641,17 @@
     color: var(--sw-status-err);
 }
 
+.tiandao-story-error-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.tiandao-story-error-actions .tiandao-btn {
+    color: inherit;
+    border-color: currentColor;
+}
+
 .tiandao-story-error-text {
     display: flex;
     align-items: flex-start;

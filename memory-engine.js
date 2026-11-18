@@ -1870,9 +1870,15 @@ export function reconcileMemoryAfterMessageDeletion(
     const remainingEnds = retained
         .map(item => numOr(item.endMessageId, -1))
         .filter(value => value >= 0);
-    memoryData.lastProcessedMessageId = remainingEnds.length > 0 ? Math.max(...remainingEnds) : -1;
+    const nextProcessedMessageId = remainingEnds.length > 0 ? Math.max(...remainingEnds) : -1;
     const remainingRounds = retained.map(item => parseRoundRange(item.roundRange).end);
-    memoryData.lastProcessedRound = remainingRounds.length > 0 ? Math.max(...remainingRounds) : 0;
+    const nextProcessedRound = remainingRounds.length > 0 ? Math.max(...remainingRounds) : 0;
+    if (memoryData.lastProcessedMessageId !== nextProcessedMessageId
+        || memoryData.lastProcessedRound !== nextProcessedRound) {
+        changed = true;
+    }
+    memoryData.lastProcessedMessageId = nextProcessedMessageId;
+    memoryData.lastProcessedRound = nextProcessedRound;
     return changed || removedL0.length > 0;
 }
 
@@ -3643,7 +3649,11 @@ export function buildInjectedMemoryPrompt(
             text: farHistoryText,
             level: -1,
             anchor: false,
-            removePriority: 15,
+            // 远史承载已折叠的最早剧情；预算不足时优先精简重复/近期层级，
+            // 不要先把唯一覆盖早期轮次的编年整体删掉。
+            removePriority: 60,
+            orderStart: 0,
+            orderEnd: 0,
         });
     }
 
@@ -3655,13 +3665,21 @@ export function buildInjectedMemoryPrompt(
         // 最高层保留开头与最近一段，避免极长聊天让顶部脉络无限膨胀。
         const visibleList = lvl >= 3 ? selectTopLevelEntries(list) : list;
         visibleList.forEach((item, index) => {
+            const rangeAnchor = index === 0 || index === visibleList.length - 1;
             const anchor = lvl === MAX_MEMORY_LEVEL && index < TOP_LEVEL_ANCHOR_COUNT;
-            const removePriority = lvl === 1 ? 40 : (lvl === 2 ? 20 : (anchor ? 25 : 30));
+            // 预算收缩时先移除中段的重复细节，保留各层最早与最近阶段。
+            const removePriority = lvl === 1
+                ? (rangeAnchor ? 55 : 20)
+                : (lvl === 2
+                    ? (rangeAnchor ? 58 : 25)
+                    : (anchor ? 45 : (rangeAnchor ? 50 : 30)));
             timelineItems.push({
                 text: `• [第 ${item.roundRange} 轮阶段总览] ${String(item.text || "")}`,
                 level: lvl,
                 anchor,
                 removePriority,
+                orderStart: parseRoundRange(item.roundRange).start,
+                orderEnd: parseRoundRange(item.roundRange).end,
             });
         });
     }
@@ -3698,11 +3716,14 @@ export function buildInjectedMemoryPrompt(
     });
     if (l0List.length > 0) {
         for (const item of l0List) {
+            const range = parseRoundRange(item.roundRange);
             timelineItems.push({
                 text: `• [第 ${item.roundRange} 轮] ${String(item.text || "")}`,
                 level: 0,
                 anchor: false,
                 removePriority: 50,
+                orderStart: range.start,
+                orderEnd: range.end,
             });
         }
     }
@@ -3729,26 +3750,21 @@ export function buildInjectedMemoryPrompt(
         }));
         const safeTime = promptSafe(ledger.time || "未知");
         const safeTodoLines = promptSafe(todoLines);
-        const timelineByLevel = new Map();
-        for (const item of safeTimeline) {
-            if (!timelineByLevel.has(item.level)) timelineByLevel.set(item.level, []);
-            timelineByLevel.get(item.level).push(item.text);
-        }
-        const timelineSections = [];
-        const farLines = timelineByLevel.get(-1) || [];
-        if (farLines.length > 0) {
-            timelineSections.push(`### 远史编年（按剧情内时间整理）\n${farLines.join("\n")}`);
-        }
-        for (let lvl = maxLvl; lvl >= 1; lvl--) {
-            const lines = timelineByLevel.get(lvl) || [];
-            if (lines.length === 0) continue;
-            const title = lvl === 1 ? "阶段剧情脉络 (近期)" : "长线剧情大阶段脉络";
-            timelineSections.push(`### ${title}\n${lines.join("\n")}`);
-        }
-        const l0Lines = timelineByLevel.get(0) || [];
-        if (l0Lines.length > 0) {
-            timelineSections.push(`### 最近 L0 剧情微摘要\n${l0Lines.join("\n")}`);
-        }
+        // 注入顺序固定为剧情内“由远及近”。面板的正序/倒序只改变
+        // buildTimelineHtml 的展示数组，不能改变发给主模型的记忆顺序。
+        const orderedTimeline = safeTimeline.slice().sort((a, b) => {
+            const startA = numOr(a.orderStart, 0);
+            const startB = numOr(b.orderStart, 0);
+            if (startA !== startB) return startA - startB;
+            const endA = numOr(a.orderEnd, startA);
+            const endB = numOr(b.orderEnd, startB);
+            // 同起点时先给出覆盖大范围的高层概览，再给更细的摘要。
+            if (endA !== endB) return endB - endA;
+            return numOr(b.level, 0) - numOr(a.level, 0);
+        });
+        const timelineSections = orderedTimeline.length > 0
+            ? [`### 剧情时间线（按轮数由远及近）\n${orderedTimeline.map(item => item.text).join("\n")}`]
+            : [];
 
         const retrievedSection = safeRetrieved.length > 0
             ? `\n## 三、当前话题相关的过往回忆片段（按需唤醒）\n${safeRetrieved.map(item => item.text).join("\n")}\n`

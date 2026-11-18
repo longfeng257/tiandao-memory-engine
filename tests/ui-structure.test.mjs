@@ -238,6 +238,18 @@ test("story timeline paginates twenty entries with older and newer controls", ()
     assert.match(styleSource, /\.tiandao-story-page-btn\s*\{/);
 });
 
+test("prompt budget preserves early and recent phase anchors", () => {
+    assert.match(engineSource, /rangeAnchor \? 55 : 20/);
+    assert.match(engineSource, /rangeAnchor \? 58 : 25/);
+    assert.match(indexSource, /希望状态每轮同步时设为 1 轮/);
+});
+
+test("prompt injection keeps chronological order independent of the timeline display sort", () => {
+    assert.match(engineSource, /注入顺序固定为剧情内“由远及近”/);
+    assert.match(engineSource, /const orderedTimeline = safeTimeline[\s\S]{0,200}orderStart/);
+    assert.match(indexSource, /const displayEntries = storySortOrder === "desc"/);
+});
+
 test("story timeline defaults to descending order and exposes ascending order", () => {
     assert.match(indexSource, /let storySortOrder = "desc"/);
     assert.match(indexSource, /id="tiandao_story_sort_order"[\s\S]{0,220}<option value="desc" selected>倒序<\/option>[\s\S]{0,80}<option value="asc">正序<\/option>/);
@@ -448,6 +460,25 @@ test("embedding models have a separate fetch action and embedding-only filter", 
 test("editing an unmerged L0 leaves higher summaries untouched", () => {
     assert.match(indexSource, /const needsHierarchyRebuild = numericLevel > 0\s*\|\| isMemoryEntryCoveredByHigherLevels\(memoryData, item, 0\)/);
     assert.match(indexSource, /该范围尚未并入高层，L1～L3 未改动/);
+});
+
+test("L0 round count is editable as a single digit without live normalization", () => {
+    assert.match(indexSource, /id="tiandao_l0_chunk" type="text" inputmode="numeric" pattern="\[0-9\]\*"/);
+    assert.match(indexSource, /bindInput\("tiandao_l0_chunk", "l0RoundsPerSummary", true,[\s\S]{0,600}deferCallbackUntilCommit: true/);
+    assert.match(indexSource, /options\.selectOnFocus[\s\S]{0,180}el\.select\?\.\(\)/);
+    assert.match(indexSource, /L0 \$\{pendingBacklogCount\}\/\$\{l0Chunk\}/);
+});
+
+test("deleted summary rounds clear stale recovery errors and keep valid cursor state", () => {
+    assert.match(indexSource, /clearedDeletedRoundError = Boolean/);
+    assert.match(engineSource, /lastProcessedMessageId !== nextProcessedMessageId[\s\S]{0,180}changed = true/);
+});
+
+test("summary failure banner can be dismissed without deleting pending rounds", () => {
+    assert.match(indexSource, /id="tiandao_story_dismiss_error_btn"/);
+    assert.match(indexSource, /memoryData.lastSummaryError = null;[\s\S]{0,220}saveChatMemory()/);
+    assert.match(indexSource, /未归档轮次仍保留/);
+    assert.match(indexSource, /normalPartialBatch/);
 });
 
 test("L0 grouping has automatic and manual modes with a configurable round count", () => {
