@@ -8,6 +8,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const indexSource = readFileSync(join(root, "index.js"), "utf8");
 const engineSource = readFileSync(join(root, "memory-engine.js"), "utf8");
 const styleSource = readFileSync(join(root, "style.css"), "utf8");
+const historySource = readFileSync(join(root, "history-builder.js"), "utf8");
 
 test("widget no longer renders hardcoded model shortcut chips", () => {
     assert.doesNotMatch(indexSource, /data-model="/);
@@ -171,11 +172,12 @@ test("appearance settings are isolated on their own page and persist neutral def
     assert.match(styleSource, /:root\[data-sw-font="sans"\]/);
 });
 
-test("memory depth and safety token cap stay internal", () => {
+test("history position is fixed and memory has no token-budget trimming", () => {
     assert.doesNotMatch(indexSource, /id="tiandao_max_level"/);
     assert.doesNotMatch(indexSource, /id="tiandao_memory_budget"/);
     assert.match(engineSource, /const MAX_MEMORY_LEVEL = 3/);
-    assert.match(engineSource, /tokenBudget = 5000/);
+    assert.doesNotMatch(engineSource, /tokenBudget = 5000|truncatePromptToBudget|fittedTimeline/);
+    assert.doesNotMatch(indexSource, /id="tiandao_inject_(?:pos|depth|role)"/);
     assert.match(engineSource, /function capTopLevelEntries\(/);
 });
 
@@ -238,9 +240,9 @@ test("story timeline paginates twenty entries with older and newer controls", ()
     assert.match(styleSource, /\.tiandao-story-page-btn\s*\{/);
 });
 
-test("prompt budget preserves early and recent phase anchors", () => {
-    assert.match(engineSource, /rangeAnchor \? 55 : 20/);
-    assert.match(engineSource, /rangeAnchor \? 58 : 25/);
+test("history preserves early coverage without a budget trim loop", () => {
+    assert.match(historySource, /selectHistoricalEntries/);
+    assert.doesNotMatch(engineSource, /while \(estimatePromptTokens\(prompt\)/);
     assert.match(indexSource, /希望状态每轮同步时设为 1 轮/);
 });
 
@@ -386,7 +388,7 @@ test("switching API profiles clears stale model options", () => {
 
 test("todo save failure restores the previous completion state", () => {
     assert.match(indexSource, /const previousCompletion = \{/);
-    assert.match(indexSource, /Object\.assign\(todo, previousCompletion\)/);
+    assert.match(indexSource, /Object\.assign\(currentTodo, previousCompletion\)/);
     assert.match(indexSource, /待办状态已保存，但刷新注入失败/);
 });
 
@@ -429,7 +431,7 @@ test("ledger items can be deleted after confirmation and refresh injection", () 
     assert.match(indexSource, /class="tiandao-item-delete"/);
     assert.match(indexSource, /async function deleteLedgerItem\(characterName, itemKind, itemIndex, button = null\)/);
     assert.match(indexSource, /只会修改当前状态账本，不会改动历史剧情/);
-    assert.match(indexSource, /info\[field\] = previousList/);
+    assert.match(indexSource, /currentInfo\[field\] = previousList/);
     assert.match(indexSource, /await refreshPromptInjection\("", \{ skipRetrieval: true \}\)/);
     assert.match(styleSource, /\.tiandao-item-delete:hover:not\(:disabled\)/);
 });
@@ -512,9 +514,9 @@ test("message deletion reconciles surviving summaries instead of rolling back th
 test("resummarize expands overlapping L0 and hidden raw rounds keep their summary", () => {
     assert.match(indexSource, /expandResummarizeRanges\(requestedRanges, existingL0\)/);
     assert.match(indexSource, /replaceL0EntryInMemory\(memoryData, target, replacement\)/);
-    assert.match(indexSource, /recentRawRoundNumbers:\s*recentRawRounds > 0[\s\S]{0,180}getSendableRawRoundNumbers\(chat, settings, currentRound, recentRawRounds\)/);
-    assert.match(indexSource, /function getSendableRawRoundNumbers\(chat, settings, currentRound = 0, recentRawRounds = 0\)/);
-    assert.match(indexSource, /msg\.is_system \|\| !String\(msg\.mes \|\| ""\)\.trim\(\)/);
+    assert.match(historySource, /Never drop an unarchived gap/);
+    assert.match(historySource, /entry\.startMessageId < rawStart && entry\.endMessageId >= rawStart/);
+    assert.match(historySource, /rawStart = Math\.min\(rawStart, turn\.window\.startMessageId\)/);
     assert.match(indexSource, /eventTypes\.MESSAGE_SWIPED[\s\S]{0,1800}scheduleAfterReplySwipeRepair\(getChatKey\(\)\)/);
     assert.match(indexSource, /clearEntryEmbedding\(item\)/);
     assert.match(indexSource, /embeddingDimension: archiveEntry\.embeddingDimension/);
@@ -532,18 +534,6 @@ test("manual backfill ignores stale summaries after chat mutations", () => {
     );
 });
 
-test("story timeline mirrors prompt visibility for hidden raw rounds", () => {
-    assert.match(indexSource, /function isL0FullyCoveredByRaw\(/);
-    assert.match(
-        indexSource,
-        /rawRoundNumbers = rawKeep > 0[\s\S]{0,140}getSendableRawRoundNumbers\(chat, settings, currentRound, rawKeep\)/,
-    );
-    assert.match(
-        indexSource,
-        /isL0FullyCoveredByRaw\(it, rawWindowStart, currentRound, rawRoundNumbers\)/,
-    );
-});
-
 test("legacy settings backups strip nested API keys before restore", () => {
     assert.match(indexSource, /function sanitizeSettingsBackup\(backup\)/);
     assert.match(indexSource, /safeProfile\.apiKey !== undefined[\s\S]{0,120}delete safeProfile\.apiKey/);
@@ -553,7 +543,7 @@ test("legacy settings backups strip nested API keys before restore", () => {
 
 test("metadata saves have concrete fallbacks and failed destructive writes roll back", () => {
     assert.match(indexSource, /async function saveChatMemory\(\)[\s\S]{0,500}ctx\.saveChat/);
-    assert.match(indexSource, /savers\.push\(\(\) => ctx\.saveMetadataDebounced\(\)\)/);
+    assert.doesNotMatch(indexSource, /savers\.push\(\(\) => ctx\.saveMetadataDebounced\(\)\)/);
     assert.match(indexSource, /for \(const save of savers\)[\s\S]{0,220}await save\(\)/);
     assert.match(
         indexSource,
@@ -578,12 +568,10 @@ test("chat mutations abort in-flight summaries instead of wasting the request", 
 
 test("long-chat hot paths reuse normalized memory and cap raw scanning", () => {
     assert.match(indexSource, /cleanupPlaceholderCharacters\(memoryData, ctx\.name1 \|\| "", true\)/);
-    assert.match(indexSource, /retrieveRelevantArchivedMemories\([\s\S]{0,180}\{ skipNormalize: true \}/);
+    assert.match(indexSource, /retrieveRelevantArchivedMemories\([\s\S]{0,250}\{ skipNormalize: true,/);
     assert.match(indexSource, /pruneStaleCharacters\([\s\S]{0,180}skipNormalize: true/);
-    assert.match(
-        indexSource,
-        /function getSendableRawRoundNumbers\([\s\S]{0,500}Math\.max\(1, currentRound - recentRawRounds \+ 1\)/,
-    );
+    assert.match(engineSource, /messageTextHashCache/);
+    assert.match(indexSource, /currentMemoryReference\(\) === memoryData/);
     assert.match(indexSource, /renderStoryTimeline\(memoryData\)/);
     assert.match(engineSource, /function cloneMemoryForUpdate\(memoryData, skipNormalize = false\)/);
     assert.match(engineSource, /cloneMemoryForUpdate\(memoryData, true\)/);

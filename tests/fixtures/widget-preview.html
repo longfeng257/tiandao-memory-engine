@@ -1,0 +1,51 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>溯微 · 本地测试页</title><link rel="stylesheet" href="/style.css"><style>body{font:16px system-ui;background:#e8ece9;padding:30px;color:#2a332f}main{max-width:650px}button{cursor:pointer;padding:8px;margin:5px}#fixture_log{white-space:pre-wrap;overflow-wrap:anywhere}#fixture_controls{display:flex;flex-wrap:wrap}</style><body><main><h1>溯微本地交互测试</h1><p>全部为虚构测试数据，无 API 密钥；不接触实际酒馆或用户存档。</p><div id="fixture_controls"><button id="refresh">刷新本地注入</button><button id="continue">续写预览</button><button id="swipe">重 Roll 预览</button><button id="switch">切换测试聊天</button><button id="edit">模拟原文变化</button><button id="fail">切换保存失败</button><button id="mobile">窄屏预览提示</button></div><pre id="fixture_log"></pre><div id="chat"></div></main>
+<script type="module">
+import { createEmptyMemoryData, DEFAULT_SETTINGS } from "/memory-engine.js";
+let current = 0, failSave = false;
+const makeContext = id => {
+ const memory = createEmptyMemoryData();
+ const chat = [];
+ for (let round = 1; round <= 14; round++) {
+  chat.push({is_user:true,name:"旅人",mes:"旅人来到城门，第"+round+"轮。"});
+  chat.push({is_user:false,name:"守卫",mes:"守卫讲述第"+round+"轮的事。"});
+  const item = {id:"L0_"+id+"_"+round,level:0,roundRange:String(round),startMessageId:round*2-2,endMessageId:round*2-1,text:round===1?"守卫与旅人约定，次日归还铜钥匙。":"第"+round+"轮：旅人在城中搜集线索，和守卫交谈。",keywords:["守卫","约定"],postStateSnapshot:{time:"清晨",characters:{},todosAndPromises:[]}};
+  memory.archivePool.push(item);
+ }
+ memory.levels[0]=memory.archivePool.slice(-6);
+ memory.levels[1]=[{id:"L1_phase",level:1,roundRange:"1-8",text:"旅人抵达城门，与守卫结识并交换信息。"}];
+ memory.archivePool[0].pinned=true;
+ memory.lastProcessedRound=14;memory.lastProcessedMessageId=27;
+ memory.stateLedger={time:"次日清晨",characters:{旅人:{location:"城门",wear:"布衣",statusAndAction:"等待",inventory:["铜钥匙"],removedItemsLock:[],present:true}},todosAndPromises:[{id:"promise",text:"把铜钥匙还给守卫",completed:false}]};
+ const listeners=new Map();
+ const ctx={name1:"旅人",name2:"守卫",chat,chatId:id,characterId:0,chatMetadata:{tiandao_memory:memory},extensionSettings:{"tiandao-memory-engine":{...DEFAULT_SETTINGS,autoSummarizePerTurn:false,enableRetrieval:false,autoHideOldMessages:true}},eventTypes:{CHAT_CHANGED:"chat_changed",MESSAGE_EDITED:"message_edited",MESSAGE_SWIPED:"message_swiped",MESSAGE_DELETED:"message_deleted"},eventSource:{on:(name,fn)=>listeners.set(name,fn)},getCurrentChatId:()=>id,saveSettingsDebounced:()=>{},saveMetadata:async()=>{if(failSave)throw Error("测试保存失败");log();},setExtensionPrompt:(key,text)=>{ctx.injected=text;log();}};
+ ctx.emit=async (name,...args)=>listeners.get(name)?.(...args);
+ return ctx;
+};
+function log(){const ctx=contexts[current];document.getElementById("fixture_log").textContent="聊天 "+ctx.chatId+" · 恢复点 "+(ctx.chatMetadata.suwei_memory_recovery_v1?.length||0)+" · 旧注入字符 "+(ctx.injected?.length||0)+" · 替换记录 "+(ctx.lastHistory?.length||0)+" · 保存失败 "+failSave;}
+const contexts=[makeContext("test-a"),makeContext("test-b")];
+// A single event bus models the host's global CHAT_CHANGED event.
+contexts[1].eventSource=contexts[0].eventSource;
+window.SillyTavern={getContext:()=>contexts[current]};
+window.fetch=async()=>{throw Error("本地预览禁止网络 API 请求");};
+async function runPreview(type = "normal") {
+ const ctx=contexts[current];
+ const before=JSON.stringify(ctx.chat);
+ const core=ctx.chat.filter(message=>!message.is_system||Array.isArray(message.extra?.tool_invocations)).map((message,index)=>({...message,index}));
+ if(type==="swipe")core.pop();
+ let aborted=false;
+ await globalThis.tiandaoMemoryInterceptor(core,0,()=>{aborted=true;},type);
+ if(JSON.stringify(ctx.chat)!==before)throw Error("原始聊天被改变");
+ if(aborted)throw Error("替换被中止");
+ ctx.lastHistory=core;log();
+}
+await import("/index.js");
+await runPreview();
+log();
+document.getElementById("refresh").onclick=async()=>{await runPreview();log();};
+document.getElementById("continue").onclick=()=>runPreview("continue");
+document.getElementById("swipe").onclick=()=>runPreview("swipe");
+document.getElementById("switch").onclick=async()=>{current=1-current;await contexts[0].emit("chat_changed");log();};
+document.getElementById("edit").onclick=async()=>{contexts[current].chat[0].mes+="（修改过）";await contexts[0].emit("message_edited",0);await runPreview();log();};
+document.getElementById("fail").onclick=()=>{failSave=!failSave;log();};
+document.getElementById("mobile").onclick=()=>{document.getElementById("fixture_log").textContent+="\n请调整浏览器视口检查窄屏布局。";};
+</script></body></html>

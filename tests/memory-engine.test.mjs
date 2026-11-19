@@ -49,6 +49,8 @@ import {
     mergeEditedMemoryWithEmbeddings,
     resolveEmbeddingModelName,
     maskSensitiveText,
+    setMemoryEntryPinned,
+    getRuntimeDiagnostics,
 } from "../memory-engine.js";
 
 function memoryWithRounds(lastRound = 5) {
@@ -486,6 +488,7 @@ test("merge failure keeps memory unchanged and retry does not duplicate L0", asy
         endMessageId: 15,
         userName: "我",
         charName: "小明",
+        shouldCommit: () => true,
         dialogueText: "第八轮对话",
     };
 
@@ -733,7 +736,7 @@ test("rebuilding hierarchy uses edited L0 text", async () => {
     data.levels[0][0].text = "编辑后的第一轮";
     stubChatCompletion("重建摘要");
 
-    await rebuildMemoryHierarchy(SETTINGS, data);
+    await rebuildMemoryHierarchy(SETTINGS, data, () => true);
     assert.ok(data.levels[0].length >= 6);
     assert.ok(data.levels[1].length > 0);
     assert.ok(data.levels[2].length > 0);
@@ -778,7 +781,7 @@ test("far history is folded into one story-time summary", async () => {
     assert.equal(data.farHistory.latestRound, 10);
 });
 
-test("memory prompt respects the configured token budget", () => {
+test("memory prompt preserves full contents without a fixed token budget", () => {
     const data = createEmptyMemoryData();
     data.stateLedger = {
         time: "未知",
@@ -816,7 +819,7 @@ test("memory prompt respects the configured token budget", () => {
     }
 
     const prompt = buildInjectedMemoryPrompt(data, [], "", 1000);
-    assert.ok(estimatePromptTokens(prompt) <= 1000);
+    assert.ok(estimatePromptTokens(prompt) > 1000);
 });
 
 test("injected timeline is always ordered from distant rounds to recent rounds", () => {
@@ -838,7 +841,7 @@ test("injected timeline is always ordered from distant rounds to recent rounds",
     assert.deepEqual(positions, positions.slice().sort((a, b) => a - b));
 });
 
-test("far-history coverage survives timeline trimming before newer L1 summaries", () => {
+test("far history and every newer L1 survive without budget trimming", () => {
     const data = createEmptyMemoryData();
     data.stateLedger = { time: "未知", characters: {}, todosAndPromises: [] };
     data.farHistory.text = "第1-335轮早期剧情的压缩远史";
@@ -851,10 +854,10 @@ test("far-history coverage survives timeline trimming before newer L1 summaries"
 
     const prompt = buildInjectedMemoryPrompt(data, [], "", 1000);
     assert.match(prompt, /第1-335轮早期剧情的压缩远史/);
-    assert.ok(estimatePromptTokens(prompt) <= 1000);
+    assert.ok(estimatePromptTokens(prompt) > 1000);
 });
 
-test("timeline budget trimming keeps earliest and latest L1 coverage before middle details", () => {
+test("all early middle and recent phase entries remain without budget trimming", () => {
     const data = createEmptyMemoryData();
     data.stateLedger = { time: "未知", characters: {}, todosAndPromises: [] };
     data.levels[1] = Array.from({ length: 8 }, (_, index) => ({
@@ -871,7 +874,7 @@ test("timeline budget trimming keeps earliest and latest L1 coverage before midd
     const prompt = buildInjectedMemoryPrompt(data, [], "", 1000);
     assert.match(prompt, /最早阶段锚点/);
     assert.match(prompt, /最近阶段锚点/);
-    assert.ok(estimatePromptTokens(prompt) <= 1000);
+    assert.ok(estimatePromptTokens(prompt) > 1000);
 });
 
 test("grouped L0 text is injected once rather than duplicated per round", () => {
@@ -1051,6 +1054,7 @@ test("state snapshots use keyframes plus deltas without losing rollback accuracy
         endMessageId: 3,
         userName: "我",
         charName: "小明",
+        shouldCommit: () => true,
         dialogueText: "第二轮对话",
     });
 
@@ -1387,6 +1391,7 @@ test("single-turn summaries discourage and strip literary elevation", async () =
             endMessageId: 1,
             userName: "玩家",
             charName: "角色",
+            shouldCommit: () => true,
             dialogueText: "阿青把钥匙交给守卫。",
         },
     );
@@ -1436,6 +1441,7 @@ test("multi-round L0 summaries store one grouped round range and final state", a
             endMessageId: 11,
             userName: "玩家",
             charName: "角色",
+            shouldCommit: () => true,
             dialogueText: "【第 3 轮】...\n\n【第 4 轮】...\n\n【第 5 轮】...\n\n【第 6 轮】...",
         },
     );
@@ -1523,6 +1529,7 @@ test("summary retries malformed model output without duplicating L0", async () =
             endMessageId: 1,
             userName: "旁观者",
             charName: "群像卡",
+            shouldCommit: () => true,
             dialogueText: "【旁白】：阿青在门口等待。",
         },
     );
@@ -2409,6 +2416,7 @@ test("timeout errors are not retried to avoid duplicate billing", async () => {
                     endMessageId: 1,
                     userName: "旁观者",
                     charName: "群像卡",
+                    shouldCommit: () => true,
                     dialogueText: "【旁白】：阿青在门口等待。",
                 },
             ),
@@ -2445,6 +2453,7 @@ test("real request timeout settles and is not retried when the transport ignores
                     endMessageId: 1,
                     userName: "旁观者",
                     charName: "群像卡",
+                    shouldCommit: () => true,
                     dialogueText: "【旁白】：阿青在门口等待。",
                 },
             ),
@@ -2627,6 +2636,7 @@ test("first archived L0 always stores a replayable state keyframe", async () => 
         endMessageId: 5,
         userName: "我",
         charName: "小明",
+        shouldCommit: () => true,
         dialogueText: "第一轮到第三轮的对话",
     });
 
@@ -2792,6 +2802,7 @@ test("new summaries record which embedding model produced their vectors", async 
             endMessageId: 1,
             userName: "我",
             charName: "小明",
+            shouldCommit: () => true,
             dialogueText: "第一轮对话",
         });
         const entry = data.archivePool[0];
@@ -2968,4 +2979,181 @@ test("provider errors mask configured and key-shaped secrets", async () => {
             && !error.message.includes(secret)
             && error.message.includes("sk-...ue"),
     );
+});
+
+
+test("normalization never substitutes round ids into the floor cursor", () => {
+    const data = memoryWithRounds(1);
+    data.archivePool[0].roundRange = "900";
+    delete data.archivePool[0].endMessageId;
+    data.lastProcessedMessageId = 81;
+    normalizeMemoryData(data);
+    assert.equal(data.lastProcessedMessageId, 81);
+    data.archivePool.push({ id: "valid", level: 0, roundRange: "901", endMessageId: 19, text: "已知楼层" });
+    normalizeMemoryData(data);
+    assert.equal(data.lastProcessedMessageId, 19);
+    assert.equal(data.lastProcessedRound, 901);
+});
+
+test("null and blank floor ids are not normalized into floor zero", () => {
+    for (const invalid of [null, "", "no", -1]) {
+        const data = memoryWithRounds(1);
+        data.archivePool[0].endMessageId = invalid;
+        data.lastProcessedMessageId = 81;
+        normalizeMemoryData(data);
+        assert.equal(data.lastProcessedMessageId, 81);
+    }
+});
+
+test("fingerprints detect same-length edits beyond the first 120 characters", () => {
+    const message = { name: "角色", mes: "相同前文".repeat(100) + "甲", is_user: false };
+    const before = buildChatMessageFingerprint([message]);
+    message.mes = message.mes.slice(0, -1) + "乙";
+    assert.notDeepEqual(buildChatMessageFingerprint([message]), before);
+});
+
+test("deletion fallback preserves the unresolved surviving delta chain", () => {
+    const data = memoryWithRounds(2);
+    data.archivePool[0].roundRange = "5";
+    delete data.archivePool[0].postStateSnapshot;
+    data.archivePool[0].postStateDelta = { t: "o", v: { time: { t: "v", v: "old" } } };
+    const chat = [{ is_user: true, mes: "u1" }, { is_user: false, mes: "a1" }, { is_user: true, mes: "u2" }, { is_user: false, mes: "a2" }];
+    const previous = buildChatMessageFingerprint(chat);
+    chat.splice(2, 2);
+    const delta = structuredClone(data.archivePool[0].postStateDelta);
+    reconcileMemoryAfterMessageDeletion(data, chat, previous, buildChatMessageFingerprint(chat), false, { skipNormalize: true });
+    assert.deepEqual(data.archivePool[0].postStateDelta, delta);
+    assert.equal(data.archivePool[0].postStateSnapshot, undefined);
+    assert.equal(data.stateLedger.time, "第2轮");
+});
+
+test("missing commit guards reject before any paid requests", async () => {
+    const data = memoryWithRounds(1);
+    const before = structuredClone(data);
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = () => { throw new Error("must not request"); };
+    try {
+        await assert.rejects(() => summarizeSingleTurn(SETTINGS, data, { roundNumber: 2 }), /requires shouldCommit/);
+        await assert.rejects(() => rebuildMemoryHierarchy(SETTINGS, data), /requires shouldCommit/);
+        assert.deepEqual(data, before);
+    } finally { globalThis.fetch = previousFetch; }
+});
+
+test("a stale summary guard prevents embedding and cascade requests", async () => {
+    const data = memoryWithRounds(7);
+    let valid = true, calls = 0;
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+        calls++;
+        valid = false;
+        return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ l0_summary: "new", keywords: [], stateLedger: {} }) } }] }), { headers: { "Content-Type": "application/json" } });
+    };
+    try {
+        const result = await summarizeSingleTurn(SETTINGS, data, { roundNumber: 8, startMessageId: 14, endMessageId: 15, dialogueText: "新剧情", shouldCommit: () => valid });
+        assert.equal(result, null);
+        assert.equal(calls, 1);
+        assert.equal(data.archivePool.length, 7);
+    } finally { globalThis.fetch = previousFetch; }
+});
+
+test("pins synchronize active and archived copies and enforce the twelve-entry limit", () => {
+    const data = memoryWithRounds(14);
+    data.levels[0] = structuredClone(data.levels[0]);
+    for (const item of data.archivePool.slice(0, 12)) assert.equal(setMemoryEntryPinned(data, item, true).ok, true);
+    assert.equal(data.levels[0][0].pinned, true);
+    assert.equal(setMemoryEntryPinned(data, data.archivePool[12], true).reason, "limit");
+    assert.equal(setMemoryEntryPinned(data, data.archivePool[0], false).ok, true);
+    assert.equal(setMemoryEntryPinned(data, data.archivePool[12], true).ok, true);
+});
+
+test("normalization caps imported pins without dropping the underlying archive", () => {
+    const data = memoryWithRounds(18);
+    for (const item of data.archivePool) item.pinned = true;
+    normalizeMemoryData(data);
+    assert.equal(data.archivePool.filter(item => item.pinned).length, 12);
+    assert.equal(data.archivePool.length, 18);
+});
+
+test("an archived pin remains injected after merging and is not duplicated by retrieval", () => {
+    const data = memoryWithRounds(10);
+    data.archivePool[0].text = "守卫许诺归还铜钥匙";
+    setMemoryEntryPinned(data, data.archivePool[0], true);
+    data.levels[0] = data.levels[0].slice(8);
+    data.levels[1].push({ id: "phase", level: 1, roundRange: "1-8", text: "阶段脉络" });
+    normalizeMemoryData(data);
+    const prompt = buildInjectedMemoryPrompt(data, [data.archivePool[0]], "", 5000);
+    assert.equal(prompt.split("守卫许诺归还铜钥匙").length - 1, 1);
+    assert.match(prompt, /固定记忆/);
+    const copy = normalizeMemoryData(JSON.parse(JSON.stringify(data)));
+    assert.equal(copy.archivePool[0].pinned, true);
+    rollbackMemoryFromMessageIndex(copy, 0);
+    assert.equal(copy.archivePool.filter(item => item.pinned).length, 0);
+});
+
+test("pinned L0 and all unpinned details survive without budget trimming", () => {
+    const data = memoryWithRounds(20);
+    for (const item of data.archivePool) item.text = "普通冗长剧情".repeat(40);
+    data.archivePool[0].text = "务必保留的铜钥匙约定";
+    setMemoryEntryPinned(data, data.archivePool[0], true);
+    const prompt = buildInjectedMemoryPrompt(data, [], "", 1000);
+    assert.match(prompt, /务必保留的铜钥匙约定/);
+    assert.ok(estimatePromptTokens(prompt) > 1000);
+});
+
+test("explicit L0 resummarizing preserves the pin on the replacement range", () => {
+    const data = memoryWithRounds(3);
+    setMemoryEntryPinned(data, data.archivePool[1], true);
+    const replacement = { id: "new", level: 0, roundRange: "2", text: "new", startMessageId: 2, endMessageId: 3 };
+    replaceL0EntryInMemory(data, data.archivePool[1], replacement);
+    assert.equal(replacement.pinned, true);
+});
+
+test("query vector cache coalesces requests and expires while ranking live memory", async t => {
+    const data = memoryWithRounds(2);
+    data.levels[0] = [];
+    data.archivePool.forEach(item => Object.assign(item, { keywords: ["铜钥匙"], embedding: [1, 0], embeddingModel: "query-cache", embeddingDimension: 2 }));
+    const settings = { enableRetrieval: true, useEmbeddingApi: true, embeddingApiUrl: "https://cache.test/v1", embeddingApiKey: "cache-key", embeddingModel: "query-cache" };
+    let calls = 0, now = 1_800_000_000_000;
+    t.mock.method(Date, "now", () => now);
+    t.mock.method(globalThis, "fetch", async () => { calls++; return new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] })); });
+    const both = await Promise.all([retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { skipNormalize: true }), retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { skipNormalize: true })]);
+    assert.equal(calls, 1);
+    assert.ok(both[0].length > 0);
+    data.archivePool = [];
+    assert.deepEqual(await retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { skipNormalize: true }), []);
+    data.archivePool = [both[0][0]];
+    now += 10 * 60_000 + 1;
+    await retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { skipNormalize: true });
+    assert.equal(calls, 2);
+    await retrieveRelevantArchivedMemories({ ...settings, embeddingApiUrl: "https://other-cache.test/v1" }, data, "铜钥匙", { skipNormalize: true });
+    assert.equal(calls, 3);
+    await retrieveRelevantArchivedMemories({ ...settings, embeddingApiKey: "new-key" }, data, "铜钥匙", { skipNormalize: true });
+    assert.equal(calls, 4);
+});
+
+test("embedding auth failure is visible and does not disable a different provider", async t => {
+    let calls = 0;
+    t.mock.method(globalThis, "fetch", async () => { calls++; return calls === 1 ? new Response("no", { status: 401 }) : new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] })); });
+    const settings = { useEmbeddingApi: true, embeddingApiUrl: "https://auth-failure.test/v1", embeddingApiKey: "key", embeddingModel: "auth" };
+    assert.equal(await getEmbeddingVector(settings, "text"), null);
+    assert.equal(getRuntimeDiagnostics().lastEmbeddingFailure.status, 401);
+    assert.equal(await getEmbeddingVector(settings, "text"), null);
+    assert.equal(calls, 1);
+    assert.deepEqual(await getEmbeddingVector({ ...settings, embeddingApiUrl: "https://auth-other.test/v1" }, "text"), [1, 0]);
+    assert.equal(calls, 2);
+});
+
+test("runtime stats record reported usage and leave missing usage unknown", async t => {
+    const before = getRuntimeDiagnostics();
+    let calls = 0;
+    t.mock.method(globalThis, "fetch", async () => {
+        calls++;
+        return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }], ...(calls === 1 ? { usage: { prompt_tokens: 12, completion_tokens: 7 } } : {}) }));
+    });
+    assert.equal(await callIndependentLLM(SETTINGS, []), "ok");
+    assert.equal(await callIndependentLLM(SETTINGS, []), "ok");
+    const after = getRuntimeDiagnostics();
+    assert.equal(after.promptTokens - before.promptTokens, 12);
+    assert.equal(after.completionTokens - before.completionTokens, 7);
+    assert.equal(after.usageUnknown - before.usageUnknown, 1);
 });
