@@ -1,4 +1,15 @@
-import { buildInjectedMemoryPrompt, buildRoundMessageIndex, computeHiddenMessageCutoff, estimatePromptTokens, numOr, parseRoundRange, resolveStateLedgerAfterEntry } from "./memory-engine.js";
+import { buildStateUpdateInstruction, stripStateUpdateMessage } from "./state-protocol.js";
+import { sanitizeSummaryFlourish, buildInjectedMemoryPrompt, buildRoundMessageIndex, computeHiddenMessageCutoff, estimatePromptTokens, numOr, parseRoundRange, resolveStateLedgerAfterEntry, getStateLedgerAtMessage, resolveStateUpdateMode } from "./memory-engine.js";
+
+const historyFactsCache = new WeakMap();
+function hasHistoricalFacts(item) {
+    const text = String(item.text || '');
+    const cached = historyFactsCache.get(item);
+    if (cached?.text === text) return cached.hasFacts;
+    const hasFacts = Boolean(sanitizeSummaryFlourish(text, Infinity));
+    historyFactsCache.set(item, { text, hasFacts });
+    return hasFacts;
+}
 
 // Bind the host's preprocessed copies to source positions, never to filtered array offsets.
 export function bindCoreHistory(coreChat, fullChat) {
@@ -18,32 +29,48 @@ export function bindCoreHistory(coreChat, fullChat) {
     });
 }
 
-function selectHistoricalEntries(memory, beforeRound, forcedDetails) {
-    const overlapsDetail = item => forcedDetails.some(detail => {
-        const a = parseRoundRange(item.roundRange), b = parseRoundRange(detail.roundRange);
-        return a.start <= b.end && b.start <= a.end;
-    });
-    const candidates = [...(memory.archivePool || [])];
-    for (let level = 1; level <= 3; level++) {
-        candidates.push(...(memory.levels?.[level] || []).filter(item => !overlapsDetail(item)));
+function selectHistoricalEntries(memory, eligibleTurns, archive) {
+    const limit = eligibleTurns.length;
+    const candidates = archive.map(item => ({ item, rank: 0 }));
+    for (let rank = 1; rank <= 3; rank++) {
+        for (const item of memory.levels?.[rank] || []) candidates.push({ item, rank });
     }
-    if (memory.farHistory?.text) {
-        const item = { id: 'suwei-far-history', level: -1, roundRange: '1-' + memory.farHistory.latestRound, text: memory.farHistory.text };
-        if (!overlapsDetail(item)) candidates.push(item);
-    }
-    candidates.sort((a, b) => {
-        const left = parseRoundRange(a.roundRange), right = parseRoundRange(b.roundRange);
-        return left.start - right.start || right.end - left.end || numOr(b.level, 0) - numOr(a.level, 0);
+    const far = memory.farHistory;
+    if (far?.text && far.latestRound >= (far.earliestRound || 1)) candidates.push({
+        item: { roundRange: `${far.earliestRound || 1}-${far.latestRound}`, text: far.text }, rank: 4,
     });
-    let covered = 0;
+    const byStart = new Map();
+    for (const { item, rank } of candidates) {
+        const { start, end } = parseRoundRange(item.roundRange);
+        if (start < 1 || end > limit || !hasHistoricalFacts(item)) continue;
+        if (rank === 0 && (item.endMessageId !== eligibleTurns[end - 1]?.idx
+            || item.startMessageId > eligibleTurns[start - 1]?.window.startMessageId
+            || !Number.isInteger(item.startMessageId))) continue;
+        if (!byStart.has(start)) byStart.set(start, []);
+        byStart.get(start).push({ item, rank, end });
+    }
+    // Tile a contiguous prefix, minimizing L0 coverage before preferring higher tiers.
+    const paths = [{ cost: [0, 0, 0, 0, 0, 0] }];
+    const isBetter = (left, right) => {
+        const difference = left.findIndex((value, i) => value !== right[i]);
+        return difference >= 0 && left[difference] < right[difference];
+    };
+    for (let start = 1; start <= limit; start++) {
+        const previous = paths[start - 1];
+        if (!previous) continue;
+        for (const candidate of byStart.get(start) || []) {
+            const { rank, end } = candidate;
+            const cost = previous.cost.slice();
+            if (!rank) cost[0] += end - start + 1;
+            else cost[5 - rank] -= end - start + 1;
+            cost[5]++;
+            if (!paths[end] || isBetter(cost, paths[end].cost)) paths[end] = { cost, previous, candidate };
+        }
+    }
+    const covered = paths.length - 1;
     const selected = [];
-    for (const item of candidates) {
-        const range = parseRoundRange(item.roundRange);
-        if (range.end > beforeRound || range.start <= covered) continue;
-        selected.push(item);
-        covered = range.end;
-    }
-    return selected;
+    for (let path = paths[covered]; path?.candidate; path = path.previous) selected.push(path.candidate);
+    return { selected: selected.reverse(), covered };
 }
 
 function narrator(text, kind, sourceRound) {
@@ -69,23 +96,15 @@ export function buildChatHistoryReplacement(memory, fullChat, coreChat, settings
     let rawStart = settings.autoHideOldMessages
         ? computeHiddenMessageCutoff(fullChat.slice(0, generationEnd + 1), Math.max(1, numOr(settings.keepRecentRoundsCount, 5)), memory.lastProcessedMessageId, settings.includeNativeHidden)
         : 0;
-    // Never drop an unarchived gap, nor split a multi-round summary across the raw boundary.
-    const orderedArchive = archive.slice().sort((a, b) => a.startMessageId - b.startMessageId);
-    let archiveIndex = 0;
-    for (const turn of turns) {
-        if (turn.idx >= rawStart) break;
-        while (archiveIndex < orderedArchive.length && orderedArchive[archiveIndex].endMessageId < turn.idx) archiveIndex++;
-        const entry = orderedArchive[archiveIndex];
-        if (!entry || entry.startMessageId > turn.window.startMessageId || entry.endMessageId < turn.idx) {
-            rawStart = Math.min(rawStart, turn.window.startMessageId); break;
-        }
-    }
-    for (const entry of orderedArchive) {
-        if (entry.startMessageId < rawStart && entry.endMessageId >= rawStart) rawStart = Math.max(0, entry.startMessageId);
-    }
+    const eligibleTurns = turns.filter(turn => turn.idx < rawStart);
+    const { selected, covered: pastRound } = selectHistoricalEntries(memory, eligibleTurns, archive);
+    if (pastRound < eligibleTurns.length) rawStart = eligibleTurns[pastRound].window.startMessageId;
     // Other extensions' synthetic messages have no source position and must be retained.
-    const raw = bound.filter(item => !Number.isInteger(item.sourceIndex) || item.sourceIndex >= rawStart);
-    const pastRound = turns.filter(turn => turn.idx < rawStart).at(-1)?.round || 0;
+    const raw = bound.filter(item => !Number.isInteger(item.sourceIndex) || item.sourceIndex >= rawStart)
+        .map(item => {
+            const message = stripStateUpdateMessage(item.message, fullChat[item.sourceIndex]);
+            return message === item.message ? item : { ...item, message };
+        });
     const detailById = new Map();
     for (const item of [...(memory.archivePool || []).filter(item => item.pinned), ...retrieved]) {
         if (!Number.isInteger(item.endMessageId) || item.endMessageId > generationEnd) continue;
@@ -93,44 +112,45 @@ export function buildChatHistoryReplacement(memory, fullChat, coreChat, settings
     }
     const details = [...detailById.values()];
     const pastDetails = details.filter(item => parseRoundRange(item.roundRange).end <= pastRound);
-    const selected = selectHistoricalEntries(memory, pastRound, pastDetails);
     const events = raw.map((item, sequence) => ({ position: Number.isInteger(item.sourceIndex) ? item.sourceIndex : item.order + 0.01, sequence, message: item.message }));
     if (selected.length) {
         const levels = { 0: [], 1: [], 2: [], 3: [] };
-        for (const item of selected) levels[Math.max(0, numOr(item.level, 0))].push(item);
-        const view = { ...memory, levels, archivePool: selected.filter(item => item.pinned), farHistory: {} };
-        const text = buildInjectedMemoryPrompt(view, [], primaryName, { omitLedger: true });
+        let farHistory;
+        for (const { item, rank } of selected) {
+            if (rank === 4) farHistory = memory.farHistory;
+            else levels[rank].push(item);
+        }
+        const text = buildInjectedMemoryPrompt({ levels, farHistory }, pastDetails, primaryName, { omitLedger: true });
         events.push({ position: -1, sequence: -1, message: narrator(text, 'history', pastRound) });
     }
     const preservesAssistantTail = ["continue", "impersonate"].includes(options.generationType);
     const rawEndIndexes = new Set(raw.map(item => item.sourceIndex));
-    for (const item of details) {
+    for (const item of details.filter(item => item.pinned)) {
         if (item.endMessageId < rawStart || !rawEndIndexes.has(item.endMessageId)
             || (preservesAssistantTail && item.endMessageId === generationEnd)) continue;
         const text = buildInjectedMemoryPrompt({ levels: { 0: [item] }, archivePool: [], farHistory: {} }, [], primaryName, { omitLedger: true });
         events.push({ position: item.endMessageId + 0.25, sequence: events.length, message: narrator(text, 'detail', item.roundRange) });
     }
-    let ledger = memory.stateLedger;
-    let ledgerEnd = memory.lastProcessedMessageId;
-    let ledgerRound = memory.lastProcessedRound;
-    if (ledgerEnd > generationEnd || (preservesAssistantTail && ledgerEnd === generationEnd)) {
-        const surviving = archive.filter(item => !preservesAssistantTail || item.endMessageId < generationEnd).sort((a, b) => a.endMessageId - b.endMessageId).at(-1);
-        ledger = surviving ? resolveStateLedgerAfterEntry(memory, surviving) : null;
-        ledgerEnd = surviving?.endMessageId ?? -1;
-        ledgerRound = surviving ? parseRoundRange(surviving.roundRange).end : 0;
-    }
+    const ledgerSource = getStateLedgerAtMessage(memory, generationEnd - (preservesAssistantTail ? 1 : 0));
+    const ledger = ledgerSource.ledger;
+    const ledgerEnd = ledgerSource.endMessageId;
+    const ledgerRound = ledgerSource.round;
     const hasLedger = ledger && (Object.keys(ledger.characters || {}).length || ledger.todosAndPromises?.some(item => !item.completed) || (ledger.time && !/^未知/.test(ledger.time)));
     if (hasLedger) {
-        const text = buildInjectedMemoryPrompt({ stateLedger: ledger }, [], primaryName, { ledgerOnly: true });
+        const text = buildInjectedMemoryPrompt({ stateLedger: ledger }, [], primaryName, { ledgerOnly: true, snapshotRound: ledgerRound });
         // A snapshot is inserted after its source round and before newer raw dialogue.
         const position = ledgerEnd >= 0 ? ledgerEnd + 0.5 : -0.5;
         events.push({ position, sequence: events.length, message: narrator(text, 'ledger', ledgerRound) });
+    }
+    if (resolveStateUpdateMode(settings) === "main_response" && !["quiet", "impersonate"].includes(options.generationType)) {
+        const protocol = narrator(buildStateUpdateInstruction(ledgerRound, true), 'state_protocol', ledgerRound);
+        events.push({ position: generationEnd + (preservesAssistantTail ? -0.1 : 1), sequence: events.length, message: protocol });
     }
     events.sort((a, b) => a.position - b.position || a.sequence - b.sequence);
     const messages = events.map(event => event.message);
     const text = formatHistoryPreview(messages);
     return { messages, text, tokens: estimatePromptTokens(text), rawStart, rawMessages: raw.length,
         memoryMessages: messages.filter(message => message.extra?.suwei_history).length,
-        retrieval: details.filter(item => retrieved.includes(item)).map(item => ({ id: item.id, roundRange: item.roundRange,
+        retrieval: details.filter(item => retrieved.includes(item) && parseRoundRange(item.roundRange).end <= pastRound).map(item => ({ id: item.id, roundRange: item.roundRange,
             reason: options.retrievalDetails?.find(detail => detail.id === item.id)?.reason || '话题相关', retainedRaw: item.endMessageId >= rawStart })) };
 }

@@ -243,7 +243,7 @@ test("story timeline paginates twenty entries with older and newer controls", ()
 test("history preserves early coverage without a budget trim loop", () => {
     assert.match(historySource, /selectHistoricalEntries/);
     assert.doesNotMatch(engineSource, /while \(estimatePromptTokens\(prompt\)/);
-    assert.match(indexSource, /希望状态每轮同步时设为 1 轮/);
+    assert.match(indexSource, /需要每轮提取状态时设为 1 轮并选择“AI 回复完成后立即总结”/);
 });
 
 test("prompt injection keeps chronological order independent of the timeline display sort", () => {
@@ -514,9 +514,9 @@ test("message deletion reconciles surviving summaries instead of rolling back th
 test("resummarize expands overlapping L0 and hidden raw rounds keep their summary", () => {
     assert.match(indexSource, /expandResummarizeRanges\(requestedRanges, existingL0\)/);
     assert.match(indexSource, /replaceL0EntryInMemory\(memoryData, target, replacement\)/);
-    assert.match(historySource, /Never drop an unarchived gap/);
-    assert.match(historySource, /entry\.startMessageId < rawStart && entry\.endMessageId >= rawStart/);
-    assert.match(historySource, /rawStart = Math\.min\(rawStart, turn\.window\.startMessageId\)/);
+    assert.match(historySource, /function selectHistoricalEntries/);
+    assert.match(historySource, /end > limit/);
+    assert.match(historySource, /rawStart = eligibleTurns\[pastRound\]\.window\.startMessageId/);
     assert.match(indexSource, /eventTypes\.MESSAGE_SWIPED[\s\S]{0,1800}scheduleAfterReplySwipeRepair\(getChatKey\(\)\)/);
     assert.match(indexSource, /clearEntryEmbedding\(item\)/);
     assert.match(indexSource, /embeddingDimension: archiveEntry\.embeddingDimension/);
@@ -579,4 +579,27 @@ test("long-chat hot paths reuse normalized memory and cap raw scanning", () => {
     assert.match(indexSource, /rollbackMemoryFromMessageIndex\(memoryData, idx, \{ skipNormalize: true \}\)/);
     assert.match(engineSource, /rollbackMemoryFromMessageIndex\(working, startMessageId, \{ skipNormalize: true \}\)/);
     assert.match(indexSource, /getSettings\(\)\.includeNativeHidden,\s*\{ skipNormalize: true \}/);
+});
+
+test('ledger render cache includes freshness even when stored state is unchanged', () => {
+    assert.match(indexSource, /const ledgerFreshness = getLedgerFreshness\(memoryData\)/);
+    assert.match(indexSource, /ledgerRenderKey = [^\n]*JSON\.stringify\(ledgerFreshness\)/);
+    assert.match(indexSource, /bodyInner\.innerHTML = buildLedgerHtml\(memoryData, ledgerFreshness\)/);
+    assert.match(styleSource, /\.tiandao-ledger-freshness\.is-stale/);
+    assert.match(indexSource, /eventTypes\.USER_MESSAGE_RENDERED, \(\) => \{[\s\S]{0,240}updateFloatingWidgetUI\(\)/);
+});
+
+test('state update modes are selectable, preserve legacy defaults and disclose paid work', () => {
+    assert.match(indexSource, /id="tiandao_state_update_mode"/);
+    assert.match(indexSource, /option value="with_summary"/);
+    assert.match(indexSource, /option value="independent"/);
+    assert.match(indexSource, /option value="main_response"/);
+    assert.match(engineSource, /stateUpdateMode: "with_summary"/);
+    assert.match(indexSource, /bindInput\("tiandao_state_update_mode", "stateUpdateMode"/);
+    assert.match(indexSource, /切换只作用于后续回复，不会自动重跑历史/);
+    assert.match(indexSource, /下一次发送才总结时则另计 L0 请求/);
+    assert.match(indexSource, /正文模式不增加独立状态请求/);
+    assert.match(indexSource, /协议区块在聊天中隐藏，发送历史时剔除，本地原始消息仍保留以便恢复/);
+    assert.match(styleSource, /details\[data-suwei-state="1"\][^}]*display: none !important/);
+    assert.match(indexSource, /stateMode !== "independent" && settings.autoSummarizePerTurn/);
 });

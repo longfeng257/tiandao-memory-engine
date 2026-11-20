@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 import * as current from "../memory-engine.js";
@@ -28,6 +29,29 @@ function fixture(api, count) {
     memory.lastProcessedRound = count;
     return { memory, chat };
 }
+function liveFixture(count) {
+    const { memory, chat } = fixture(current, count);
+    const inventory = Array.from({ length: 250 }, (_, i) => "随身道具" + (i + 1));
+    const locks = Array.from({ length: 180 }, (_, i) => "饰品" + (i + 1) + "（已摘下）");
+    memory.stateLedger = { time: "清晨", characters: { 旅人: { inventory, removedItemsLock: locks } }, todosAndPromises: [] };
+    const processed = { message: memory.lastProcessedMessageId, round: memory.lastProcessedRound };
+    memory.lastProcessedMessageId = -1;
+    memory.lastProcessedRound = 0;
+    current.ensureLiveStateStorage(memory);
+    for (let round = 1; round <= count; round++) {
+        // Common scalar updates; periodically rewrite one item to exercise array-valued deltas.
+        const traveler = memory.stateLedger.characters.旅人;
+        const next = { ...memory.stateLedger, characters: { 旅人: {
+            ...traveler, location: "营地" + round,
+            inventory: round % 10 === 0 ? [...inventory.slice(0, -1), inventory.at(-1) + "（放于口袋" + round + "）"] : traveler.inventory,
+        } } };
+        current.recordStateLedger(memory, { endMessageId: round * 2 - 1, roundNumber: round }, next);
+    }
+    memory.lastProcessedMessageId = processed.message;
+    memory.lastProcessedRound = processed.round;
+    return { memory, chat, inventoryCount: inventory.length, lockCount: locks.length };
+}
+
 function measure(callback, samples = 25) {
     for (let i = 0; i < 5; i++) callback();
     const times = [];
@@ -40,7 +64,7 @@ for (const count of [200, 1000, 5000]) {
         if (!api) continue;
         const { memory, chat } = fixture(api, count);
         api.normalizeMemoryData(memory);
-        const report = { variant: name, rounds: count, normalize: measure(() => api.normalizeMemoryData(memory)), prompt: measure(() => api.buildInjectedMemoryPrompt(memory)), fingerprint: measure(() => api.buildChatMessageFingerprint(chat)) };
+        const report = { variant: name, scenario: "archive", rounds: count, normalize: measure(() => api.normalizeMemoryData(memory)), prompt: measure(() => api.buildInjectedMemoryPrompt(memory)), fingerprint: measure(() => api.buildChatMessageFingerprint(chat)) };
         if (name === 'working') {
             const core = chat.map((message, index) => ({ ...message, index }));
             report.localSend = measure(() => {
@@ -52,4 +76,27 @@ for (const count of [200, 1000, 5000]) {
         }
         console.log(JSON.stringify(report));
     }
+
+    const { memory, chat, inventoryCount, lockCount } = liveFixture(count);
+    const serialized = JSON.stringify(memory);
+    const loaded = current.normalizeMemoryData(JSON.parse(serialized));
+    const lastHistoricalMessage = (count - 1) * 2 - 1;
+    const historical = current.getStateLedgerAtMessage(loaded, lastHistoricalMessage);
+    assert.equal(historical.round, count - 1);
+    assert.equal(historical.ledger.characters.旅人.inventory.length, inventoryCount);
+    assert.equal(historical.ledger.characters.旅人.removedItemsLock.length, lockCount);
+    const core = chat.map((message, index) => ({ ...message, index }));
+    const settings = { ...current.DEFAULT_SETTINGS, stateUpdateMode: "main_response" };
+    console.log(JSON.stringify({
+        variant: "working", scenario: "live-state", rounds: count, stateEntries: loaded.stateSync.entries.length,
+        inventoryCount, lockCount, serializedBytes: Buffer.byteLength(serialized),
+        reload: measure(() => current.normalizeMemoryData(JSON.parse(serialized))),
+        normalize: measure(() => current.normalizeMemoryData(loaded)),
+        historicalState: measure(() => current.getStateLedgerAtMessage(loaded, lastHistoricalMessage)),
+        localContinue: measure(() => {
+            current.normalizeMemoryData(loaded);
+            const roundIndex = current.buildRoundMessageIndex(chat);
+            buildChatHistoryReplacement(loaded, chat, core, settings, [], "", { roundIndex, generationType: "continue" });
+        }),
+    }));
 }

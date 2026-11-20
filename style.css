@@ -460,6 +460,29 @@
     width: 100%;
 }
 
+/* ---------- 账本快照时效 ---------- */
+.tiandao-ledger-freshness {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 10px;
+    padding: 8px 12px;
+    border: 1px solid var(--sw-line);
+    border-radius: 8px;
+    color: var(--sw-muted);
+    font-size: 0.85em;
+    overflow-wrap: anywhere;
+}
+
+.tiandao-ledger-freshness.is-stale {
+    border-color: var(--sw-banner-border);
+    background: var(--sw-banner-bg);
+}
+
+.tiandao-ledger-freshness strong {
+    color: var(--sw-text);
+}
+
 /* ---------- 故事时间横幅 ---------- */
 .tiandao-time-banner {
     position: relative;
@@ -2077,3 +2100,6 @@
 .tiandao-entry-pin-btn { cursor: pointer; font: inherit; font-size: .75em; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--sw-accent-line); background: var(--sw-panel-bg); color: var(--sw-text-soft); }
 .tiandao-entry-pin-btn[aria-pressed="true"] { background: var(--sw-chip-sel-bg); color: var(--sw-chip-sel-text); border-color: var(--sw-accent); }
 .tiandao-full-width { width: 100%; max-width: 100%; }
+
+/* State protocol remains available in the saved source for replay, hidden in rendered chat. */
+.mes_text details[data-suwei-state="1"] { display: none !important; }

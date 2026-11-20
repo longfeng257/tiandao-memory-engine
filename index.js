@@ -41,7 +41,12 @@ import {
     replaceL0EntryInMemory,
     setMemoryEntryPinned,
     getRuntimeDiagnostics,
+    sanitizeSummaryFlourish,
+    resolveStateUpdateMode, getStateLedgerCursor, getStateLedgerAtMessage, ensureLiveStateStorage,
+    recordStateLedger, applyStateChanges, extractStateChanges,
 } from "./memory-engine.js";
+import { readMainResponseState, stripStateUpdateMessage } from "./state-protocol.js";
+import { loadHostPromptProcessor, createPromptTextReader, preparePromptHistory } from "./host-prompt.js";
 import { bindCoreHistory, buildChatHistoryReplacement } from "./history-builder.js";
 import { createSummaryTaskGate } from "./task-gate.js";
 import { createRecoveryPoint, appendRecoveryPoint, restoreRecoveryPoint, recoveryChatSignature } from "./recovery-store.js";
@@ -84,6 +89,8 @@ let lastLedgerRenderKey = "";
 const pendingLedgerRender = { force: false };
 const RECOVERY_KEY = "suwei_memory_recovery_v1";
 const pendingSummarySaves = new WeakMap();
+// SillyTavern recreates metadata when a chat is reopened. Keep state drafts keyed to the chat instead.
+const pendingStateSaves = new Map();
 
 function overwriteMemoryData(target, source) {
     for (const key of Object.keys(target)) delete target[key];
@@ -93,15 +100,40 @@ function overwriteMemoryData(target, source) {
 function getPendingSummarySave(ctx = getSTContext()) {
     const metadata = ctx.chatMetadata || window.chat_metadata;
     if (!metadata) return null;
-    const pending = pendingSummarySaves.get(metadata);
+    const pending = pendingSummarySaves.get(metadata) || pendingStateSaves.get(getStateSaveKey(ctx));
     if (!pending) return null;
-    if (metadata.tiandao_memory !== pending.target
-        || recoveryChatSignature((ctx.chat || []).slice(0, pending.endMessageId + 1)) !== pending.signature) {
-        pendingSummarySaves.delete(metadata);
-        if (metadata.tiandao_memory?.lastSummaryError?.message?.startsWith("摘要已生成，等待重试保存")) metadata.tiandao_memory.lastSummaryError = null;
+    const memory = metadata.tiandao_memory || (pending.kind === 'state' ? createEmptyMemoryData() : null);
+    if (!memory || recoveryChatSignature((ctx.chat || []).slice(0, pending.endMessageId + 1)) !== pending.signature
+        || (memory !== pending.target && (pending.kind !== 'state' || !canRestoreStateDraft(memory, pending)))) {
+        deletePendingSave(metadata, pending);
+        if (/^(?:摘要|状态)已生成，等待重试保存/.test(memory?.lastSummaryError?.message || "")) memory.lastSummaryError = null;
         return null;
     }
+    metadata.tiandao_memory = memory;
+    pending.target = memory;
     return pending;
+}
+
+function getStateSaveKey(ctx) {
+    const owner = ctx.groupId || (ctx.characters?.[ctx.characterId]?.avatar ?? ctx.characterId ?? ctx.name2);
+    return JSON.stringify([Boolean(ctx.groupId), owner, getChatKey(ctx)]);
+}
+
+function canRestoreStateDraft(memory, pending) {
+    const loaded = normalizeMemoryData(clonePlainData(memory));
+    const cursor = getStateLedgerCursor(loaded);
+    return cursor.round === pending.baseCursor.round && cursor.endMessageId === pending.baseCursor.endMessageId
+        && JSON.stringify(loaded.stateLedger) === pending.baseLedger;
+}
+
+function deletePendingSave(metadata, pending) {
+    if (pending.kind === 'state') {
+        if (pendingStateSaves.get(pending.key) === pending) pendingStateSaves.delete(pending.key);
+    } else if (pendingSummarySaves.get(metadata) === pending) pendingSummarySaves.delete(metadata);
+}
+
+function savedStateFields(memory) {
+    return { stateLedger: memory.stateLedger, stateSync: memory.stateSync };
 }
 
 async function retryPendingSummarySave() {
@@ -110,25 +142,34 @@ async function retryPendingSummarySave() {
     if (!pending || recoveryBusy) return !pending;
     const metadata = ctx.chatMetadata || window.chat_metadata;
     const chatKey = getChatKey();
-    const before = clonePlainData(pending.target);
+    const chat = ctx.chat || [];
+    const target = pending.target;
+    const originalIsActive = () => isCurrentChat(chatKey) && currentMemoryReference() === target;
+    const stateOnly = pending.kind === 'state';
+    const before = clonePlainData(stateOnly ? savedStateFields(target) : target);
+    const apply = source => stateOnly ? Object.assign(target, clonePlainData(source)) : overwriteMemoryData(target, source);
     recoveryBusy = true;
-    overwriteMemoryData(pending.target, pending.draft);
+    apply(pending.draft);
     try {
         await saveChatMemory();
-        pendingSummarySaves.delete(metadata);
-        if (isCurrentChat(chatKey)) {
-            updateStatusBar('✅ 第 ' + pending.roundRange + ' 轮已保存；本次没有调用总结 API');
-            await refreshPromptInjection('', { skipRetrieval: true });
+        deletePendingSave(metadata, pending);
+        if (originalIsActive()) {
+            updateStatusBar('✅ 第 ' + pending.roundRange + ' 轮' + (pending.kind === 'state' ? '状态' : '摘要') + '已保存；本次没有调用 API');
+            await refreshPromptInjection('', { skipRetrieval: true }).catch(() => {});
         }
         return true;
     } catch (error) {
         // A concurrent native edit may already have invalidated/rolled back the draft.
-        if (pendingSummarySaves.get(metadata) === pending
-            && recoveryChatSignature((ctx.chat || []).slice(0, pending.endMessageId + 1)) === pending.signature) {
-            overwriteMemoryData(pending.target, before);
-            pending.target.lastSummaryError = { message: '摘要已生成，等待重试保存：' + String(error.message || error), roundNumber: pending.roundNumber, at: Date.now() };
-        }
-        if (isCurrentChat(chatKey)) updateStatusBar('❌ 保存仍未成功，生成结果已保留；可再次重试保存', true);
+        const sourceMatches = recoveryChatSignature(chat.slice(0, pending.endMessageId + 1)) === pending.signature;
+        const stillPending = stateOnly
+            ? pendingStateSaves.get(pending.key) === pending && getStateLedgerCursor(target).endMessageId === pending.endMessageId
+            : pendingSummarySaves.get(metadata) === pending;
+        const canRetry = stillPending && (sourceMatches || (stateOnly && !originalIsActive()));
+        if (canRetry || (stateOnly && stillPending)) apply(before);
+        if (!stateOnly && canRetry) {
+            target.lastSummaryError = { message: '摘要已生成，等待重试保存：' + String(error.message || error), roundNumber: pending.roundNumber, at: Date.now() };
+        } else if (stateOnly && !canRetry) deletePendingSave(metadata, pending);
+        if (originalIsActive() && canRetry) updateStatusBar('❌ 保存仍未成功，生成结果已保留；可再次重试保存', true);
         return false;
     } finally {
         recoveryBusy = false;
@@ -143,7 +184,7 @@ function memoryOperationBusy() {
 
 function checkpointBeforeChange(label, memoryData = getChatMemory()) {
     if (memoryOperationBusy()) {
-        updateStatusBar(getPendingSummarySave() ? "⏳ 摘要已生成但尚未保存，请先重试保存" : "⏳ 请等待记忆任务结束后再修改", true);
+        updateStatusBar(getPendingSummarySave() ? "⏳ 有生成结果尚未保存，请先重试保存" : "⏳ 请等待记忆任务结束后再修改", true);
         return false;
     }
     const ctx = getSTContext();
@@ -254,8 +295,7 @@ function getSTContext() {
     return window;
 }
 
-function getChatKey() {
-    const ctx = getSTContext();
+function getChatKey(ctx = getSTContext()) {
     try {
         if (typeof ctx.getCurrentChatId === "function") {
             return String(ctx.getCurrentChatId() || "");
@@ -402,6 +442,7 @@ function getSettings() {
     s.embeddingModel = String(s.embeddingModel || "").slice(0, 200);
     s.streamMode = s.streamMode === "stream" ? "stream" : "non_stream";
     s.l0RoundsPerSummary = resolveL0RoundsPerSummary(s);
+    s.stateUpdateMode = resolveStateUpdateMode(s);
     s.l0MergeMode = s.l0MergeMode === "manual" ? "manual" : "auto";
     s.targetContentTags = String(s.targetContentTags || "").slice(0, 500);
     s.customStripTags = String(s.customStripTags || "").slice(0, 500);
@@ -596,6 +637,8 @@ function getChatMemory() {
 
 async function saveChatMemory() {
     const ctx = getSTContext();
+    const chatKey = getChatKey(ctx);
+    const metadata = ctx.chatMetadata || window.chat_metadata;
     const savers = [];
     if (typeof ctx.saveMetadata === "function") {
         savers.push(() => ctx.saveMetadata());
@@ -611,6 +654,7 @@ async function saveChatMemory() {
     }
     let lastError = null;
     for (const save of savers) {
+        if (!isCurrentChat(chatKey) || (getSTContext().chatMetadata || window.chat_metadata) !== metadata) break;
         try {
             const result = await save();
             if (result === false || result?.ok === false) throw new Error("聊天元数据保存接口返回失败");
@@ -726,7 +770,7 @@ function renderSummaryProgress() {
     const pendingPanel = document.getElementById("tiandao_pending_save_panel");
     if (pendingPanel) pendingPanel.style.display = pendingSave ? "flex" : "none";
     const pendingMessage = document.getElementById("tiandao_pending_save_message");
-    if (pendingMessage && pendingSave) pendingMessage.textContent = "第 " + pendingSave.roundRange + " 轮摘要已生成，尚未保存。";
+    if (pendingMessage && pendingSave) pendingMessage.textContent = "第 " + pendingSave.roundRange + " 轮" + (pendingSave.kind === "state" ? "状态" : "摘要") + "已生成，尚未保存。";
     const retryButton = document.getElementById("tiandao_pending_save_retry");
     if (retryButton) retryButton.disabled = recoveryBusy;
 
@@ -785,22 +829,22 @@ function applyWidgetAppearance() {
     document.documentElement.style.setProperty("--sw-font-scale", String(fontScale / 100));
 }
 
-function buildLatestUserQuery(chat, settings = getSettings()) {
+function buildLatestUserQuery(chat, settings = getSettings(), readPromptText = index => chat[index]?.mes) {
     for (let i = chat.length - 1; i >= 0; i--) {
         if (!chat[i]?.is_user || chat[i].is_system) continue;
-        return cleanMessageText(chat[i].mes, settings.targetContentTags, settings.customStripTags).slice(-1000);
+        return cleanMessageText(readPromptText(i), settings.targetContentTags, settings.customStripTags).slice(-1000);
     }
     return "";
 }
 
-function buildRecentContextQuery(chat, targetContentTags, customStripTags) {
+function buildRecentContextQuery(chat, targetContentTags, customStripTags, readPromptText = index => chat[index]?.mes) {
     if (!Array.isArray(chat) || !chat.length) return "";
     const settings = { targetContentTags, customStripTags };
-    const user = buildLatestUserQuery(chat, settings);
+    const user = buildLatestUserQuery(chat, settings, readPromptText);
     const latest = chat.at(-1);
     // Keep the player's question first, so long assistant prose cannot displace its topic.
     if (latest?.is_user) return user;
-    const reply = latest && !latest.is_system ? cleanMessageText(latest.mes, targetContentTags, customStripTags).slice(-200) : "";
+    const reply = latest && !latest.is_system ? cleanMessageText(readPromptText(chat.length - 1), targetContentTags, customStripTags).slice(-200) : "";
     return [user, reply].filter(Boolean).join("\n");
 }
 
@@ -825,17 +869,20 @@ async function refreshPromptInjection(customQuery = "", options = {}) {
     const chatKey = getChatKey();
     const memoryData = getChatMemory();
     const fullChat = ctx.chat || [];
-    const queryText = customQuery || buildRecentContextQuery(fullChat, settings.targetContentTags, settings.customStripTags);
+    const needsRetrieval = settings.enableRetrieval && !options.skipRetrieval;
+    const coreChat = options.coreChat || preparePromptHistory(fullChat, await loadHostPromptProcessor(ctx), options.generationType);
+    if (!isCurrentChat(chatKey) || requestEpoch !== summaryEpoch || currentMemoryReference(ctx) !== memoryData) return null;
+    // Query exactly the host's outgoing source, including swipe removal and other extensions' filtering.
+    const queryText = customQuery || (needsRetrieval ? buildRecentContextQuery(coreChat, settings.targetContentTags, settings.customStripTags) : '');
     const retrievalDetails = [];
     let retrieved = [];
     if (settings.enableRetrieval && queryText && !options.skipRetrieval) {
         retrieved = await retrieveRelevantArchivedMemories(settings, memoryData, queryText,
-            { skipNormalize: true, details: retrievalDetails, focusQuery: buildLatestUserQuery(fullChat, settings) });
+            { skipNormalize: true, details: retrievalDetails, focusQuery: buildLatestUserQuery(coreChat, settings) });
     }
     if (!isCurrentChat(chatKey) || requestEpoch !== summaryEpoch
         || currentMemoryReference(ctx) !== memoryData) return null;
     if (requestSequence !== injectionRequestSequence && !options.coreChat) return null;
-    const coreChat = options.coreChat || fullChat.filter(message => message && (!message.is_system || Array.isArray(message.extra?.tool_invocations)));
     const plan = buildChatHistoryReplacement(memoryData, fullChat, coreChat, settings, retrieved, ctx.name1 || "", {
         bound: options.bound, generationType: options.generationType, roundIndex: getCachedRoundIndex(fullChat, settings.includeNativeHidden), retrievalDetails,
     });
@@ -871,8 +918,8 @@ function renderInjectionPreview() {
     const value = preview?.text || "尚未准备聊天记录；启用引擎并进入聊天后会在这里显示。";
     if (text.value !== value) text.value = value;
     info.textContent = preview
-        ? "最近" + (preview.applied ? "替换于 " : "准备于 ") + new Date(preview.at).toLocaleTimeString() + " · 原生聊天记录区块 · 约 " + preview.tokens + " Token（估算，无固定裁剪） · 原文 " + preview.rawMessages + " 条 / 记忆 " + preview.memoryMessages + " 条" + (preview.retrieval?.length ? " · 召回：" + preview.retrieval.map(item => "第 " + item.roundRange + " 轮（" + item.reason + "）").join("；") : "")
-        : "本页显示插件准备替换的完整聊天记录区块；不包含角色卡与其他预设。查看不会调用 API。";
+        ? "最近" + (preview.applied ? "替换于 " : "准备于 ") + new Date(preview.at).toLocaleTimeString() + " · 原生聊天记录区块 · 约 " + preview.tokens + " Token（估算；原文已应用发出正则） · 原文 " + preview.rawMessages + " 条 / 记忆 " + preview.memoryMessages + " 条" + (preview.retrieval?.length ? " · 召回：" + preview.retrieval.map(item => "第 " + item.roundRange + " 轮（" + item.reason + "）").join("；") : "")
+        : "本页显示已应用发出正则的聊天记录区块；实际生成时以酒馆处理后的副本为准，不包含角色卡与其他预设。查看不会调用 API。";
     const copy = document.getElementById("tiandao_injection_copy");
     if (copy) copy.disabled = !preview;
 }
@@ -888,7 +935,7 @@ function clearEntryEmbedding(item) {
     item.embeddingDimension = null;
 }
 
-function buildL0GroupSummaryInput(chat, turns, settings, ctx) {
+async function buildL0GroupSummaryInput(chat, turns, settings, ctx) {
     if (!Array.isArray(turns) || turns.length === 0) return null;
     const validTurns = turns.filter(turn =>
         turn
@@ -897,6 +944,7 @@ function buildL0GroupSummaryInput(chat, turns, settings, ctx) {
         && isAiReplyMessage(turn.msg, settings.includeNativeHidden)
     );
     if (validTurns.length === 0) return null;
+    const readPromptText = createPromptTextReader(chat, await loadHostPromptProcessor(ctx));
 
     const userName = ctx.name1 || "User";
     const charName = validTurns.at(-1)?.msg?.name || ctx.name2 || "Character";
@@ -908,14 +956,14 @@ function buildL0GroupSummaryInput(chat, turns, settings, ctx) {
         const lines = [];
         if (roundWindow.openingMessageIndex >= 0) {
             const openingMsg = chat[roundWindow.openingMessageIndex];
-            const openingText = cleanMessageText(openingMsg.mes, settings.targetContentTags, settings.customStripTags);
+            const openingText = cleanMessageText(readPromptText(roundWindow.openingMessageIndex), settings.targetContentTags, settings.customStripTags);
             if (openingText) lines.push(`【开场白·${openingMsg.name || charName}】：\n${openingText}`);
         }
         if (roundWindow.userMessageIndex >= 0) {
-            const userText = cleanMessageText(chat[roundWindow.userMessageIndex].mes, settings.targetContentTags, settings.customStripTags);
+            const userText = cleanMessageText(readPromptText(roundWindow.userMessageIndex), settings.targetContentTags, settings.customStripTags);
             if (userText) lines.push(`【${userName}】：\n${userText}`);
         }
-        const aiText = cleanMessageText(chat[turn.idx].mes, settings.targetContentTags, settings.customStripTags);
+        const aiText = cleanMessageText(readPromptText(turn.idx), settings.targetContentTags, settings.customStripTags);
         const aiName = chat[turn.idx].name || charName;
         if (aiText) lines.push(`【${aiName}】：\n${aiText}`);
         if (lines.length > 0) {
@@ -938,7 +986,7 @@ function buildL0GroupSummaryInput(chat, turns, settings, ctx) {
     };
 }
 
-function buildTurnSummaryInput(chat, msgIdx, settings, ctx, precomputedTurn = null) {
+async function buildTurnSummaryInput(chat, msgIdx, settings, ctx, precomputedTurn = null) {
     const targetMsg = chat[msgIdx];
     if (!isAiReplyMessage(targetMsg, settings.includeNativeHidden)) return null;
     const roundWindow = precomputedTurn?.window
@@ -957,6 +1005,7 @@ function replaceL0Entry(memoryData, target, replacement) {
 }
 
 function refreshLedgerFromLatestL0(memoryData) {
+    if (memoryData.stateSync) return;
     const latest = (memoryData.archivePool || [])
         .filter(item => item && item.level === 0)
         .sort((a, b) =>
@@ -983,8 +1032,8 @@ async function resummarizeRoundInPlace(
     groupTurns = null,
 ) {
     const turn = Array.isArray(groupTurns) && groupTurns.length > 1
-        ? buildL0GroupSummaryInput(chat, groupTurns, settings, ctx)
-        : buildTurnSummaryInput(chat, msgIdx, settings, ctx, precomputedTurn);
+        ? await buildL0GroupSummaryInput(chat, groupTurns, settings, ctx)
+        : await buildTurnSummaryInput(chat, msgIdx, settings, ctx, precomputedTurn);
     if (!turn) return true;
     const groupStartMessageId = turn.startMessageId;
     const groupEndMessageId = turn.endMessageId;
@@ -1010,11 +1059,16 @@ async function resummarizeRoundInPlace(
         (previousEntry ? resolveStateLedgerAfterEntry(memoryData, previousEntry) : null)
         || createEmptyMemoryData().stateLedger
     );
+    if (memoryData.stateSync) {
+        working.stateSync = clonePlainData(memoryData.stateSync);
+        working.stateLedger = clonePlainData(memoryData.stateLedger);
+    }
     working.lastProcessedMessageId = groupStartMessageId - 1;
     working.lastProcessedRound = Math.max(0, groupStartRound - 1);
 
     const replacement = await summarizeSingleTurn(settings, working, {
         ...turn,
+        summaryOnly: Boolean(memoryData.stateSync),
         memoryAlreadyNormalized: true,
         shouldCommit: () =>
             isCurrentChat(chatKey)
@@ -1242,15 +1296,22 @@ globalThis.tiandaoMemoryInterceptor = async function (chat, _contextSize, abort,
     try {
         const settings = getSettings();
         ctx.setExtensionPrompt?.(PROMPT_KEY, "", 1, 0, false, 0);
-        if (!settings.enabled || String(type || "") === "quiet") return;
         const fullChat = ctx.chat || [];
         if (!Array.isArray(chat) || chat === fullChat) throw new Error("酒馆未提供独立的生成聊天副本，已停止以保护原始聊天记录");
         const bound = bindCoreHistory(chat, fullChat);
+        const sanitized = new Map();
+        for (const item of bound) {
+            const message = stripStateUpdateMessage(item.message, fullChat[item.sourceIndex]);
+            sanitized.set(item.message, message);
+            item.message = message;
+        }
+        // Filter before retrieval as well as history replacement, even while memory is paused.
+        for (let i = 0; i < chat.length; i++) chat[i] = sanitized.get(chat[i]) || stripStateUpdateMessage(chat[i]);
+        if (!settings.enabled || String(type || "") === "quiet") return;
         if (settings.summarizeTiming === "on_next_send" && shouldSettleBeforeGeneration(type)) {
             schedulePendingTurnsBeforeGeneration(fullChat, type);
         }
-        const query = buildRecentContextQuery(fullChat, settings.targetContentTags, settings.customStripTags);
-        const plan = await refreshPromptInjection(query, { coreChat: chat, bound, generationType: type });
+        const plan = await refreshPromptInjection("", { coreChat: chat, bound, generationType: type });
         if (!plan || !isCurrentChat(chatKey)) {
             abort?.(true);
             return;
@@ -1293,6 +1354,116 @@ function syncHiddenMessagesState(_forceRestoreAll = false) {
 /**
  * 总结指定的一问一答轮次
  */
+/** State work shares the summary queue, but never advances the narrative archive cursor. */
+function enqueueLiveStateUpdates(chat, upToIndex, options = {}) {
+    const ctx = options.ctx || getSTContext();
+    const chatKey = options.chatKey || getChatKey();
+    const epoch = options.epoch ?? summaryEpoch;
+    const mode = resolveStateUpdateMode(getSettings());
+    if (mode === "with_summary" || !getSettings().enabled || !isActiveChatContext(ctx)) return null;
+    const metadata = ctx.chatMetadata || window.chat_metadata;
+    const saveKey = getStateSaveKey(ctx);
+    return enqueueBackgroundSummary(async () => {
+        const valid = () => {
+            const current = getSTContext();
+            return epoch === summaryEpoch && getSettings().enabled && resolveStateUpdateMode(getSettings()) === mode
+                && getStateSaveKey(current) === saveKey && current.chat === chat
+                && (current.chatMetadata || window.chat_metadata) === metadata;
+        };
+        if (!valid() || recoveryBusy || (isBackfilling && activeBackfillChatKey === chatKey)) return;
+        if (getPendingSummarySave(ctx) && !await retryPendingSummarySave()) return;
+        if (!valid()) return;
+        const memory = getChatMemory();
+        const sync = ensureLiveStateStorage(memory);
+        const latest = sync.entries.at(-1) || sync.base;
+        const fingerprint = buildChatMessageFingerprint([chat[upToIndex]])[0];
+        if (latest.endMessageId === upToIndex && latest.sourceFingerprint && latest.sourceFingerprint !== fingerprint) {
+            const window = getRoundMessageWindow(chat, upToIndex, getSettings().includeNativeHidden);
+            if (window) rollbackMemoryFromMessageIndex(memory, window.startMessageId, { skipNormalize: true });
+        }
+        let cursor = getStateLedgerCursor(memory);
+        let pending = collectPendingAiTurns(chat, cursor.endMessageId, upToIndex, getSettings().includeNativeHidden);
+        if (!pending.length) return;
+        const task = await acquireSummaryTask({ label: mode === "independent" ? "逐轮同步状态" : "读取正文状态", total: 1, canCancel: true }, valid);
+        if (!task) return;
+        const signal = task.controller.signal;
+        let before = null, sourceSignature = '', target = pending.at(-1), saving = false;
+        try {
+            // When both are due after a reply, one normal summary request returns story and state.
+            const settings = getSettings();
+            if (mode === "independent" && options.allowSummary !== false && settings.autoSummarizePerTurn
+                && settings.l0MergeMode !== "manual" && settings.summarizeTiming === "after_reply") {
+                const groups = groupAiTurnsForL0(collectPendingAiTurns(chat, memory.lastProcessedMessageId, upToIndex, settings.includeNativeHidden), resolveL0RoundsPerSummary(settings), true);
+                for (const group of groups) {
+                    if (!valid() || signal.aborted) return;
+                    if (!await processSingleAiTurn(group.at(-1).idx, false, { ctx, chat, chatKey, epoch, memoryData: memory, summaryTask: task, groupTurns: group })) return;
+                }
+            }
+            if (!valid() || signal.aborted || currentMemoryReference() !== memory) return;
+            cursor = getStateLedgerCursor(memory);
+            pending = collectPendingAiTurns(chat, cursor.endMessageId, upToIndex, settings.includeNativeHidden);
+            if (!pending.length) return;
+            target = pending.at(-1);
+            sourceSignature = recoveryChatSignature(chat.slice(0, target.idx + 1));
+            activeSummaryChats.add(chatKey);
+            let next;
+            if (mode === "main_response") {
+                const payload = readMainResponseState(chat[target.idx]?.mes);
+                if (payload.baseRound !== cursor.round) throw Error("正文状态的基准轮次与当前快照不匹配，保留原状态；不自动调用独立 API");
+                const baseTurn = payload.baseRound === 0 ? null : getCachedRoundIndex(chat, settings.includeNativeHidden).aiTurns.find(turn => turn.round === payload.baseRound);
+                const baseIndex = payload.baseRound === 0 ? -1 : baseTurn?.idx;
+                if (!Number.isInteger(baseIndex) || baseIndex >= target.idx) throw Error("正文状态的基准轮次超出当前回复，未应用");
+                const base = getStateLedgerAtMessage(memory, baseIndex);
+                if (base.round !== payload.baseRound) throw Error("找不到正文状态对应的基准快照，未应用；不自动调用独立 API");
+                next = applyStateChanges(base.ledger, payload, target.round);
+            } else {
+                const input = await buildL0GroupSummaryInput(chat, pending, settings, ctx);
+                if (!input) return;
+                next = await extractStateChanges(settings, memory.stateLedger, { ...input, roundNumber: target.round }, { baseRound: cursor.round, signal });
+            }
+            if (!valid() || signal.aborted || currentMemoryReference() !== memory
+                || recoveryChatSignature(chat.slice(0, target.idx + 1)) !== sourceSignature) return;
+            const baseCursor = getStateLedgerCursor(memory);
+            before = { ...clonePlainData(savedStateFields(memory)), baseCursor };
+            if (!recordStateLedger(memory, { endMessageId: target.idx, roundNumber: target.round,
+                sourceFingerprint: buildChatMessageFingerprint([chat[target.idx]])[0] }, next)) return;
+            saving = true;
+            await saveChatMemory();
+            saving = false;
+            if (valid()) {
+                updateStatusBar("✅ 状态已同步至第 " + target.round + " 轮；剧情仍按 L0 设置归档");
+                await refreshPromptInjection("", { skipRetrieval: true }).catch(() => {});
+            }
+        } catch (error) {
+            const originalIsActive = isCurrentChat(chatKey) && currentMemoryReference() === memory;
+            const sourceMatches = !sourceSignature || recoveryChatSignature(chat.slice(0, target.idx + 1)) === sourceSignature;
+            if (saving) {
+                // A chat switch or cancellation must not skip rollback of a failed save.
+                // When the host reuses the chat array, validate the source again when the original chat returns.
+                if (metadata?.tiandao_memory !== memory || getStateLedgerCursor(memory).endMessageId !== target.idx) return;
+                const draft = clonePlainData(savedStateFields(memory));
+                const { baseCursor, ...previousState } = before;
+                Object.assign(memory, previousState);
+                if (originalIsActive && !sourceMatches) return;
+                pendingStateSaves.set(saveKey, {
+                    key: saveKey, target: memory, draft, baseCursor, baseLedger: JSON.stringify(previousState.stateLedger),
+                    signature: sourceSignature, endMessageId: target.idx, roundNumber: target.round, roundRange: String(target.round), kind: "state",
+                });
+                if (originalIsActive) updateStatusBar("❌ 状态已生成但保存失败；请重试保存，不会重新调用 API", true);
+                return;
+            }
+            if (!valid() || signal.aborted || error?.name === "AbortError" || !originalIsActive || !sourceMatches) return;
+            ensureLiveStateStorage(memory).lastError = { message: String(error.message || error).slice(0, 300), round: target.round, at: Date.now() };
+            await saveChatMemory().catch(() => {});
+            if (valid()) updateStatusBar("⚠️ 状态未同步：" + String(error.message || error).slice(0, 200), true);
+        } finally {
+            activeSummaryChats.delete(chatKey);
+            finishSummaryTask(task);
+            updateFloatingWidgetUI({ forceLedger: true });
+        }
+    }, "状态同步");
+}
+
 async function processSingleAiTurn(targetMessageId, isManual = false, options = {}) {
     const settings = getSettings();
     if (recoveryBusy || (!settings.enabled && !isManual)) return false;
@@ -1338,7 +1509,9 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
     const firstTurn = groupTurns[0];
     const memoryData = options.memoryData || getChatMemory();
     if (memoryData.lastProcessedMessageId >= msgIdx) return true;
-    const summaryInput = buildL0GroupSummaryInput(chat, groupTurns, settings, ctx);
+    const summaryInput = await buildL0GroupSummaryInput(chat, groupTurns, settings, ctx);
+    if (!isCurrentChat(chatKey) || epoch !== summaryEpoch || activeSummaryChats.has(chatKey)) return false;
+    if (memoryData.lastProcessedMessageId >= msgIdx) return true;
     if (!summaryInput) {
         // 空回复无需调用 API，但必须推进游标，避免后台队列永远卡在同一楼。
         memoryData.lastProcessedMessageId = lastTurn.idx;
@@ -1349,7 +1522,6 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
     const startRound = firstTurn.round;
     const roundNumber = lastTurn.round;
     const roundRange = startRound === roundNumber ? String(roundNumber) : `${startRound}-${roundNumber}`;
-    const aiCleaned = cleanMessageText(lastTurn.msg.mes, settings.targetContentTags, settings.customStripTags);
 
     activeSummaryChats.add(chatKey);
     const ownsTask = !options.summaryTask;
@@ -1382,6 +1554,8 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
         updateStatusBar(`⏳ 正在总结第 ${roundRange} 轮对话并更新状态账本...`);
         const result = await summarizeSingleTurn(settings, memoryData, {
             memoryAlreadyNormalized: true,
+            summaryOnly: options.summaryOnly === true,
+            sourceFingerprint: buildChatMessageFingerprint([chat[msgIdx]])[0],
             roundNumber,
             startRound,
             endRound: roundNumber,
@@ -1425,7 +1599,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
         await saveChatMemory();
         savingGeneratedSummary = false;
         if (isCurrentChat(chatKey) && epoch === summaryEpoch) {
-            await refreshPromptInjection(aiCleaned).catch(error => {
+            await refreshPromptInjection().catch(error => {
                 console.warn("[溯微] 归档已保存，但刷新提示词注入失败:", error?.name || "refresh failed");
             });
             syncHiddenMessagesState();
@@ -1679,7 +1853,7 @@ function renderStoryRecoveryState(memoryData = getChatMemory(), pendingOverride 
     const pendingSave = getPendingSummarySave();
     if (pendingSave) {
         box.style.display = 'flex';
-        messageEl.textContent = '第 ' + pendingSave.roundRange + ' 轮摘要已生成，但尚未写入存档。重试只保存已有结果，不调用总结 API；刷新页面前请先保存成功。';
+        messageEl.textContent = '第 ' + pendingSave.roundRange + ' 轮' + (pendingSave.kind === 'state' ? '状态' : '摘要') + '已生成，但尚未写入存档。重试只保存已有结果，不调用总结 API；刷新页面前请先保存成功。';
         if (recoverBtn) { recoverBtn.textContent = '重试保存（不调用 API）'; recoverBtn.disabled = recoveryBusy; recoverBtn.style.display = 'inline-flex'; }
         const dismiss = document.getElementById('tiandao_story_dismiss_error_btn');
         if (dismiss) dismiss.style.display = 'none';
@@ -2466,11 +2640,22 @@ function initFloatingWidget() {
                                 </select>
                             </div>
                             <div class="tiandao-form-row">
+                                <span class="tiandao-field-label">状态更新方式</span>
+                                <select id="tiandao_state_update_mode" class="tiandao-select">
+                                    <option value="with_summary">随 L0 总结更新（原方式）</option>
+                                    <option value="independent">独立 API 逐轮更新</option>
+                                    <option value="main_response">主模型随正文返回状态</option>
+                                </select>
+                            </div>
+                            <div class="tiandao-field-caption">
+                                独立模式使用上方总结 API，每轮回复后提取状态；与回复后 L0 同时到期时共用请求，下一次发送才总结时则另计 L0 请求。正文模式不增加独立状态请求，但主模型会多输出状态数据；协议区块在聊天中隐藏，发送历史时剔除，本地原始消息仍保留以便恢复。漏写或格式错误只提示，不自动付费补跑。切换只作用于后续回复，不会自动重跑历史。
+                            </div>
+                            <div class="tiandao-form-row">
                                 <span class="tiandao-field-label">每几轮合成一条 L0</span>
                                 <input id="tiandao_l0_chunk" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" class="tiandao-input tiandao-input-sm" placeholder="1" aria-label="每几轮合成一条 L0" />
                             </div>
                             <div class="tiandao-field-caption" style="margin:0 0 8px;">
-                                自动模式满 N 轮才归档；手动模式不会自动生成 L0，仍可在剧情页选择连续轮次手动合并。手动合并后，下一段从合并结束后的第一轮重新计数。多轮 L0 会整组总结并更新状态看板；希望状态每轮同步时设为 1 轮。
+                                自动模式满 N 轮才归档；手动模式不会自动生成 L0，仍可在剧情页选择连续轮次手动合并。手动合并后，下一段从合并结束后的第一轮重新计数。“随 L0 总结更新”模式下，账本随整组总结更新；需要每轮提取状态时设为 1 轮并选择“AI 回复完成后立即总结”，或选择上方两种逐轮状态模式。状态同步与剧情归档分别计数，未同步期间以之后的剧情为准。
                             </div>
                             <div class="tiandao-form-row">
                                 <span class="tiandao-field-label">L1+ 向上合并步长</span>
@@ -2942,6 +3127,11 @@ function initFloatingWidget() {
                 return;
             }
 
+            if (event.target.closest("[data-retry-state]")) {
+                const chat = getSTContext().chat || [];
+                enqueueLiveStateUpdates(chat, chat.length - 1, { allowSummary: false });
+                return;
+            }
             const deleteButton = event.target.closest("[data-delete-item]");
             if (deleteButton) {
                 deleteLedgerItem(
@@ -3442,9 +3632,10 @@ function renderFloatingWidgetUI({ forceLedger = false } = {}) {
     const memoryBusy = recoveryBusy || Boolean(getPendingSummarySave()) || activeSummaryChats.has(getChatKey())
         || pendingHierarchyEdits.has(getChatKey())
         || (isBackfilling && activeBackfillChatKey === getChatKey());
-    const ledgerRenderKey = `${getChatKey()}|${getSTContext().name1 || ""}|${memoryBusy ? 1 : 0}|${JSON.stringify(memoryData.stateLedger || {})}`;
+    const ledgerFreshness = getLedgerFreshness(memoryData);
+    const ledgerRenderKey = `${getChatKey()}|${getSTContext().name1 || ""}|${memoryBusy ? 1 : 0}|${JSON.stringify(ledgerFreshness)}|${JSON.stringify(memoryData.stateLedger || {})}`;
     if (forceLedger || ledgerRenderKey !== lastLedgerRenderKey) {
-        bodyInner.innerHTML = buildLedgerHtml(memoryData);
+        bodyInner.innerHTML = buildLedgerHtml(memoryData, ledgerFreshness);
         lastLedgerRenderKey = ledgerRenderKey;
     }
 
@@ -3468,10 +3659,52 @@ function escapeHTML(value) {
         .replace(/'/g, "&#39;");
 }
 
+/** Describe the saved snapshot, including the newest turn intentionally deferred until next send. */
+function getLedgerFreshness(memoryData) {
+    const ctx = getSTContext();
+    const chat = Array.isArray(ctx.chat) ? ctx.chat : [];
+    const roundIndex = getCachedRoundIndex(chat, getSettings().includeNativeHidden);
+    const turns = roundIndex.aiTurns;
+    const stateCursor = getStateLedgerCursor(memoryData);
+    const snapshotEnd = stateCursor.endMessageId;
+    const snapshotRound = stateCursor.round;
+    const latestRound = turns.at(-1)?.round || 0;
+    const coveredRound = roundIndex.roundByIndex.get(snapshotEnd)
+        ?? turns.findLast(turn => turn.idx <= snapshotEnd)?.round ?? 0;
+    const pendingRounds = Math.max(0, latestRound - coveredRound);
+    let newerPlayerMessage = false;
+    for (let i = chat.length - 1; i > snapshotEnd; i--) {
+        if (chat[i]?.is_user && !chat[i]?.is_system) {
+            newerPlayerMessage = true;
+            break;
+        }
+    }
+    const outOfRange = snapshotEnd >= chat.length || snapshotRound > latestRound;
+    const stale = snapshotRound === 0 || pendingRounds > 0 || newerPlayerMessage || outOfRange;
+    const title = snapshotRound > 0 ? "账本快照 · 截至第 " + snapshotRound + " 轮" : "账本尚未同步";
+    let detail;
+    if (outOfRange) {
+        detail = "快照超出当前剧情范围，待校正；请以当前剧情为准。";
+    } else if (snapshotRound === 0) {
+        detail = "最新已完成第 " + latestRound + " 轮，尚无已归档的状态快照；账本将在 L0 总结成功并保存后更新。";
+    } else if (pendingRounds > 0) {
+        detail = "最新已完成第 " + latestRound + " 轮，" + pendingRounds + " 轮尚未同步；位置、穿戴和道具以之后的剧情为准。";
+    } else if (newerPlayerMessage) {
+        detail = "有新的玩家消息尚未同步；状态以之后的剧情为准。";
+    } else {
+        detail = "已同步至该轮结束；后续变化将在下一次 L0 总结成功并保存后更新。";
+    }
+    const mode = resolveStateUpdateMode(getSettings());
+    if (mode !== "with_summary") detail = detail.replace("账本将在 L0 总结成功并保存后更新", "账本将在回复完成后的状态同步成功并保存后更新")
+        .replace("后续变化将在下一次 L0 总结成功并保存后更新", "后续变化将在下一次回复完成并同步成功后更新");
+    if (memoryData.stateSync?.lastError) detail += " 同步失败：" + memoryData.stateSync.lastError.message;
+    return { snapshotRound, latestRound, pendingRounds, stale: stale || Boolean(memoryData.stateSync?.lastError), title, detail, mode };
+}
+
 /**
  * 状态账本通用渲染（状态看板 Tab 与 剧情 → 状态账本 分页共用同一份数据视图）
  */
-function buildLedgerHtml(memoryData) {
+function buildLedgerHtml(memoryData, freshness = getLedgerFreshness(memoryData)) {
     const ledger = memoryData.stateLedger || {};
     const chars = ledger.characters || {};
     const charCards = [];
@@ -3623,8 +3856,13 @@ function buildLedgerHtml(memoryData) {
         : "<div class='tiandao-empty-hint'>暂无未完成的约定与待办</div>";
 
     return `
+        <div class="tiandao-ledger-freshness${freshness.stale ? " is-stale" : ""}" role="status">
+            <strong>${escapeHTML(freshness.title)}</strong>
+            <span>${escapeHTML(freshness.detail)}</span>
+            ${freshness.stale && freshness.mode !== "with_summary" ? `<button type="button" data-retry-state class="tiandao-btn tiandao-btn-sm" ${memoryBusy ? "disabled" : ""}>${freshness.mode === "main_response" ? "重新读取正文状态（不调用 API）" : "同步状态（调用 API）"}</button>` : ""}
+        </div>
         <div class="tiandao-time-banner">
-            <span class="tiandao-time-label"><i class="fa-regular fa-clock"></i> 故事时间</span>
+            <span class="tiandao-time-label"><i class="fa-regular fa-clock"></i> 快照故事时间</span>
             <span class="tiandao-time-val">${escapeHTML(ledger.time || "未知时间")}</span>
         </div>
         ${charCards.length > 0 ? charCards.join("") : "<div class='tiandao-empty-hint'>暂无在场个体状态</div>"}
@@ -3834,11 +4072,11 @@ function buildTimelineHtml(memoryData) {
                         <i class="fa-solid fa-arrows-rotate"></i>
                     </button>
                 </div>
-                <div class="tiandao-entry-text">${escapeHTML(item.text)}</div>
+                <div class="tiandao-entry-text">${escapeHTML(sanitizeSummaryFlourish(item.text, 4000))}</div>
             </div>`;
     };
 
-    const farHistoryText = String(memoryData.farHistory?.text || "").trim();
+    const farHistoryText = sanitizeSummaryFlourish(memoryData.farHistory?.text, 8000);
     if (farHistoryText && !storyViewRange && storyMemoryScope === "active" && !storySearchQuery.trim()) {
         entries.push({ kind: "far", item: farHistoryText });
     }
@@ -4597,6 +4835,17 @@ function bindSettingsUI() {
         updateFloatingWidgetUI();
     });
     syncL0ModeUi();
+    bindInput("tiandao_state_update_mode", "stateUpdateMode", false, () => {
+        invalidateActiveSummaryWork("状态更新方式已变更");
+        const memory = getChatMemory();
+        const sync = ensureLiveStateStorage(memory);
+        const latest = sync.entries.at(-1) || sync.base;
+        latest.sourceFingerprint = buildChatMessageFingerprint([(getSTContext().chat || [])[latest.endMessageId]])[0] || "";
+        saveChatMemory().catch(error => updateStatusBar("⚠️ 模式已切换，但状态基准保存失败：" + error.message, true));
+        refreshPromptInjection("", { skipRetrieval: true });
+        updateFloatingWidgetUI({ forceLedger: true });
+        updateStatusBar("✅ 状态更新方式已切换，仅对后续回复生效；未自动调用 API 或重跑历史");
+    });
     bindInput("tiandao_summary_retry", "summaryRetryCount", true);
     bindInput("tiandao_summarize_timing", "summarizeTiming");
     bindInput("tiandao_widget_theme", "widgetTheme", false, () => applyWidgetAppearance());
@@ -4770,6 +5019,7 @@ function bindSettingsUI() {
             const userName = ctx.name1 || "User";
             const charName = ctx.name2 || "Character";
             const result = await backfillExistingChatHistory(getSettings(), memoryData, chat, userName, charName, {
+                processPromptText: await loadHostPromptProcessor(ctx),
                 onProgress: (cur, total, roundNumber) => {
                     updateSummaryTask(task, {
                         current: cur,
@@ -4932,8 +5182,13 @@ function bindSettingsUI() {
                 // 这里只刷新提示词，不触发摘要，避免预览时消耗 API。
                 if (!dryRun) return;
                 syncHiddenMessagesState();
-                const currentChat = getSTContext().chat || [];
-                await refreshPromptInjection(buildRecentContextQuery(currentChat, settings.targetContentTags, settings.customStripTags));
+                await refreshPromptInjection("", { generationType: type });
+            });
+            if (eventTypes.USER_MESSAGE_RENDERED) eventSource.on(eventTypes.USER_MESSAGE_RENDERED, () => {
+                const chat = getSTContext().chat || [];
+                invalidateRoundIndexCache(chat);
+                refreshChatFingerprint(chat);
+                updateFloatingWidgetUI();
             });
             if (eventTypes.CHARACTER_MESSAGE_RENDERED) eventSource.on(eventTypes.CHARACTER_MESSAGE_RENDERED, async (msgId) => {
                 const settings = getSettings();
@@ -4943,7 +5198,9 @@ function bindSettingsUI() {
                 invalidateRoundIndexCache(chat);
                 refreshChatFingerprint(chat);
                 syncHiddenMessagesState(); updateFloatingWidgetUI();
-                if (settings.autoSummarizePerTurn && settings.summarizeTiming === "after_reply") {
+                const stateMode = resolveStateUpdateMode(settings);
+                if (stateMode !== "with_summary") enqueueLiveStateUpdates(chat, msgId, { ctx: currentCtx });
+                if (stateMode !== "independent" && settings.autoSummarizePerTurn && settings.summarizeTiming === "after_reply") {
                     const chatKey = getChatKey();
                     const epoch = summaryEpoch;
                     enqueuePendingAiTurns(chat, msgId, {
@@ -4988,7 +5245,7 @@ function bindSettingsUI() {
                 invalidateRoundIndexCache(chat);
                 refreshChatFingerprint(chat);
                 const memoryData = getChatMemory();
-                if (memoryData.lastProcessedMessageId >= idx) {
+                if (Math.max(memoryData.lastProcessedMessageId, getStateLedgerCursor(memoryData).endMessageId) >= idx) {
                     rollbackMemoryFromMessageIndex(memoryData, idx, { skipNormalize: true });
                     memoryData.lastSummaryError = null;
                     await saveChatMemory();
@@ -4996,6 +5253,7 @@ function bindSettingsUI() {
                 }
                 const targetMsg = chat[idx];
                 const settings = getSettings();
+                if (resolveStateUpdateMode(settings) !== "with_summary") enqueueLiveStateUpdates(chat, chat.length - 1, { allowSummary: false });
                 if (settings.enabled
                     && settings.autoSummarizePerTurn
                     && settings.l0MergeMode !== "manual"
@@ -5033,7 +5291,7 @@ function bindSettingsUI() {
                 refreshChatFingerprint(chat);
                 const memoryData = getChatMemory();
                 const startFloor = idx > 0 && chat[idx - 1]?.is_user ? idx - 1 : idx;
-                if (memoryData.lastProcessedMessageId >= startFloor) {
+                if (Math.max(memoryData.lastProcessedMessageId, getStateLedgerCursor(memoryData).endMessageId) >= startFloor) {
                     rollbackMemoryFromMessageIndex(memoryData, startFloor, { skipNormalize: true });
                     memoryData.lastSummaryError = null;
                     await saveChatMemory();
@@ -5041,6 +5299,7 @@ function bindSettingsUI() {
                     await refreshPromptInjection().catch(() => {});
                     updateFloatingWidgetUI();
                 }
+                if (resolveStateUpdateMode(getSettings()) !== "with_summary") enqueueLiveStateUpdates(chat, idx, { allowSummary: false });
                 scheduleAfterReplySwipeRepair(getChatKey());
             });
             if (eventTypes.MESSAGE_UPDATED) eventSource.on(eventTypes.MESSAGE_UPDATED, () => {
@@ -5050,6 +5309,6 @@ function bindSettingsUI() {
             });
         }
         updateFloatingWidgetUI();
-        console.log("[溯微] v1.16.0 (原生聊天记录替换·无预算裁剪·保存重试) 加载完毕！");
+        console.log("[溯微] v1.17.0 (独立状态同步·正文状态协议·分层剧情归档) 加载完毕！");
     } catch (err) { console.error("[溯微] 初始化异常:", err); }
 })();

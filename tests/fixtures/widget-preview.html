@@ -38,6 +38,7 @@ async function runPreview(type = "normal") {
  if(aborted)throw Error("替换被中止");
  ctx.lastHistory=core;log();
 }
+for(const ctx of contexts) ctx.getRegexedString = text => text;
 await import("/index.js");
 await runPreview();
 log();
