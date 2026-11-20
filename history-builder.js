@@ -94,7 +94,7 @@ export function buildChatHistoryReplacement(memory, fullChat, coreChat, settings
     const turns = roundIndex.aiTurns.filter(turn => turn.idx <= generationEnd);
     const archive = (memory.archivePool || []).filter(item => Number.isInteger(item.endMessageId) && item.endMessageId <= generationEnd);
     let rawStart = settings.autoHideOldMessages
-        ? computeHiddenMessageCutoff(fullChat.slice(0, generationEnd + 1), Math.max(1, numOr(settings.keepRecentRoundsCount, 5)), memory.lastProcessedMessageId, settings.includeNativeHidden)
+        ? computeHiddenMessageCutoff(fullChat.slice(0, generationEnd + 1), Math.max(1, numOr(settings.keepRecentRoundsCount, 5)), memory.lastProcessedMessageId, settings.includeNativeHidden, { aiTurns: turns })
         : 0;
     const eligibleTurns = turns.filter(turn => turn.idx < rawStart);
     const { selected, covered: pastRound } = selectHistoricalEntries(memory, eligibleTurns, archive);

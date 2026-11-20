@@ -44,7 +44,7 @@ function harness({ renderTimeline = false } = {}) {
     });
     scope.messages = messages;
     scope.renderTimeline = renderTimeline;
-    vm.runInContext(source + '\nconst nativeSyncHidden = syncHiddenMessagesState; updateFloatingWidgetUI = () => { if (renderTimeline) renderStoryTimeline(); }; renderRecoveryPoints = () => {}; if (!renderTimeline) renderStoryTimeline = () => {}; syncHiddenMessagesState = () => {}; updateStatusBar = text => messages.push(text); globalThis.api = { resummarizeRoundInPlace, refreshLedgerFromLatestL0, enqueueLiveStateUpdates, processSingleAiTurn, refreshPromptInjection, retryPendingSummarySave, getPendingSummarySave, recoverPendingSummaries, renderStoryRecoveryState, invalidateActiveSummaryWork, syncLegacyHidden: nativeSyncHidden, interceptor: globalThis.tiandaoMemoryInterceptor, requestSummaryTaskStop, checkpointBeforeChange, importMemoryJsonFile, restoreSelectedRecovery, buildTimelineHtml, buildLedgerHtml, getLedgerFreshness, invalidateRoundIndexCache, updateTodoCompletion, deleteLedgerItem, memoryOperationBusy, clearCurrentChatMemory, saveStoryEntry: window.tiandaoSaveStoryEntry, preview: () => lastInjectionPreview, setScope: value => {storyMemoryScope=value}, setSearch: value => {storySearchQuery=value} };', scope);
+    vm.runInContext(source + '\nconst nativeSyncHidden = syncHiddenMessagesState; updateFloatingWidgetUI = () => { if (renderTimeline) renderStoryTimeline(); }; renderRecoveryPoints = () => {}; if (!renderTimeline) renderStoryTimeline = () => {}; syncHiddenMessagesState = () => {}; updateStatusBar = text => messages.push(text); globalThis.api = { scanChatHistory, resummarizeRoundInPlace, refreshLedgerFromLatestL0, enqueueLiveStateUpdates, processSingleAiTurn, refreshPromptInjection, retryPendingSummarySave, getPendingSummarySave, recoverPendingSummaries, renderStoryRecoveryState, invalidateActiveSummaryWork, syncLegacyHidden: nativeSyncHidden, interceptor: globalThis.tiandaoMemoryInterceptor, requestSummaryTaskStop, checkpointBeforeChange, importMemoryJsonFile, restoreSelectedRecovery, buildTimelineHtml, buildLedgerHtml, getLedgerFreshness, invalidateRoundIndexCache, updateTodoCompletion, deleteLedgerItem, memoryOperationBusy, clearCurrentChatMemory, saveStoryEntry: window.tiandaoSaveStoryEntry, preview: () => lastInjectionPreview, setScope: value => {storyMemoryScope=value}, setSearch: value => {storySearchQuery=value} };', scope);
     return { api: scope.api, nodes, readers, messages, current: () => current, switchTo: value => { current = value; } };
 }
 
@@ -974,3 +974,211 @@ for (const [enabled, type] of [[false, 'normal'], [true, 'normal'], [true, 'quie
         assert.equal(JSON.stringify(ctx.chat), before);
     });
 }
+
+test("character growth renders inside the existing card with escaped facts and source rounds", () => {
+    const h = harness();
+    const memory = h.current().chatMetadata.tiandao_memory;
+    memory.stateLedger.characters.旅人.inventory = ["铜钥匙"];
+    memory.stateLedger.characters.旅人.growth = [{
+        key: "对导师的判断", dimension: "relationship", target: "导师", state: '<img src=x onerror="bad()">先核实命令',
+        evidence: "明确要求先查卷宗 & 再行动", sourceRound: 7,
+    }];
+    const html = h.api.buildLedgerHtml(memory);
+    assert.match(html, /<details class="tiandao-char-growth"><summary>长期成长 · 1 项<\/summary>/);
+    assert.match(html, /关系与信任 · 导师/);
+    assert.match(html, /第 7 轮确认/);
+    assert.match(html, /&lt;img/);
+    assert.match(html, /&amp; 再行动/);
+    assert.doesNotMatch(html, /<img src=x/);
+    assert.match(html, /随身道具/);
+    assert.match(html, /铜钥匙/);
+});
+
+test("a revealed name is displayed while card actions keep their stable storage key", () => {
+ const h=harness();const memory=h.current().chatMetadata.tiandao_memory;
+ memory.stateLedger.characters={戴面具的引路人:{canonicalName:'沈舟',aliases:[],inventory:['铜钥匙']}};
+ const html=h.api.buildLedgerHtml(memory);
+ assert.match(html,/<span class="tiandao-char-name">沈舟<\/span>/);
+ assert.match(html,/data-char-name="戴面具的引路人"/);
+ assert.match(html,/data-char-toggle="戴面具的引路人"/);
+ assert.match(html,/别名\/称号: 戴面具的引路人/);
+});
+
+test("manual todo completion uses the state round when narrative summaries lag behind", async () => {
+ const h=harness();const memory=h.current().chatMetadata.tiandao_memory;
+ memory.stateSync={version:1,base:{endMessageId:19,round:10,ledger:structuredClone(memory.stateLedger)},entries:[],lastError:null};
+ memory.stateLedger.todosAndPromises=[{id:'live-promise',text:'归还铜钥匙',completed:false}];
+ await h.api.updateTodoCompletion('live-promise',true);
+ assert.equal(memory.stateLedger.todosAndPromises[0].completedRound,10);
+ const same=engine.applyStateChanges(memory.stateLedger,{version:1,baseRound:10,changes:{}},10);
+ assert.equal(same.todosAndPromises[0].completed,true);
+ const next=engine.applyStateChanges(same,{version:1,baseRound:10,changes:{}},11);
+ assert.deepEqual(next.todosAndPromises,[]);
+});
+
+
+for (const change of ['none', 'reply', 'ledger', 'owner']) {
+    test('unsaved narrative draft survives metadata reload only for the same source and baseline: ' + change, async t => {
+        const h = harness(), calls = mockSummary(t, h), original = h.current();
+        const persisted = structuredClone(original.chatMetadata);
+        original.saveMetadata = async () => { throw Error('offline'); };
+        await h.api.processSingleAiTurn(1);
+        assert.ok(h.api.getPendingSummarySave()); assert.equal(calls(), 1);
+        h.switchTo(makeContext('elsewhere'));
+        h.api.invalidateActiveSummaryWork('switch');
+        const reopened = { ...original, chat: structuredClone(original.chat), chatMetadata: persisted, saveMetadata: async () => {} };
+        if (change === 'reply') reopened.chat[1].mes = '修改后的最终回复';
+        if (change === 'ledger') reopened.chatMetadata.tiandao_memory.stateLedger.time = '手动修订的时间';
+        if (change === 'owner') reopened.characterId = 1;
+        h.switchTo(reopened);
+        const pending = h.api.getPendingSummarySave();
+        if (change === 'none') {
+            assert.ok(pending);
+            assert.equal(await h.api.retryPendingSummarySave(), true);
+            assert.equal(reopened.chatMetadata.tiandao_memory.archivePool.length, 1);
+            assert.equal(calls(), 1);
+        } else {
+            assert.equal(pending, null);
+            assert.equal(reopened.chatMetadata.tiandao_memory.archivePool.length, 0);
+        }
+    });
+}
+
+test('a narrative draft survives a failed save after the host reuses the chat array for another chat', async t => {
+    const h = harness(), calls = mockSummary(t, h), original = h.current();
+    const savedChat = structuredClone(original.chat), savedMetadata = structuredClone(original.chatMetadata);
+    let startSave, rejectSave;
+    const started = new Promise(resolve => { startSave = resolve; });
+    original.saveMetadata = () => new Promise((_resolve, reject) => { rejectSave = reject; startSave(); });
+    const work = h.api.processSingleAiTurn(1); await started;
+    const next = makeContext(original.chatId); next.characterId = 1;
+    original.chat.splice(0, original.chat.length, ...next.chat); next.chat = original.chat;
+    h.switchTo(next); h.api.invalidateActiveSummaryWork('switch');
+    rejectSave(Error('offline')); await work;
+    assert.equal(original.chatMetadata.tiandao_memory.archivePool.length, 0);
+    assert.equal(h.api.getPendingSummarySave(), null);
+    original.chat.splice(0, original.chat.length, ...savedChat);
+    h.switchTo({ ...original, chatMetadata: savedMetadata, saveMetadata: async () => {} });
+    assert.ok(h.api.getPendingSummarySave());
+    assert.equal(await h.api.retryPendingSummarySave(), true);
+    assert.equal(calls(), 1);
+    assert.equal(h.current().chatMetadata.tiandao_memory.archivePool.length, 1);
+});
+
+for (const includeNativeHidden of [false, true]) {
+    test('automatic summary obeys player visibility and retains every visible consecutive input: ' + includeNativeHidden, async t => {
+        const h = harness(), prompts = [];
+        const ctx = h.current();
+        Object.assign(ctx.extensionSettings['tiandao-memory-engine'], { apiUrl: 'https://example.invalid/v1', apiKey: 'key', model: 'mock', includeNativeHidden });
+        ctx.chat = [
+            { is_user: true, mes: '早先的玩家事实' },
+            { is_user: true, is_system: true, mes: '隐藏的玩家事实' },
+            { is_user: true, mes: '后续的玩家事实' },
+            { is_user: false, mes: '角色的最终答复' },
+        ];
+        t.mock.method(globalThis, 'fetch', async (_url, options) => {
+            prompts.push(JSON.parse(options.body));
+            return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ l0_summary: '守卫收到铜钥匙。', keywords: [], stateLedger: {} }) } }] }), { headers: { 'Content-Type': 'application/json' } });
+        });
+        assert.equal(await h.api.processSingleAiTurn(3), true);
+        const text = prompts[0].messages.map(message => message.content).join('\n');
+        assert.match(text, /早先的玩家事实/); assert.match(text, /后续的玩家事实/);
+        assert.equal(text.includes('隐藏的玩家事实'), includeNativeHidden);
+    });
+}
+
+
+test('history scan retains a failed batch across metadata reload and retries saving without another API call', async t => {
+    const h = harness(), calls = mockSummary(t, h), ctx = h.current();
+    const persisted = structuredClone(ctx.chatMetadata);
+    ctx.saveMetadata = async () => { throw Error('disk full'); };
+    await h.api.scanChatHistory({ innerHTML: '' });
+    assert.equal(calls(), 1); assert.ok(h.api.getPendingSummarySave());
+    assert.equal(ctx.chatMetadata.tiandao_memory.archivePool.length, 0);
+    assert.equal(ctx.chatMetadata.tiandao_memory.lastProcessedMessageId, -1);
+    h.switchTo(makeContext('elsewhere')); h.api.invalidateActiveSummaryWork('switch');
+    const reopened = { ...ctx, chat: structuredClone(ctx.chat), chatMetadata: persisted, saveMetadata: async () => {} };
+    h.switchTo(reopened);
+    assert.ok(h.api.getPendingSummarySave());
+    await h.api.scanChatHistory({ innerHTML: '' });
+    assert.equal(calls(), 1); assert.equal(h.api.getPendingSummarySave(), null);
+    assert.equal(reopened.chatMetadata.tiandao_memory.archivePool.length, 1);
+    assert.equal(reopened.chatMetadata.tiandao_memory.lastProcessedMessageId, 1);
+});
+
+test('a preview failure after a successful history save does not roll back or regenerate its archive', async t => {
+    const h = harness(), calls = mockSummary(t, h), ctx = h.current();
+    let saves = 0; ctx.saveMetadata = async () => { saves++; };
+    ctx.setExtensionPrompt = () => { throw Error('preview unavailable'); };
+    await h.api.scanChatHistory({ innerHTML: '' });
+    assert.equal(saves, 1); assert.equal(calls(), 1);
+    assert.equal(h.api.getPendingSummarySave(), null);
+    assert.equal(ctx.chatMetadata.tiandao_memory.archivePool.length, 1);
+});
+
+test('a failed history save after a chat switch keeps the old draft away from the new owner', async t => {
+    const h = harness(), calls = mockSummary(t, h), original = h.current();
+    const savedChat = structuredClone(original.chat), savedMetadata = structuredClone(original.chatMetadata);
+    let startSave, rejectSave;
+    const started = new Promise(resolve => { startSave = resolve; });
+    original.saveMetadata = () => new Promise((_resolve, reject) => { rejectSave = reject; startSave(); });
+    const work = h.api.scanChatHistory({ innerHTML: '' }); await started;
+    const next = makeContext(original.chatId); next.characterId = 1;
+    next.chat[1].mes = '另一个人物的回复';
+    original.chat.splice(0, original.chat.length, ...next.chat); next.chat = original.chat;
+    let nextSaves = 0; next.saveMetadata = async () => { nextSaves++; };
+    h.switchTo(next); h.api.invalidateActiveSummaryWork('switch');
+    rejectSave(Error('offline')); await work;
+    assert.equal(original.chatMetadata.tiandao_memory.archivePool.length, 0);
+    assert.equal(next.chatMetadata.tiandao_memory.archivePool.length, 0);
+    assert.equal(nextSaves, 0); assert.equal(h.api.getPendingSummarySave(), null);
+    original.chat.splice(0, original.chat.length, ...savedChat);
+    h.switchTo({ ...original, chatMetadata: savedMetadata, saveMetadata: async () => {} });
+    assert.ok(h.api.getPendingSummarySave());
+    assert.equal(await h.api.retryPendingSummarySave(), true);
+    assert.equal(calls(), 1);
+});
+
+
+test('a native edit during a failed draft save cannot resurrect invalidated narrative archives', async t => {
+    const h = harness(), calls = mockSummary(t, h), ctx = h.current();
+    const memory = ctx.chatMetadata.tiandao_memory;
+    await h.api.processSingleAiTurn(1);
+    ctx.chat.push({ is_user: true, mes: '第二轮玩家' }, { is_user: false, mes: '第二轮回复' });
+    ctx.saveMetadata = async () => { throw Error('offline'); };
+    await h.api.processSingleAiTurn(3);
+    assert.equal(memory.archivePool.length, 1); assert.ok(h.api.getPendingSummarySave());
+    let startSave, rejectSave;
+    const started = new Promise(resolve => { startSave = resolve; });
+    ctx.saveMetadata = () => new Promise((_resolve, reject) => { rejectSave = reject; startSave(); });
+    const retry = h.api.retryPendingSummarySave(); await started;
+    ctx.chat[0].mes = '第一轮已改写'; h.api.invalidateActiveSummaryWork('edited');
+    engine.rollbackMemoryFromMessageIndex(memory, 0);
+    rejectSave(Error('offline')); await retry;
+    assert.equal(memory.archivePool.length, 0); assert.equal(memory.lastProcessedMessageId, -1);
+    assert.equal(h.api.getPendingSummarySave(), null); assert.equal(calls(), 2);
+});
+
+
+test('retrying an old scan save cannot begin scanning a different chat selected during the save', async t => {
+    const h = harness(), calls = mockSummary(t, h), original = h.current();
+    original.saveMetadata = async () => { throw Error('offline'); };
+    await h.api.scanChatHistory({ innerHTML: '' });
+    assert.ok(h.api.getPendingSummarySave()); assert.equal(calls(), 1);
+    const next = makeContext('new-chat');
+    next.extensionSettings = original.extensionSettings;
+    original.saveMetadata = async () => { h.switchTo(next); h.api.invalidateActiveSummaryWork('switch'); };
+    await h.api.scanChatHistory({ innerHTML: '' });
+    assert.equal(calls(), 1); assert.equal(next.chatMetadata.tiandao_memory.archivePool.length, 0);
+});
+
+
+test('automatic archive retries cannot move on to another chat selected during the save', async t => {
+    const h = harness(), calls = mockSummary(t, h), original = h.current();
+    original.saveMetadata = async () => { throw Error('offline'); };
+    await h.api.processSingleAiTurn(1);
+    const next = makeContext('new-chat'); next.extensionSettings = original.extensionSettings;
+    original.saveMetadata = async () => { h.switchTo(next); h.api.invalidateActiveSummaryWork('switch'); };
+    assert.equal(await h.api.processSingleAiTurn(1), false);
+    assert.equal(calls(), 1); assert.equal(next.chatMetadata.tiandao_memory.archivePool.length, 0);
+});

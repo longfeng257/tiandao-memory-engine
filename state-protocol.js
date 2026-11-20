@@ -1,3 +1,5 @@
+import { CHARACTER_MEMORY_RULES } from "./character-memory.js";
+
 // Machine state stays in the source reply for swipe/reload recovery, never in story input.
 export function stripStateUpdateBlocks(value) {
     return String(value ?? '')
@@ -94,6 +96,8 @@ export function readMainResponseState(value) {
 export function buildStateUpdateInstruction(baseRound = 0, mainResponse = false) {
     const schema = JSON.stringify({ version: 1, baseRound, changes: {
         time: '仅明确变化时填写', characters: { '沿用账本人物名': {
+            canonicalName: '仅正文明确揭示或确认姓名时更新，键名沿用旧档', importance: 'supporting', importanceReason: '仅写值得跨轮追踪的具体剧情依据', named: true,
+            growth: [{ key: '沿用该方面的稳定名称', dimension: 'cognition', target: '', state: '已成立的当前判断方式', evidence: '本段明确对话或持续行为依据' }],
             location: '仅变化时填写', statusAndAction: '只写可观察的事实', wear: '仅变化时填写',
             inventoryAdd: ['新增物品，或同一物品的最新描述'], inventoryRemove: ['明确消耗、丢弃或转交的物品名'],
             removedItemsLockAdd: ['本段脱下的衣物及最新去向'], removedItemsLockRemove: ['明确重戴或转交的物品名'],
@@ -103,7 +107,8 @@ export function buildStateUpdateInstruction(baseRound = 0, mainResponse = false)
         '状态更新协议：仅记录已经发生的事实，比较提供的状态快照与本段剧情结束状态。',
         '只返回变化字段；未提及的旧人物、道具和约定全部保留。物品不限条数；同一实物只更新一条，不合并不同编号、颜色或确为不同的实物。',
         '发言署名不代表剧情身份；只追踪剧情中真实出场且有具体状态的实体，不创建旁白、系统或占位人物。',
-        'characters 使用既有人物键名；新出场具体人物可新增。可用标量字段：location、statusAndAction、wear、viewTarget、viewTargetVisible、present；aliases 可用字符串数组。',
+        'characters 使用既有人物键名；仅符合收录条件的新人物可新增。可用标量字段：canonicalName、location、statusAndAction、wear、viewTarget、viewTargetVisible、present、importance、importanceReason、named；aliases 可用字符串数组；growth 只填写有依据的新状态或变化项。',
+        CHARACTER_MEMORY_RULES,
         '物品增删使用 inventoryAdd、inventoryRemove、removedItemsLockAdd、removedItemsLockRemove；转交时分别更新双方。重新穿戴时移除卸下记录并更新 wear，不能凭旧锁否认之后的重戴。',
         '私下所见只写对应角色的 viewTarget，禁止写入其他角色；不推测心理，不写氛围、升华、尚未回应或等待玩家。',
         'todosAdd 只含值得跨轮跟进的明确约定；todosComplete 沿用已有事项原文或 id。没有变化时 changes 返回 {}。',

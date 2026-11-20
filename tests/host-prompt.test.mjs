@@ -80,3 +80,11 @@ test('a source reader excludes the discarded swipe reply even when read directly
     assert.equal(read(0), '保留的问题');
     assert.equal(read(1), '');
 });
+
+
+test('preview preserves visible host tool messages even when their system flag is set', () => {
+    const chat = [{ is_user: true, mes: 'question' },
+        { is_user: false, is_system: true, mes: 'tool result', extra: { tool_invocations: [{ id: 'call-1' }] } },
+        { is_user: false, mes: 'answer' }];
+    assert.deepEqual(preparePromptHistory(chat, text => text).map(message => message.mes), ['question', 'tool result', 'answer']);
+});

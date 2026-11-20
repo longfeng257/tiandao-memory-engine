@@ -667,6 +667,22 @@
     color: var(--sw-info-text);
 }
 
+/* ---------- 人物成长：沿用人物卡字体与主题 ---------- */
+.tiandao-char-growth {
+    margin-top: 5px;
+    border-top: 1px solid var(--sw-line);
+    padding-top: 5px;
+}
+
+.tiandao-char-growth > summary {
+    cursor: pointer;
+    color: var(--sw-text);
+}
+
+.tiandao-char-growth > .tiandao-char-prop {
+    margin-top: 6px;
+}
+
 /* ---------- 随身物品折叠栏 ---------- */
 .tiandao-char-item-section {
     margin-top: 5px;

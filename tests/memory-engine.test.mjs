@@ -1686,7 +1686,7 @@ test("user-starting chats and system-prefixed openings use the same round rules"
         userMessageIndex: 2,
         openingMessageIndex: 1,
     });
-    assert.equal(computeHiddenMessageCutoff(systemPrefixed, 1, 3), 2);
+    assert.equal(computeHiddenMessageCutoff(systemPrefixed, 1, 3), 1);
 });
 
 test("native hidden AI floors can be included explicitly for legacy migration", () => {
