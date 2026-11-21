@@ -7,6 +7,8 @@ import * as recovery from "../recovery-store.js";
 import * as history from "../history-builder.js";
 import * as hostPrompt from "../host-prompt.js";
 import * as stateProtocol from "../state-protocol.js";
+import * as hostPersistence from "../host-persistence.js";
+import * as memoryBackup from "../memory-backup.js";
 import { createSummaryTaskGate } from "../task-gate.js";
 
 const source = (await readFile(new URL("../index.js", import.meta.url), "utf8"))
@@ -17,7 +19,9 @@ function makeContext(id = "a") {
     memory.stateLedger.time = "清晨";
     memory.stateLedger.characters = { 旅人: { location: "城门", statusAndAction: "等待", wear: "布衣", inventory: [], removedItemsLock: [] } };
     return {
-        chatId: id, characterId: 0, name1: "旅人", name2: "守卫",
+        chatId: id, characterId: 0, characters: [{ avatar: "test.png" }],
+        getCurrentChatId: () => id, getRequestHeaders: () => ({ "X-CSRF-Token": "test" }),
+        name1: "旅人", name2: "守卫",
         chat: [{ is_user: true, mes: "钥匙呢" }, { is_user: false, mes: "在这里" }],
         chatMetadata: { tiandao_memory: memory },
         extensionSettings: { "tiandao-memory-engine": { ...engine.DEFAULT_SETTINGS, enableRetrieval: false, autoHideOldMessages: false } },
@@ -35,17 +39,46 @@ function harness({ renderTimeline = false } = {}) {
         readAsText() {}
         async complete(value) { this.result = value; await this.onload(); }
     }
+    const persisted = new Map();
+    const installed = new WeakSet();
+    const contextKey = ctx => JSON.stringify([ctx.characters?.[ctx.characterId]?.avatar, ctx.chatId]);
+    const installStorage = ctx => {
+        if (installed.has(ctx)) return;
+        installed.add(ctx);
+        if (!persisted.has(contextKey(ctx))) persisted.set(contextKey(ctx), structuredClone(ctx.chatMetadata));
+        let saver = ctx.saveMetadata;
+        Object.defineProperty(ctx, 'saveMetadata', { configurable: true, enumerable: true,
+            get: () => typeof saver !== 'function' ? saver : async () => {
+                const key = contextKey(ctx), snapshot = structuredClone(ctx.chatMetadata);
+                const result = await saver();
+                if (result !== false && result?.ok !== false) persisted.set(key, snapshot);
+                return result;
+            },
+            set: value => { saver = value; },
+        });
+    };
+    installStorage(current);
     const scope = vm.createContext({
-        ...engine, ...recovery, ...history, ...hostPrompt, ...stateProtocol, createSummaryTaskGate,
+        ...engine, ...recovery, ...history, ...hostPrompt, ...stateProtocol, ...hostPersistence, ...memoryBackup, createSummaryTaskGate,
         window: {}, SillyTavern: { getContext: () => current },
         document: { getElementById: id => nodes.get(id) || null },
         FileReader: Reader, confirm: () => true, console,
+        fetch: async (url, options) => {
+            const body = JSON.parse(options?.body || "{}");
+            if (url === "/api/chats/get" || url === "/api/chats/group/get") {
+                const key = JSON.stringify([body.avatar_url, body.file_name]);
+                return { ok: true, json: async () => [{ chat_metadata: structuredClone(persisted.get(key) || {}) }] };
+            }
+            return globalThis.fetch(url, options);
+        },
         setTimeout, clearTimeout, AbortController, Map, Set, WeakMap, WeakSet,
     });
     scope.messages = messages;
     scope.renderTimeline = renderTimeline;
-    vm.runInContext(source + '\nconst nativeSyncHidden = syncHiddenMessagesState; updateFloatingWidgetUI = () => { if (renderTimeline) renderStoryTimeline(); }; renderRecoveryPoints = () => {}; if (!renderTimeline) renderStoryTimeline = () => {}; syncHiddenMessagesState = () => {}; updateStatusBar = text => messages.push(text); globalThis.api = { scanChatHistory, resummarizeRoundInPlace, refreshLedgerFromLatestL0, enqueueLiveStateUpdates, processSingleAiTurn, refreshPromptInjection, retryPendingSummarySave, getPendingSummarySave, recoverPendingSummaries, renderStoryRecoveryState, invalidateActiveSummaryWork, syncLegacyHidden: nativeSyncHidden, interceptor: globalThis.tiandaoMemoryInterceptor, requestSummaryTaskStop, checkpointBeforeChange, importMemoryJsonFile, restoreSelectedRecovery, buildTimelineHtml, buildLedgerHtml, getLedgerFreshness, invalidateRoundIndexCache, updateTodoCompletion, deleteLedgerItem, memoryOperationBusy, clearCurrentChatMemory, saveStoryEntry: window.tiandaoSaveStoryEntry, preview: () => lastInjectionPreview, setScope: value => {storyMemoryScope=value}, setSearch: value => {storySearchQuery=value} };', scope);
-    return { api: scope.api, nodes, readers, messages, current: () => current, switchTo: value => { current = value; } };
+    vm.runInContext(source + '\nconst nativeSyncHidden = syncHiddenMessagesState; updateFloatingWidgetUI = () => { if (renderTimeline) renderStoryTimeline(); }; renderRecoveryPoints = () => {}; if (!renderTimeline) renderStoryTimeline = () => {}; syncHiddenMessagesState = () => {}; updateStatusBar = text => messages.push(text); globalThis.api = { scanChatHistory, runStoryResummarize, resummarizeStoryRange, getPendingBacklog, buildResummarizePlan, resummarizeRoundInPlace, refreshLedgerFromLatestL0, enqueueLiveStateUpdates, processSingleAiTurn, refreshPromptInjection, retryPendingSummarySave, getPendingSummarySave, recoverPendingSummaries, renderStoryRecoveryState, invalidateActiveSummaryWork, syncLegacyHidden: nativeSyncHidden, interceptor: globalThis.tiandaoMemoryInterceptor, requestSummaryTaskStop, checkpointBeforeChange, importMemoryJsonFile, restoreSelectedRecovery, buildTimelineHtml, buildLedgerHtml, getLedgerFreshness, invalidateRoundIndexCache, updateTodoCompletion, deleteLedgerItem, memoryOperationBusy, clearCurrentChatMemory, saveStoryEntry: window.tiandaoSaveStoryEntry, preview: () => lastInjectionPreview, setScope: value => {storyMemoryScope=value}, setSearch: value => {storySearchQuery=value} };', scope);
+    return { api: scope.api, nodes, readers, messages, current: () => current, switchTo: value => { installStorage(value); current = value; },
+        persist: value => persisted.set(contextKey(current), structuredClone(value || current.chatMetadata)),
+    };
 }
 
 test("widget preview equals the replacement history and clears on pause or chat change", async () => {
@@ -105,7 +138,7 @@ test("failed import persistence restores the original memory object", async () =
 
 test("restore failure keeps current memory and a successful restore makes a redo point", async () => {
     const h = harness();
-    assert.equal(h.api.checkpointBeforeChange("edit"), true);
+    assert.ok(h.api.checkpointBeforeChange("edit"));
     const point = h.current().chatMetadata.suwei_memory_recovery_v1[0];
     h.nodes.get("tiandao_recovery_select").value = point.id;
     h.current().chatMetadata.tiandao_memory.stateLedger.time = "夜晚";
@@ -1181,4 +1214,152 @@ test('automatic archive retries cannot move on to another chat selected during t
     original.saveMetadata = async () => { h.switchTo(next); h.api.invalidateActiveSummaryWork('switch'); };
     assert.equal(await h.api.processSingleAiTurn(1), false);
     assert.equal(calls(), 1); assert.equal(next.chatMetadata.tiandao_memory.archivePool.length, 0);
+});
+
+function storyGapFixture(h, count = 5) {
+    const ctx = h.current(), memory = ctx.chatMetadata.tiandao_memory;
+    Object.assign(ctx.extensionSettings['tiandao-memory-engine'], { l0RoundsPerSummary: 1, summaryRetryCount: 0 });
+    ctx.chat = [];
+    memory.archivePool = [];
+    for (let round = 1; round <= count; round++) {
+        ctx.chat.push({ is_user: true, mes: '问题' + round }, { is_user: false, mes: '回复' + round });
+        if (round !== 2) memory.archivePool.push({ id: 'old-' + round, level: 0, roundRange: String(round),
+            startMessageId: round * 2 - 2, endMessageId: round * 2 - 1, text: '原剧情' + round });
+    }
+    memory.levels[0] = memory.archivePool.slice();
+    memory.stateLedger.time = '最新状态';
+    memory.stateSync = { version: 1, base: { endMessageId: count * 2 - 1, round: count, ledger: structuredClone(memory.stateLedger) }, entries: [], lastError: null };
+    engine.normalizeMemoryData(memory);
+    const missing = engine.collectMissingAiTurns(ctx.chat, memory);
+    return { ctx, memory, missing };
+}
+
+test('a middle-gap repair keeps later archives and the newer independent state', async t => {
+    const h = harness(), calls = mockSummary(t, h);
+    const { ctx, memory, missing } = storyGapFixture(h);
+    const newer = memory.archivePool.filter(item => Number(item.roundRange) > 2).map(item => structuredClone(item));
+    const state = JSON.stringify(memory.stateSync);
+    assert.deepEqual(h.api.getPendingBacklog(ctx.chat, memory).map(item => item.round), [2]);
+    await h.api.recoverPendingSummaries();
+    assert.equal(calls(), 1);
+    assert.deepEqual(Array.from(memory.archivePool, item => item.roundRange), ['1', '2', '3', '4', '5']);
+    assert.equal(memory.archivePool[1].text, '守卫答应保管铜钥匙。');
+    for (const item of newer) assert.deepEqual(JSON.parse(JSON.stringify(memory.archivePool.find(saved => saved.id === item.id))), item);
+    assert.equal(memory.lastProcessedMessageId, 9);
+    assert.equal(memory.lastProcessedRound, 5);
+    assert.equal(JSON.stringify(memory.stateSync), state);
+    assert.equal(memory.stateLedger.time, '最新状态');
+    assert.deepEqual(engine.collectMissingAiTurns(ctx.chat, memory), []);
+    assert.equal(ctx.chatMetadata.suwei_memory_recovery_v1.length, 1);
+});
+
+test('a failed range save restores evicted recovery points and retries only persistence', async t => {
+    const h = harness(), calls = mockSummary(t, h);
+    const { ctx, memory, missing } = storyGapFixture(h);
+    for (let index = 0; index < 3; index++) assert.ok(h.api.checkpointBeforeChange('原恢复点' + index));
+    const points = JSON.stringify(ctx.chatMetadata.suwei_memory_recovery_v1);
+    const archive = JSON.stringify(memory.archivePool), state = JSON.stringify(memory.stateSync);
+    let saves = 0;
+    ctx.saveMetadata = async () => { saves++; throw Error('disk full'); };
+    await h.api.runStoryResummarize(missing, { requireConfirm: false });
+    assert.equal(calls(), 1); assert.equal(saves, 1);
+    assert.equal(JSON.stringify(memory.archivePool), archive);
+    assert.equal(JSON.stringify(memory.stateSync), state);
+    assert.equal(JSON.stringify(ctx.chatMetadata.suwei_memory_recovery_v1), points);
+    const pending = h.api.getPendingSummarySave();
+    assert.ok(pending); assert.equal(pending.recoveryDraft.value.length, 3);
+    assert.notEqual(JSON.stringify(pending.recoveryDraft.value), points);
+    ctx.saveMetadata = async () => { saves++; };
+    assert.equal(await h.api.retryPendingSummarySave(), true);
+    assert.equal(saves, 2); assert.equal(calls(), 1);
+    assert.equal(h.api.getPendingSummarySave(), null);
+    assert.equal(memory.archivePool.length, 5);
+    assert.equal(JSON.stringify(ctx.chatMetadata.suwei_memory_recovery_v1), JSON.stringify(pending.recoveryDraft.value));
+    assert.equal(JSON.stringify(memory.stateSync), state);
+});
+
+test('range retry confirms an already persisted draft without saving or generating again', async t => {
+    const h = harness(), calls = mockSummary(t, h);
+    const { ctx, memory, missing } = storyGapFixture(h);
+    ctx.saveMetadata = async () => { throw Error('confirmation unavailable'); };
+    await h.api.runStoryResummarize(missing, { requireConfirm: false });
+    const pending = h.api.getPendingSummarySave();
+    assert.ok(pending);
+    h.persist({ tiandao_memory: structuredClone(pending.draft), suwei_memory_recovery_v1: structuredClone(pending.recoveryDraft.value) });
+    let saves = 0;
+    ctx.saveMetadata = async () => { saves++; throw Error('must not save twice'); };
+    assert.equal(await h.api.retryPendingSummarySave(), true);
+    assert.equal(saves, 0); assert.equal(calls(), 1);
+    assert.equal(memory.archivePool.length, 5);
+    assert.equal(h.api.getPendingSummarySave(), null);
+});
+
+for (const change of ['reply', 'recovery']) {
+    test('a range draft is invalidated by a changed ' + change + ' baseline', async t => {
+        const h = harness(); mockSummary(t, h);
+        const { ctx, memory, missing } = storyGapFixture(h);
+        ctx.saveMetadata = async () => { throw Error('offline'); };
+        await h.api.runStoryResummarize(missing, { requireConfirm: false });
+        assert.ok(h.api.getPendingSummarySave());
+        if (change === 'reply') ctx.chat[3].mes = '更改后的回复';
+        else ctx.chatMetadata.suwei_memory_recovery_v1 = [recovery.createRecoveryPoint(memory, ctx.chat, '新的恢复点')];
+        assert.equal(h.api.getPendingSummarySave(), null);
+        assert.equal(memory.archivePool.length, 4);
+        assert.equal(await h.api.retryPendingSummarySave(), true);
+        assert.equal(memory.archivePool.length, 4);
+    });
+}
+
+test('range generation stays detached and cannot commit after switching chats', async t => {
+    const h = harness(); mockSummary(t, h);
+    const { ctx, memory, missing } = storyGapFixture(h);
+    const originalArchive = JSON.stringify(memory.archivePool);
+    let finish, started;
+    const ready = new Promise(resolve => { started = resolve; });
+    t.mock.method(globalThis, 'fetch', async () => { started(); return new Promise(resolve => { finish = resolve; }); });
+    let saves = 0; ctx.saveMetadata = async () => { saves++; };
+    const work = h.api.runStoryResummarize(missing, { requireConfirm: false });
+    await ready;
+    assert.equal(JSON.stringify(memory.archivePool), originalArchive);
+    const next = makeContext('other'); h.switchTo(next);
+    finish(new Response(JSON.stringify({ choices: [{ message: { content: '{"l0_summary":"过期结果","keywords":[]}' } }] })));
+    await work;
+    assert.equal(saves, 0);
+    assert.equal(JSON.stringify(memory.archivePool), originalArchive);
+    assert.equal(ctx.chatMetadata.suwei_memory_recovery_v1, undefined);
+    assert.equal(next.chatMetadata.tiandao_memory.archivePool.length, 0);
+    assert.equal(next.chatMetadata.suwei_memory_recovery_v1, undefined);
+});
+
+test('a failed range save after a chat switch can be retried only in its original owner', async t => {
+    const h = harness(), calls = mockSummary(t, h);
+    const { ctx, memory, missing } = storyGapFixture(h);
+    let rejectSave, startSave;
+    const started = new Promise(resolve => { startSave = resolve; });
+    ctx.saveMetadata = () => new Promise((_resolve, reject) => { rejectSave = reject; startSave(); });
+    const work = h.api.runStoryResummarize(missing, { requireConfirm: false }); await started;
+    const next = makeContext(ctx.chatId); next.characterId = 1;
+    let nextSaves = 0; next.saveMetadata = async () => { nextSaves++; };
+    h.switchTo(next); rejectSave(Error('offline')); await work;
+    assert.equal(nextSaves, 0); assert.equal(h.api.getPendingSummarySave(), null);
+    assert.equal(memory.archivePool.length, 4);
+    assert.equal(ctx.chatMetadata.suwei_memory_recovery_v1, undefined);
+    h.switchTo(ctx); ctx.saveMetadata = async () => {};
+    assert.ok(h.api.getPendingSummarySave());
+    assert.equal(await h.api.retryPendingSummarySave(), true);
+    assert.equal(calls(), 1); assert.equal(memory.archivePool.length, 5);
+    assert.equal(next.chatMetadata.tiandao_memory.archivePool.length, 0);
+});
+
+test('a preview failure after a confirmed range save preserves the archive and its recovery point', async t => {
+    const h = harness(), calls = mockSummary(t, h);
+    const { ctx, memory, missing } = storyGapFixture(h);
+    let saves = 0; ctx.saveMetadata = async () => { saves++; };
+    ctx.setExtensionPrompt = () => { throw Error('preview unavailable'); };
+    await h.api.runStoryResummarize(missing, { requireConfirm: false });
+    assert.equal(saves, 1); assert.equal(calls(), 1);
+    assert.equal(memory.archivePool.length, 5);
+    assert.equal(ctx.chatMetadata.suwei_memory_recovery_v1.length, 1);
+    assert.equal(h.api.getPendingSummarySave(), null);
+    assert.ok(h.messages.some(message => message.includes('存档已保存，但预览刷新失败')));
 });

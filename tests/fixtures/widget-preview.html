@@ -2,6 +2,13 @@
 <script type="module">
 import { createEmptyMemoryData, DEFAULT_SETTINGS } from "/memory-engine.js";
 let current = 0, failSave = false;
+const nativeConsoleError = console.error.bind(console);
+console.error = (...values) => {
+ const output = document.getElementById("fixture_errors") || document.body.appendChild(Object.assign(document.createElement("pre"), {id:"fixture_errors"}));
+ output.textContent += values.map(value=>String(value?.stack||value)).join(" ")+"\n";
+ nativeConsoleError(...values);
+};
+const persisted = new Map();
 const makeContext = id => {
  const memory = createEmptyMemoryData();
  const chat = [];
@@ -17,7 +24,8 @@ const makeContext = id => {
  memory.lastProcessedRound=14;memory.lastProcessedMessageId=27;
  memory.stateLedger={time:"次日清晨",characters:{旅人:{location:"城门",wear:"布衣",statusAndAction:"等待",inventory:["铜钥匙"],removedItemsLock:[],present:true,importance:"core",importanceReason:"玩家持续扮演的旅人",growth:[{key:"人生阶段",dimension:"lifeStage",target:"",state:"成年，已独自离乡旅行",evidence:"开场说明已成年并独自出发。",sourceRound:1},{key:"处理承诺",dimension:"values",target:"",state:"倾向先核实约定的代价，再作出承诺",evidence:"归还钥匙后，主动询问新约定的条件。",sourceRound:14}]},守卫:{canonicalName:"林舟",aliases:["守卫"],named:true,importance:"supporting",importanceReason:"持续与旅人追查失踪者并保管关键线索",location:"城门",statusAndAction:"等待旅人归还铜钥匙",present:true},路人甲:{named:false,importance:"incidental",importanceReason:"只在城门口短暂路过",location:"城门",present:true}},todosAndPromises:[{id:"promise",text:"把铜钥匙还给守卫",completed:false}]};
  const listeners=new Map();
- const ctx={name1:"旅人",name2:"守卫",chat,chatId:id,characterId:0,chatMetadata:{tiandao_memory:memory},extensionSettings:{"tiandao-memory-engine":{...DEFAULT_SETTINGS,autoSummarizePerTurn:false,enableRetrieval:false,autoHideOldMessages:true}},eventTypes:{CHAT_CHANGED:"chat_changed",MESSAGE_EDITED:"message_edited",MESSAGE_SWIPED:"message_swiped",MESSAGE_DELETED:"message_deleted"},eventSource:{on:(name,fn)=>listeners.set(name,fn)},getCurrentChatId:()=>id,saveSettingsDebounced:()=>{},saveMetadata:async()=>{if(failSave)throw Error("测试保存失败");log();},setExtensionPrompt:(key,text)=>{ctx.injected=text;log();}};
+ const ctx={name1:"旅人",name2:"守卫",chat,chatId:id,characterId:0,characters:[{avatar:"fixture.png"}],getRequestHeaders:()=>({"X-CSRF-Token":"local-fixture"}),chatMetadata:{tiandao_memory:memory},extensionSettings:{"tiandao-memory-engine":{...DEFAULT_SETTINGS,autoSummarizePerTurn:false,enableRetrieval:false,autoHideOldMessages:true}},eventTypes:{CHAT_CHANGED:"chat_changed",MESSAGE_EDITED:"message_edited",MESSAGE_SWIPED:"message_swiped",MESSAGE_DELETED:"message_deleted"},eventSource:{on:(name,fn)=>listeners.set(name,fn)},getCurrentChatId:()=>id,saveSettingsDebounced:()=>{},saveMetadata:async()=>{if(failSave)throw Error("测试保存失败");persisted.set(id,structuredClone(ctx.chatMetadata));log();},setExtensionPrompt:(key,text)=>{ctx.injected=text;log();}};
+ persisted.set(id,structuredClone(ctx.chatMetadata));
  ctx.emit=async (name,...args)=>listeners.get(name)?.(...args);
  return ctx;
 };
@@ -26,7 +34,15 @@ const contexts=[makeContext("test-a"),makeContext("test-b")];
 // A single event bus models the host's global CHAT_CHANGED event.
 contexts[1].eventSource=contexts[0].eventSource;
 window.SillyTavern={getContext:()=>contexts[current]};
-window.fetch=async()=>{throw Error("本地预览禁止网络 API 请求");};
+window.fetch=async(url,options)=>{
+ if(url==="/api/chats/get"||url==="/api/chats/group/get"){
+  const body=JSON.parse(options?.body||"{}");
+  const id=body.file_name||body.id;
+  if(!persisted.has(id))return new Response("{}",{status:404});
+  return new Response(JSON.stringify([{chat_metadata:structuredClone(persisted.get(id))}]),{headers:{"Content-Type":"application/json"}});
+ }
+ throw Error("本地预览禁止网络 API 请求");
+};
 async function runPreview(type = "normal") {
  const ctx=contexts[current];
  const before=JSON.stringify(ctx.chat);
@@ -39,9 +55,14 @@ async function runPreview(type = "normal") {
  ctx.lastHistory=core;log();
 }
 for(const ctx of contexts) ctx.getRegexedString = text => text;
-await import("/index.js");
-await runPreview();
-log();
+try {
+ await import("/index.js");
+ await runPreview();
+ log();
+} catch(error) {
+ document.getElementById("fixture_log").textContent="本地预览加载失败："+String(error.stack||error);
+ throw error;
+}
 document.getElementById("refresh").onclick=async()=>{await runPreview();log();};
 document.getElementById("continue").onclick=()=>runPreview("continue");
 document.getElementById("swipe").onclick=()=>runPreview("swipe");

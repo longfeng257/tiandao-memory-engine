@@ -408,7 +408,7 @@ test("deletion also repairs a stale cursor left by an older broken archive", () 
     assert.equal(pending[0].round, 20);
 });
 
-test("deleting a summarized reply removes only affected entries and renumbers later ones", () => {
+test("deleting a summarized reply preserves later L0 spans without claiming the orphaned prompt", () => {
     const chat = [
         { is_user: true, mes: "第一句" },
         { is_user: false, name: "角色", mes: "第一答" },
@@ -435,9 +435,9 @@ test("deleting a summarized reply removes only affected entries and renumbers la
         currentFingerprint,
     ), true);
     assert.deepEqual(data.archivePool.map(item => item.roundRange), ["1", "2", "3"]);
-    assert.deepEqual(data.levels[1].map(item => item.roundRange), ["2-3"]);
-    assert.deepEqual(data.levels[1].map(item => item.id), ["L1_3_4"]);
-    assert.deepEqual(data.levels[0].map(item => item.roundRange), ["1"]);
+    assert.deepEqual(data.archivePool.map(item => item.startMessageId), [0, 3, 5]);
+    assert.deepEqual(data.levels[1], []);
+    assert.deepEqual(data.levels[0].map(item => item.roundRange), ["1", "2", "3"]);
     assert.equal(data.lastProcessedRound, 3);
 });
 

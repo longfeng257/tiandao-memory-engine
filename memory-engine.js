@@ -1453,8 +1453,26 @@ async function flushFarHistory(settings, memoryData, { signal = null } = {}) {
 
     while (memoryData.pendingFarHistory.length > 0) {
         throwIfAborted(signal);
-        const batch = memoryData.pendingFarHistory.slice(0, 8);
+        memoryData.pendingFarHistory.sort((a, b) => parseRoundRange(a.roundRange).start - parseRoundRange(b.roundRange).start);
+        const batch = [];
+        for (const item of memoryData.pendingFarHistory.slice(0, 8)) {
+            if (!getContinuousRoundRange([...batch, item])) break;
+            batch.push(item);
+        }
+        if (batch.length === 0) return false;
+        const batchRange = getContinuousRoundRange(batch);
+        const coverage = getL0CoverageRanges(memoryData.archivePool);
         const previous = sanitizeSummaryFlourish(memoryData.farHistory?.text, Infinity);
+        const existing = memoryData.farHistory || {};
+        const combinedRange = previous ? {
+            start: Math.min(numOr(existing.earliestRound, 1), batchRange.start),
+            end: Math.max(numOr(existing.latestRound, 0), batchRange.end),
+        } : batchRange;
+        if (coverage.length > 0 && !isRoundRangeCovered(combinedRange, coverage)) return false;
+        if (previous && !isRoundRangeCovered(combinedRange, [
+            { start: numOr(existing.earliestRound, 1), end: numOr(existing.latestRound, 0) },
+            batchRange,
+        ])) return false;
         const source = batch
             .map(item => `[第 ${item.roundRange} 轮，仅用于排序] ${String(item.text || "").slice(0, 1000)}`)
             .join("\n");
@@ -1487,16 +1505,10 @@ ${SUMMARY_FACTS_ONLY_RULE}
             .trim(), 1400);
         if (!merged) return false;
 
-        const ranges = batch.map(item => parseRoundRange(item.roundRange));
-        const batchStart = Math.min(...ranges.map(range => range.start));
-        const batchEnd = Math.max(...ranges.map(range => range.end));
-        const existing = memoryData.farHistory || {};
         memoryData.farHistory = {
             text: merged,
-            earliestRound: numOr(existing.earliestRound, 0) > 0
-                ? Math.min(existing.earliestRound, batchStart)
-                : batchStart,
-            latestRound: Math.max(numOr(existing.latestRound, 0), batchEnd),
+            earliestRound: combinedRange.start,
+            latestRound: combinedRange.end,
             updatedAt: Date.now(),
         };
         memoryData.pendingFarHistory.splice(0, batch.length);
@@ -1513,6 +1525,49 @@ export function parseRoundRange(roundRange) {
     if (parts.length === 0) return { start: 0, end: 0 };
     if (parts.length === 1) return { start: parts[0], end: parts[0] };
     return { start: Math.min(...parts), end: Math.max(...parts) };
+}
+
+export function getContinuousRoundRange(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) return null;
+    const ranges = entries.map(item => parseRoundRange(item?.roundRange));
+    let end = ranges[0].start - 1;
+    for (const range of ranges) {
+        if (!Number.isSafeInteger(range.start) || range.start < 1
+            || !Number.isSafeInteger(range.end) || range.end < range.start
+            || range.start !== end + 1) return null;
+        end = range.end;
+    }
+    return { start: ranges[0].start, end };
+}
+
+export function isRoundRangeCovered(range, coveredRanges) {
+    if (!range || range.start < 1 || range.end < range.start) return false;
+    let next = range.start;
+    const sorted = coveredRanges.slice().sort((a, b) => a.start - b.start || a.end - b.end);
+    for (const covered of sorted) {
+        if (covered.end < next) continue;
+        if (covered.start > next) return false;
+        next = Math.max(next, covered.end + 1);
+        if (next > range.end) return true;
+    }
+    return false;
+}
+
+export function getL0CoverageRanges(entries, roundIndex = null) {
+    const turns = roundIndex?.aiTurns;
+    return (Array.isArray(entries) ? entries : []).filter(item => {
+        if (!item || item.level !== 0) return false;
+        const { start, end } = parseRoundRange(item.roundRange);
+        if (!Number.isSafeInteger(start) || start < 1 || !Number.isSafeInteger(end) || end < start) return false;
+        if (!turns) return true;
+        const firstTurn = turns[start - 1];
+        const lastTurn = turns[end - 1];
+        return Boolean(firstTurn?.window && lastTurn
+            && Number.isInteger(item.startMessageId) && item.startMessageId >= 0
+            && Number.isInteger(item.endMessageId) && item.endMessageId >= item.startMessageId
+            && item.startMessageId === firstTurn.window.startMessageId
+            && item.endMessageId === lastTurn.idx);
+    }).map(item => parseRoundRange(item.roundRange));
 }
 
 export function roundRangesOverlap(left, right) {
@@ -1662,11 +1717,18 @@ export function groupAiTurnsForL0(turns, chunkSize, completeOnly = true) {
     if (!Array.isArray(turns) || turns.length === 0) return [];
     const size = Math.min(50, Math.max(1, Math.floor(numOr(chunkSize, 1))));
     const groups = [];
-    for (let index = 0; index < turns.length; index += size) {
-        const group = turns.slice(index, index + size);
-        if (completeOnly && group.length < size) break;
-        groups.push(group);
+    let group = [];
+    const flush = () => {
+        if (group.length && (!completeOnly || group.length === size)) groups.push(group);
+        group = [];
+    };
+    for (const turn of turns) {
+        const previous = group.at(-1);
+        if (previous && (turn.round !== previous.round + 1 || turn.idx <= previous.idx)) flush();
+        group.push(turn);
+        if (group.length === size) flush();
     }
+    flush();
     return groups;
 }
 
@@ -1765,6 +1827,19 @@ export function collectPendingAiTurns(
     return (roundIndex || buildRoundMessageIndex(chat, includeNativeHidden)).aiTurns
         .filter(turn => turn.idx >= start && turn.idx <= end)
         .map(({ idx, round, msg }) => ({ idx, round, msg }));
+}
+
+export function collectMissingAiTurns(chat, memoryData, upToIndex = Infinity, includeNativeHidden = false, roundIndex = null) {
+    if (!Array.isArray(chat)) return [];
+    const index = roundIndex || buildRoundMessageIndex(chat, includeNativeHidden);
+    const ranges = getL0CoverageRanges(memoryData?.archivePool, index)
+        .sort((a, b) => a.start - b.start || a.end - b.end);
+    let rangeIndex = 0;
+    return index.aiTurns.filter(turn => {
+        if (turn.idx > upToIndex) return false;
+        while (rangeIndex < ranges.length && ranges[rangeIndex].end < turn.round) rangeIndex++;
+        return !ranges[rangeIndex] || ranges[rangeIndex].start > turn.round;
+    });
 }
 
 /**
@@ -1883,26 +1958,28 @@ export function rollbackMemoryFromMessageIndex(memoryData, cutoffMessageId, opti
     return true;
 }
 
-function remapRangeFromSurvivingL0(item, oldL0, oldRanges, retainedSet, roundMap) {
+function remapRangeFromSurvivingL0(item, oldL0, oldRanges, verifiedSet, roundMap) {
     const range = parseRoundRange(item?.roundRange);
     const covered = oldL0.filter(entry => {
         const entryRange = oldRanges.get(entry) || parseRoundRange(entry.roundRange);
         return entryRange.start >= range.start && entryRange.end <= range.end;
-    });
-    if (covered.length === 0) return true;
-    if (covered.some(entry => !retainedSet.has(entry))) return false;
-    const mapped = covered
-        .map(entry => roundMap.get(entry))
-        .filter(value => Number.isFinite(value));
-    if (mapped.length !== covered.length) return false;
-    const start = Math.min(...covered.map(entry => {
-        const previousRange = oldRanges.get(entry) || parseRoundRange(entry.roundRange);
-        return roundMap.get(entry) - (previousRange.end - previousRange.start);
+    }).sort((a, b) => oldRanges.get(a).start - oldRanges.get(b).start);
+    const sourceRange = getContinuousRoundRange(covered.map(entry => {
+        const source = oldRanges.get(entry);
+        return { roundRange: `${source.start}-${source.end}` };
     }));
-    const end = Math.max(...mapped);
-    const nextRange = start === end ? String(start) : `${start}-${end}`;
-    if (nextRange === String(item.roundRange || "")) return true;
-    item.roundRange = nextRange;
+    if (!sourceRange || sourceRange.start !== range.start || sourceRange.end !== range.end
+        || covered.some(entry => !verifiedSet.has(entry))) return false;
+    const mapped = covered.map(entry => {
+        const source = oldRanges.get(entry);
+        const end = roundMap.get(entry);
+        return { roundRange: `${end - (source.end - source.start)}-${end}` };
+    });
+    const mappedRange = getContinuousRoundRange(mapped);
+    if (!mappedRange) return false;
+    item.roundRange = mappedRange.start === mappedRange.end
+        ? String(mappedRange.start)
+        : `${mappedRange.start}-${mappedRange.end}`;
     return true;
 }
 
@@ -1946,6 +2023,7 @@ export function reconcileMemoryAfterMessageDeletion(
     const oldRanges = new Map(oldL0.map(item => [item, parseRoundRange(item.roundRange)]));
     const retained = [];
     const retainedSet = new Set();
+    const verifiedSet = new Set();
     const roundMap = new Map();
     let changed = liveChanged || cursorBeforeMessageId !== memoryData.lastProcessedMessageId
         || cursorBeforeRound !== memoryData.lastProcessedRound;
@@ -2004,7 +2082,8 @@ export function reconcileMemoryAfterMessageDeletion(
 
         const previousStart = oldStart;
         const previousRound = oldRange.end;
-        const nextStartMessageId = startTurn?.window?.startMessageId ?? newStart;
+        // Preserve the proven source span; a new round window may include an orphaned user prompt.
+        const nextStartMessageId = newStart;
         const nextRange = newStartRound === window.roundNumber
             ? String(window.roundNumber)
             : `${newStartRound}-${window.roundNumber}`;
@@ -2033,6 +2112,10 @@ export function reconcileMemoryAfterMessageDeletion(
         }
         retained.push(item);
         retainedSet.add(item);
+        if (Number.isSafeInteger(oldRange.start) && oldRange.start >= 1
+            && Number.isSafeInteger(oldRange.end) && oldRange.end >= oldRange.start
+            && window.roundNumber >= roundSpan
+            && startTurn?.window?.startMessageId === newStart) verifiedSet.add(item);
         roundMap.set(item, window.roundNumber);
         if (previousStart !== nextStartMessageId || previousRound !== window.roundNumber) {
             changed = true;
@@ -2066,7 +2149,7 @@ export function reconcileMemoryAfterMessageDeletion(
         const kept = [];
         for (const item of list) {
             const before = String(item?.roundRange || "");
-            if (remapRangeFromSurvivingL0(item, oldL0, oldRanges, retainedSet, roundMap)) {
+            if (remapRangeFromSurvivingL0(item, oldL0, oldRanges, verifiedSet, roundMap)) {
                 if (String(item.roundRange || "") !== before) changed = true;
                 kept.push(item);
             } else {
@@ -2082,7 +2165,7 @@ export function reconcileMemoryAfterMessageDeletion(
     const keptPending = [];
     for (const item of pending) {
         const before = String(item?.roundRange || "");
-        if (remapRangeFromSurvivingL0(item, oldL0, oldRanges, retainedSet, roundMap)) {
+        if (remapRangeFromSurvivingL0(item, oldL0, oldRanges, verifiedSet, roundMap)) {
             if (String(item.roundRange || "") !== before) changed = true;
             keptPending.push(item);
         } else {
@@ -2092,59 +2175,21 @@ export function reconcileMemoryAfterMessageDeletion(
     memoryData.pendingFarHistory = keptPending;
 
     const removedL0 = oldL0.filter(item => !retainedSet.has(item));
-    const hasLostL0InRange = (range) => removedL0.some(item => {
-        const removedRange = parseRoundRange(item.roundRange);
-        return removedRange.end >= range.start && removedRange.start <= range.end;
-    });
-
-    const farRange = {
-        start: numOr(memoryData.farHistory?.earliestRound, 0),
-        end: numOr(memoryData.farHistory?.latestRound, 0),
-    };
-    if (memoryData.farHistory?.text && hasLostL0InRange(farRange)) {
-        memoryData.farHistory = { text: "", earliestRound: 0, latestRound: 0, updatedAt: 0 };
-        changed = true;
-    } else if (memoryData.farHistory?.text) {
-        const covered = oldL0.filter(item => {
-            const range = oldRanges.get(item) || parseRoundRange(item.roundRange);
-            return range.start >= farRange.start && range.end <= farRange.end;
-        });
-        const mapped = covered
-            .filter(item => retainedSet.has(item))
-            .map(item => roundMap.get(item))
-            .filter(value => Number.isFinite(value));
-        if (mapped.length > 0) {
-            memoryData.farHistory.earliestRound = Math.min(...covered.filter(item => retainedSet.has(item)).map(item => {
-                const range = oldRanges.get(item) || parseRoundRange(item.roundRange);
-                return roundMap.get(item) - (range.end - range.start);
-            }));
-            memoryData.farHistory.latestRound = Math.max(...mapped);
+    for (const key of ["farHistory", "fadedHistory"]) {
+        const history = memoryData[key];
+        if (!(key === "farHistory" ? history?.text : numOr(history?.count, 0) > 0)) continue;
+        const remapped = { roundRange: `${numOr(history.earliestRound, 0)}-${numOr(history.latestRound, 0)}` };
+        if (!remapRangeFromSurvivingL0(remapped, oldL0, oldRanges, verifiedSet, roundMap)) {
+            memoryData[key] = key === "farHistory"
+                ? { text: "", earliestRound: 0, latestRound: 0, updatedAt: 0 }
+                : { earliestRound: 0, latestRound: 0, count: 0 };
+            changed = true;
+            continue;
         }
-    }
-
-    const fadedRange = {
-        start: numOr(memoryData.fadedHistory?.earliestRound, 0),
-        end: numOr(memoryData.fadedHistory?.latestRound, 0),
-    };
-    if (numOr(memoryData.fadedHistory?.count, 0) > 0 && hasLostL0InRange(fadedRange)) {
-        memoryData.fadedHistory = { earliestRound: 0, latestRound: 0, count: 0 };
-        changed = true;
-    } else if (numOr(memoryData.fadedHistory?.count, 0) > 0) {
-        const covered = oldL0.filter(item => {
-            const range = oldRanges.get(item) || parseRoundRange(item.roundRange);
-            return range.start >= fadedRange.start && range.end <= fadedRange.end;
-        });
-        const mapped = covered
-            .filter(item => retainedSet.has(item))
-            .map(item => roundMap.get(item))
-            .filter(value => Number.isFinite(value));
-        if (mapped.length > 0) {
-            memoryData.fadedHistory.earliestRound = Math.min(...covered.filter(item => retainedSet.has(item)).map(item => {
-                const range = oldRanges.get(item) || parseRoundRange(item.roundRange);
-                return roundMap.get(item) - (range.end - range.start);
-            }));
-            memoryData.fadedHistory.latestRound = Math.max(...mapped);
-        }
+        const range = parseRoundRange(remapped.roundRange);
+        if (history.earliestRound !== range.start || history.latestRound !== range.end) changed = true;
+        history.earliestRound = range.start;
+        history.latestRound = range.end;
     }
 
     memoryData.levels[0] = retained.filter(item =>
@@ -3865,6 +3910,7 @@ export async function checkAndCascadeMerge(settings, memoryData, options = {}) {
         memoryData.levels = { 0: [] };
     }
     const chunkSize = Math.min(20, Math.max(2, numOr(settings.mergeChunkSize, 5)));
+    const coverage = getL0CoverageRanges(memoryData.archivePool);
 
     for (let lvl = 0; lvl < MAX_MEMORY_LEVEL; lvl++) {
         if (!Array.isArray(memoryData.levels[lvl])) {
@@ -3875,9 +3921,9 @@ export async function checkAndCascadeMerge(settings, memoryData, options = {}) {
         while (memoryData.levels[lvl].length >= mergeThreshold) {
             throwIfAborted(signal);
             const itemsToMerge = memoryData.levels[lvl].slice(0, chunkSize);
-            const firstRound = parseRoundRange(itemsToMerge[0].roundRange).start;
-            const lastRound = parseRoundRange(itemsToMerge[itemsToMerge.length - 1].roundRange).end;
-            const mergedRoundRange = `${firstRound}-${lastRound}`;
+            const range = getContinuousRoundRange(itemsToMerge);
+            if (!range || (lvl > 0 && coverage.length > 0 && !isRoundRangeCovered(range, coverage))) break;
+            const mergedRoundRange = `${range.start}-${range.end}`;
 
             const mergedText = await mergeSummariesAtLevel(
                 settings,
@@ -4578,6 +4624,12 @@ export async function backfillExistingChatHistory(
     const safeUserName = String(userName || "").slice(0, 200);
     const safeCharName = String(charName || "").slice(0, 200);
     const roundIndex = buildRoundMessageIndex(chatMessages, settings.includeNativeHidden);
+    const missing = collectMissingAiTurns(chatMessages, memoryData, Infinity, settings.includeNativeHidden, roundIndex);
+    if (missing.some(turn => turn.idx <= memoryData.lastProcessedMessageId)) {
+        const error = new Error("检测到历史中段缺档，请使用范围补档以保留后续记忆");
+        error.code = "MEMORY_HISTORY_GAP";
+        throw error;
+    }
     const pendingTurns = roundIndex.aiTurns.filter(turn => turn.idx > memoryData.lastProcessedMessageId);
     const l0Groups = groupAiTurnsForL0(pendingTurns, resolveL0RoundsPerSummary(settings), false);
     let beforeBatch = typeof onChunkSaved === 'function' ? deepClone(memoryData) : null;

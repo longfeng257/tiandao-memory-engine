@@ -9,6 +9,7 @@ const indexSource = readFileSync(join(root, "index.js"), "utf8");
 const engineSource = readFileSync(join(root, "memory-engine.js"), "utf8");
 const styleSource = readFileSync(join(root, "style.css"), "utf8");
 const historySource = readFileSync(join(root, "history-builder.js"), "utf8");
+const backupSource = readFileSync(join(root, "memory-backup.js"), "utf8");
 
 test("widget no longer renders hardcoded model shortcut chips", () => {
     assert.doesNotMatch(indexSource, /data-model="/);
@@ -205,12 +206,10 @@ test("long-chat performance paths avoid repeated full work", () => {
 test("story summary edits rebuild atomically and preserve old high-level summaries on failure", () => {
     assert.match(indexSource, /function startHierarchyRebuildTransaction\(/);
     assert.match(indexSource, /async function rebuildHierarchyLevelsFromL0\(/);
-    assert.match(indexSource, /memoryData\.levels = rebuiltLevels\.levels;/);
-    assert.match(indexSource, /memoryData\.farHistory = rebuiltLevels\.farHistory;/);
+    assert.match(indexSource, /Object\.assign\(draft, rebuiltLevels\);[\s\S]{0,220}await saveReplacementMemory\(checkpoint, draft\)/);
     assert.match(indexSource, /本次修改未保存/);
     assert.match(indexSource, /pendingHierarchyEdits/);
     assert.match(indexSource, /重建后的层级无法定位所选阶段/);
-    assert.match(indexSource, /restoreStagedIfNeeded/);
     assert.doesNotMatch(
         indexSource,
         /if \(Number\(lvl\) === 0\) \{[\s\S]{0,500}memoryData\.levels = \{ 0: l0 \};/,
@@ -223,11 +222,13 @@ test("manual ledger edits are stamped into the latest L0 state storage", () => {
     assert.match(indexSource, /restoreLatestL0StateStorage\(stateStorageCapture\)/);
 });
 
-test("model lists normalize full endpoint URLs and the pill is keyboard operable", () => {
+test("model lists normalize full endpoint URLs and the launcher uses native keyboard activation", () => {
     assert.match(indexSource, /function getModelsEndpoint\(baseUrl\)/);
     assert.match(indexSource, /normalized\.endsWith\("\/chat\/completions"\)/);
-    assert.match(indexSource, /id="tiandao_widget_pill"[^>]*role="button"[^>]*tabindex="0"/);
-    assert.match(indexSource, /pill\.addEventListener\("keydown"/);
+    assert.match(indexSource, /<button type="button" id="tiandao_widget_pill"[^>]*aria-haspopup="dialog"/);
+    assert.doesNotMatch(indexSource, /pill\.addEventListener\("keydown"/);
+    assert.match(indexSource, /pill\.addEventListener\("click", \(\) => setWidgetExpanded\(true\)\)/);
+    assert.match(indexSource, /interactive && interactive !== handle/);
 });
 
 test("story timeline paginates twenty entries with older and newer controls", () => {
@@ -277,9 +278,12 @@ test("legacy state snapshot migration is persisted after load", () => {
     assert.match(indexSource, /previousStateStorageVersion !== memoryData\.stateStorageVersion[\s\S]{0,120}scheduleChatSave\(\)/);
 });
 
-test("story range stays on one compact row", () => {
-    assert.match(styleSource, /\.tiandao-story-range-bar[\s\S]{0,160}flex-wrap:\s*nowrap/);
-    assert.match(styleSource, /\.tiandao-story-range-bar \.tiandao-input-sm[\s\S]{0,140}width:\s*38px/);
+test("story range groups its endpoints and wraps without shrinking interactive targets", () => {
+    assert.match(indexSource, /class="tiandao-story-range-fields" role="group" aria-labelledby="tiandao_story_range_label"/);
+    assert.match(indexSource, /class="tiandao-story-range-actions"/);
+    assert.match(styleSource, /\.tiandao-story-range-bar\s*\{[^}]*flex-wrap:\s*wrap/);
+    assert.match(styleSource, /\.tiandao-story-range-bar \.tiandao-input-sm\s*\{[^}]*min-height:\s*28px/);
+    assert.match(styleSource, /\.tiandao-story-range-mode\s*,\s*\.tiandao-story-range-bar \.tiandao-btn-sm,[^}]*min-height:\s*32px/);
 });
 
 test("todo ledger uses checkboxes that save completion immediately", () => {
@@ -341,19 +345,17 @@ test("story range has an explicit settings binding", () => {
     assert.match(indexSource, /buildRoundMessageIndex\(chat, settings\.includeNativeHidden\)/);
 });
 
-test("fetched models open a dedicated clickable menu", () => {
-    assert.match(indexSource, /id="tiandao_model_toggle_btn"/);
-    assert.match(indexSource, /function openModelMenu\(/);
-    assert.match(indexSource, /function setFetchedModelNames\(/);
-    assert.match(indexSource, /ensureModelMenu\(\)/);
-    assert.match(indexSource, /modelInput\?\.addEventListener\("click"/);
+test("summary and embedding toggles control accessible model lists without native datalist conflicts", () => {
+    for (const prefix of ["tiandao_model", "tiandao_emb_model"]) {
+        assert.match(indexSource, new RegExp(`id="${prefix}_toggle_btn"[^>]*aria-haspopup="listbox"[^>]*aria-expanded="false"[^>]*aria-controls="${prefix}_menu"`));
+    }
+    assert.match(indexSource, /menu\.setAttribute\("role", "listbox"\)/);
+    assert.match(indexSource, /option\.setAttribute\("role", "option"\)/);
     assert.match(indexSource, /setFetchedModelNames\(names\)/);
     assert.match(indexSource, /手动输入模型名称/);
-    assert.match(indexSource, /isMobileWidgetViewport\(\) && fetchedModelNames\.length > 0/);
-    assert.match(indexSource, /if \(!isMobileWidgetViewport\(\)\) input\.focus\(\)/);
-    assert.match(styleSource, /\.tiandao-model-menu\s*\{/);
+    assert.doesNotMatch(indexSource, /list="tiandao_(?:emb_)?model_datalist"/);
+    assert.match(styleSource, /\.tiandao-model-menu\[hidden\]\s*\{\s*display:\s*none/);
     assert.match(styleSource, /\.tiandao-model-option\.selected\s*\{/);
-    assert.match(styleSource, /\.tiandao-model-manual\s*\{/);
 });
 
 test("chat changes reset story editing and abort stale summaries", () => {
@@ -362,34 +364,47 @@ test("chat changes reset story editing and abort stale summaries", () => {
     assert.match(indexSource, /if \(eventTypes\.CHAT_CHANGED\)[\s\S]{0,900}storyViewRange = null;/);
 });
 
-test("todo edits are blocked while the current chat is being summarized", () => {
+test("todo edits use the shared memory lock while the current chat is being summarized", () => {
     assert.match(indexSource, /const memoryBusy = activeSummaryChats\.has\(chatKey\)/);
     assert.match(indexSource, /\$\{memoryBusy \? "disabled" : ""\}/);
-    assert.match(indexSource, /async function updateTodoCompletion\(todoId, completed\) \{\s*const chatKey = getChatKey\(\);\s*if \(activeSummaryChats\.has\(chatKey\)/);
+    const start = indexSource.indexOf("async function updateTodoCompletion(");
+    const end = indexSource.indexOf("const memoryData = getChatMemory();", start);
+    assert.ok(start >= 0 && end > start, "todo handler must exist before its memory mutation");
+    assert.match(indexSource.slice(start, end), /if \(memoryOperationBusy\(\)\)\s*\{/);
+    const lockStart = indexSource.indexOf("function memoryOperationBusy()");
+    const lockEnd = indexSource.indexOf("function ", lockStart + 9);
+    assert.match(indexSource.slice(lockStart, lockEnd), /activeSummaryChats\.size > 0/);
 });
 
 test("interrupted range rebuild invalidates contradictory high-level summaries", () => {
-    assert.match(indexSource, /const partial = completedRounds > 0 && !rebuiltSuccessfully;/);
-    assert.match(indexSource, /invalidateDerivedSummariesInRange\(memoryData, fromRound, toRound\)/);
+    assert.match(indexSource, /const working = clonePlainData\(before\)/);
+    assert.match(indexSource, /invalidateDerivedSummariesInRange\(working, firstRound, lastRound\)/);
     assert.match(engineSource, /export function invalidateDerivedSummariesInRange/);
 });
 
 test("range fill explains prerequisite rounds before processing", () => {
-    assert.match(indexSource, /const pendingThroughRange = collectPendingAiTurns\(/);
+    assert.match(indexSource, /const pendingThroughRange = collectMissingAiTurns\(/);
     assert.match(indexSource, /const prerequisiteCount = pendingThroughRange/);
     assert.match(indexSource, /将先补齐范围前 \$\{prerequisiteCount\} 轮前置缺口/);
     assert.match(indexSource, /补缺失\+前置/);
 });
 
-test("switching API profiles clears stale model options", () => {
-    assert.match(indexSource, /settings\.activeApiProfileId = profile\.id;\s*setFetchedModelNames\(\[\]\);/);
+test("switching API profiles cancels pending lookups and clears stale model options", () => {
+    assert.match(indexSource, /settings\.activeApiProfileId = profile\.id;\s*invalidateSummaryModelLookup\(\);/);
+    assert.match(indexSource, /invalidateSummaryModelLookup = bindModelLookup\(/);
+    const start = indexSource.indexOf("const invalidate = () =>");
+    const end = indexSource.indexOf("const checkCredentials", start);
+    assert.ok(start >= 0 && end > start, "model lookup invalidation must be defined");
+    assert.match(indexSource.slice(start, end), /request\?\.abort\(\)/);
+    assert.match(indexSource.slice(start, end), /applyNames\(\[\]\)/);
     assert.match(indexSource, /模型列表已清空，请重新拉取/);
 });
 
 test("todo save failure restores the previous completion state", () => {
     assert.match(indexSource, /const previousCompletion = \{/);
     assert.match(indexSource, /Object\.assign\(currentTodo, previousCompletion\)/);
-    assert.match(indexSource, /待办状态已保存，但刷新注入失败/);
+    assert.match(indexSource, /reportSavedMemoryChange\(isActive, checkpoint, completed/);
+    assert.match(indexSource, /但刷新注入失败/);
 });
 
 test("placeholder cleanup schedules a chat save", () => {
@@ -397,11 +412,11 @@ test("placeholder cleanup schedules a chat save", () => {
 });
 
 test("memory import is size limited", () => {
-    assert.match(indexSource, /MAX_IMPORT_FILE_BYTES = 20 \* 1024 \* 1024/);
-    assert.match(indexSource, /MAX_IMPORT_MEMORY_ENTRIES = 50_000/);
+    assert.match(backupSource, /MAX_IMPORT_FILE_BYTES = 20 \* 1024 \* 1024/);
+    assert.match(backupSource, /MAX_MEMORY_ENTRIES = 50_000/);
     assert.match(indexSource, /file\.size > MAX_IMPORT_FILE_BYTES/);
     assert.match(indexSource, /超过 20MB/);
-    assert.match(indexSource, /记忆条目超过/);
+    assert.match(backupSource, /记忆条目超过/);
 });
 
 test("range resummarize passes precomputed round windows", () => {
@@ -436,13 +451,12 @@ test("ledger items can be deleted after confirmation and refresh injection", () 
     assert.match(styleSource, /\.tiandao-item-delete:hover:not\(:disabled\)/);
 });
 
-test("model menus keep scrolling inside the open menu", () => {
-    assert.match(indexSource, /const scrollingInsideModelMenu = modelMenu && !modelMenu\.hidden/);
-    assert.match(indexSource, /const scrollingInsideEmbeddingMenu = embeddingMenu && !embeddingMenu\.hidden/);
-    assert.match(indexSource, /if \(!scrollingInsideModelMenu\) closeModelMenu\(\)/);
-    assert.match(indexSource, /if \(!scrollingInsideEmbeddingMenu\) closeEmbeddingModelMenu\(\)/);
+test("model menus keep internal scrolling and move focus safely when dismissed", () => {
+    assert.match(indexSource, /window\.addEventListener\("scroll", \(event\) => \{\s*const menu = activeModelMenu\?\.menu;\s*if \(menu && !menu\.contains\(event\.target\)\) dismissModelMenu\(\);/);
+    assert.match(indexSource, /closeModelMenu\(opened\?\.menu\.contains\(document\.activeElement\) \? opened\.opener : null\)/);
     assert.match(styleSource, /\.tiandao-model-menu\s*\{[\s\S]{0,520}touch-action:\s*pan-y/);
     assert.match(styleSource, /-webkit-overflow-scrolling:\s*touch/);
+    assert.match(styleSource, /\.tiandao-model-option\s*\{[^}]*flex:\s*0 0 auto/);
 });
 
 test("embedding models have a separate fetch action and embedding-only filter", () => {
@@ -518,8 +532,8 @@ test("resummarize expands overlapping L0 and hidden raw rounds keep their summar
     assert.match(historySource, /end > limit/);
     assert.match(historySource, /rawStart = eligibleTurns\[pastRound\]\.window\.startMessageId/);
     assert.match(indexSource, /eventTypes\.MESSAGE_SWIPED[\s\S]{0,1800}scheduleAfterReplySwipeRepair\(getChatKey\(\)\)/);
-    assert.match(indexSource, /clearEntryEmbedding\(item\)/);
-    assert.match(indexSource, /embeddingDimension: archiveEntry\.embeddingDimension/);
+    assert.match(indexSource, /clearEntryEmbedding\(entry\)/);
+    assert.match(indexSource, /for \(const entry of new Set\(\[draftItem, archiveEntry\]\)\)/);
 });
 
 test("manual backfill ignores stale summaries after chat mutations", () => {
@@ -543,16 +557,13 @@ test("legacy settings backups strip nested API keys before restore", () => {
 
 test("metadata saves have concrete fallbacks and failed destructive writes roll back", () => {
     assert.match(indexSource, /async function saveChatMemory\(\)[\s\S]{0,500}ctx\.saveChat/);
+    assert.match(indexSource, /saveAndVerifyChatMetadata\(ctx, expectedFields, savers, globalThis\.fetch, isCurrent\)/);
     assert.doesNotMatch(indexSource, /savers\.push\(\(\) => ctx\.saveMetadataDebounced\(\)\)/);
-    assert.match(indexSource, /for \(const save of savers\)[\s\S]{0,220}await save\(\)/);
-    assert.match(
-        indexSource,
-        /const previousMemory = metadata\.tiandao_memory;\s*metadata\.tiandao_memory = createEmptyMemoryData\(\)[\s\S]{0,520}metadata\.tiandao_memory = previousMemory/,
-    );
-    assert.match(
-        indexSource,
-        /metadata\.tiandao_memory = merged;[\s\S]{0,320}metadata\.tiandao_memory = previousMemory/,
-    );
+    assert.match(indexSource, /const result = await saveAndVerifyChatMetadata/);
+    assert.match(indexSource, /async function saveReplacementMemory\(checkpoint, memory\)[\s\S]{0,600}metadata\.tiandao_memory = previousMemory/);
+    assert.match(indexSource, /async function saveCheckpointedEdit\(checkpoint, apply, rollback\)[\s\S]{0,350}checkpoint\.rollback\(\)/);
+    assert.match(indexSource, /await saveReplacementMemory\(checkpoint, createEmptyMemoryData\(\)\)/);
+    assert.match(indexSource, /await saveReplacementMemory\(checkpoint, imported\.memory\)/);
 });
 
 test("chat mutations abort in-flight summaries instead of wasting the request", () => {

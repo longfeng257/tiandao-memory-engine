@@ -36,8 +36,8 @@
     --sw-panel-bg: #f5f3ed;
     --sw-text: #2a332f;
     --sw-text-soft: #48544e;
-    --sw-muted: #7b877f;
-    --sw-placeholder: #9aa39e;
+    --sw-muted: #58685f;
+    --sw-placeholder: #637169;
     --sw-input-bg: #ffffff;
     --sw-input-border: #d7d2c6;
     --sw-input-radius: 7px;
@@ -62,7 +62,7 @@
     --sw-info-border: #cfe0e7;
     --sw-footer-bg: #f5f2eb;
     --sw-scrollbar: rgba(47, 107, 97, 0.28);
-    --sw-item-off: #9aa39e;
+    --sw-item-off: var(--sw-muted);
 }
 
 /* ---------- 主题 B · 书页叙事 (journal) ---------- */
@@ -88,7 +88,7 @@
     --sw-tab-active-shadow: 0 1px 2px rgba(89, 58, 39, 0.12);
     --sw-line: #e5d6c2;
     --sw-status-bg: #f4e9d9;
-    --sw-ok: #627348;
+    --sw-ok: #566642;
     --sw-status-err: #a64632;
     --sw-status-err-bg: #f7e4dc;
     --sw-banner-bg: #f3e6d2;
@@ -96,8 +96,8 @@
     --sw-panel-bg: #f5ecdc;
     --sw-text: #3c3027;
     --sw-text-soft: #5c4a3d;
-    --sw-muted: #8e7967;
-    --sw-placeholder: #a6927e;
+    --sw-muted: #6d5849;
+    --sw-placeholder: #755f4c;
     --sw-input-bg: #fffaf0;
     --sw-input-border: #d5c0a2;
     --sw-input-radius: 6px;
@@ -122,7 +122,7 @@
     --sw-info-border: #d8c7a7;
     --sw-footer-bg: #f2e7d4;
     --sw-scrollbar: rgba(138, 79, 53, 0.28);
-    --sw-item-off: #a6927e;
+    --sw-item-off: var(--sw-muted);
 }
 
 :root[data-sw-font="sans"] {
@@ -138,6 +138,7 @@
 /* ---------- 外层容器与胶囊 ---------- */
 #tiandao_floating_widget {
     position: fixed;
+    width: max-content;
     top: 80px;
     right: 25px;
     z-index: 9999;
@@ -150,12 +151,16 @@
 .tiandao-widget-pill {
     display: inline-flex;
     align-items: center;
+    min-height: 32px;
+    box-sizing: border-box;
     gap: 9px;
+    margin: 0;
     padding: 7px 15px;
     background: var(--sw-pill-bg);
     border: 1px solid var(--sw-pill-border);
     border-radius: 22px;
     color: var(--sw-accent);
+    font: inherit;
     font-weight: 600;
     box-shadow: var(--sw-pill-shadow);
     cursor: pointer;
@@ -207,6 +212,7 @@
 /* ---------- 展开卡片主容器 ---------- */
 .tiandao-widget-card {
     position: absolute;
+    box-sizing: border-box;
     top: 44px;
     right: 0;
     width: 372px;
@@ -220,6 +226,31 @@
     flex-direction: column;
     overflow: hidden;
     animation: tiandaoCardPop 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.tiandao-widget-card[hidden],
+.tiandao-tab-page[hidden],
+.tiandao-settings-page[hidden],
+.tiandao-embedding-box[hidden],
+#tiandao_embedding_hint_row[hidden],
+#tiandao_import_json_input[hidden] {
+    display: none !important;
+}
+
+.tiandao-embedding-box {
+    margin-top: 8px;
+}
+
+.tiandao-visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
 }
 
 .tiandao-widget-expanded .tiandao-widget-card {
@@ -257,6 +288,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 4px;
     padding: 9px 12px;
     background: var(--sw-header-bg);
     border-bottom: 1px solid var(--sw-line);
@@ -264,6 +296,8 @@
 
 .tiandao-segmented-control {
     display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
     background: var(--sw-tabwell);
     padding: 3px;
     border-radius: 9px;
@@ -300,6 +334,11 @@
 }
 
 .tiandao-card-close {
+    display: grid;
+    place-items: center;
+    flex: 0 0 auto;
+    min-width: 32px;
+    min-height: 32px;
     background: transparent;
     border: none;
     outline: none;
@@ -535,7 +574,6 @@
 
 .tiandao-char-card.tiandao-char-away {
     border-left-color: var(--sw-muted);
-    opacity: 0.78;
 }
 
 .tiandao-char-card-header {
@@ -783,7 +821,6 @@
     color: var(--sw-item-off);
     background: transparent;
     border-style: dashed;
-    opacity: 0.9;
 }
 
 /* ---------- 待办箱 ---------- */
@@ -847,7 +884,6 @@
 .tiandao-todo-done .tiandao-todo-text {
     color: var(--sw-muted);
     text-decoration: line-through;
-    opacity: 0.72;
 }
 
 .tiandao-todo-status {
@@ -1309,8 +1345,9 @@
 }
 
 .tiandao-model-option {
+    flex: 0 0 auto;
     width: 100%;
-    min-height: 30px;
+    min-height: 32px;
     padding: 5px 8px;
     border: 0;
     border-radius: 5px;
@@ -1748,16 +1785,26 @@
     white-space: nowrap;
 }
 
-.tiandao-story-range-bar {
+.tiandao-story-range-bar,
+.tiandao-story-range-fields,
+.tiandao-story-range-actions {
     display: flex;
     align-items: center;
-    gap: 4px;
-    flex-wrap: nowrap;
+    gap: 6px;
+}
+
+.tiandao-story-range-bar {
+    flex-wrap: wrap;
     padding: 6px 8px;
     margin-bottom: 9px;
     background: var(--sw-panel-bg);
     border: 1px solid var(--sw-line);
     border-radius: 7px;
+}
+
+.tiandao-story-range-actions {
+    flex: 1 1 auto;
+    flex-wrap: wrap;
 }
 
 .tiandao-story-range-label {
@@ -1773,11 +1820,11 @@
 }
 
 .tiandao-story-range-bar .tiandao-input-sm {
-    width: 38px;
-    height: 26px;
+    width: clamp(44px, 3.3em, 58px);
+    min-height: 28px;
     padding: 3px 4px;
     text-align: center;
-    font-size: 0.78em;
+    font-size: 0.82em;
     appearance: textfield;
     -moz-appearance: textfield;
 }
@@ -1789,18 +1836,19 @@
 }
 
 .tiandao-story-range-mode {
-    width: 88px;
-    min-width: 0;
-    max-width: 88px;
-    height: 26px;
-    padding: 2px 4px;
-    font-size: 0.72em;
+    flex: 1 1 94px;
+    min-width: 94px;
+    max-width: 100%;
+    min-height: 28px;
+    padding: 2px 5px;
+    font-size: 0.82em;
 }
 
 .tiandao-story-range-bar .tiandao-btn-sm {
+    flex: 0 0 auto;
     margin-left: auto;
-    padding: 2px 6px;
-    font-size: 0.74em;
+    padding: 3px 8px;
+    font-size: 0.82em;
     white-space: nowrap;
 }
 
@@ -2049,35 +2097,26 @@
         font-size: 0.82em;
     }
     .tiandao-story-range-bar {
-        gap: 3px;
         padding: 5px 6px;
     }
-    .tiandao-story-range-label {
-        display: none;
-    }
-    .tiandao-story-range-bar .tiandao-input-sm {
-        width: 34px;
-        padding: 2px 3px;
-    }
-    .tiandao-story-range-mode {
-        width: 76px;
-        max-width: 76px;
-        font-size: 0.68em;
-    }
-    .tiandao-story-range-bar .tiandao-btn-sm {
-        padding: 2px 5px;
+    .tiandao-story-range-bar .tiandao-input-sm,
+    .tiandao-story-range-mode,
+    .tiandao-story-range-bar .tiandao-btn-sm,
+    .tiandao-story-sort-select {
+        min-height: 32px;
     }
     .tiandao-story-range-bar .tiandao-btn-sm i {
         display: none;
     }
     .tiandao-story-sort-control {
-        font-size: 0.72em;
+        font-size: 0.76em;
     }
     .tiandao-story-sort-select {
-        width: 66px;
-        max-width: 66px;
-        padding: 2px 4px;
-        font-size: 0.7em;
+        width: 72px;
+        max-width: 72px;
+    }
+    .tiandao-story-bulk-bar {
+        flex-wrap: wrap;
     }
     .tiandao-action-grid {
         grid-template-columns: 1fr;
@@ -2116,6 +2155,77 @@
 .tiandao-entry-pin-btn { cursor: pointer; font: inherit; font-size: .75em; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--sw-accent-line); background: var(--sw-panel-bg); color: var(--sw-text-soft); }
 .tiandao-entry-pin-btn[aria-pressed="true"] { background: var(--sw-chip-sel-bg); color: var(--sw-chip-sel-text); border-color: var(--sw-accent); }
 .tiandao-full-width { width: 100%; max-width: 100%; }
+
+/* Keep a visible, high-contrast focus indicator on the existing controls. */
+#tiandao_floating_widget :is([role="button"], button, input, select, textarea, summary):focus-visible,
+.tiandao-model-menu .tiandao-model-option:focus-visible,
+.tiandao-modal-container textarea:focus-visible {
+    outline: 2px solid var(--sw-accent);
+    outline-offset: 2px;
+}
+
+#tiandao_floating_widget .tiandao-model-toggle:focus-visible,
+#tiandao_floating_widget .tiandao-collapsible > summary:focus-visible,
+.tiandao-model-menu .tiandao-model-option:focus-visible {
+    outline-offset: -2px;
+}
+
+.tiandao-segment-btn,
+.tiandao-subtab,
+.tiandao-toggle-row,
+.tiandao-btn,
+.tiandao-link-btn,
+.tiandao-chip {
+    min-height: 28px;
+}
+
+.tiandao-input.has-model-toggle {
+    min-height: 32px;
+    padding-right: 38px;
+}
+
+.tiandao-model-toggle {
+    width: 32px;
+}
+
+.tiandao-input::placeholder { opacity: 1; }
+
+.tiandao-story-page-btn,
+.tiandao-entry-edit-btn,
+.tiandao-entry-resummarize-btn {
+    min-width: 30px;
+    min-height: 30px;
+}
+
+.tiandao-item-delete,
+.tiandao-entry-pin-btn,
+.tiandao-range {
+    min-width: 24px;
+    min-height: 24px;
+}
+
+#tiandao_floating_widget button[aria-disabled="true"] {
+    cursor: wait;
+    box-shadow: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #tiandao_floating_widget,
+    #tiandao_floating_widget *,
+    #tiandao_floating_widget *::before,
+    #tiandao_floating_widget *::after,
+    .tiandao-model-menu,
+    .tiandao-model-menu *,
+    .tiandao-modal-container * {
+        animation: none !important;
+        transition: none !important;
+        scroll-behavior: auto !important;
+    }
+
+    #tiandao_floating_widget .tiandao-widget-pill {
+        transform: none;
+    }
+}
 
 /* State protocol remains available in the saved source for replay, hidden in rendered chat. */
 .mes_text details[data-suwei-state="1"] { display: none !important; }

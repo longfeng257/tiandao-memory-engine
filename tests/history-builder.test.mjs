@@ -202,13 +202,14 @@ test('recalling one detail per old phase never explodes a 368-round history into
     assert.equal(plan.rawStart, 732);
 });
 
-test('a valid phase covers an expired L0 without resurrecting old raw messages', () => {
+test('a phase cannot hide raw dialogue across a known L0 gap', () => {
     const f = fixture();
     f.memory.archivePool = f.memory.archivePool.filter(item => item.roundRange !== '3');
     const plan = build(f);
-    assert.equal(plan.rawStart, 12);
-    assert.match(plan.text, /阶段剧情/);
-    assert.doesNotMatch(plan.text, /2026\.1\.03 玩家原文/);
+    assert.equal(plan.rawStart, 4);
+    assert.doesNotMatch(plan.text, /阶段剧情/);
+    assert.match(plan.text, /2026\.1\.03 玩家原文/);
+    assert.match(plan.text, /2026\.1\.08 角色原文/);
 });
 
 test('overlapping fallback spans use a complete path without losing a round', () => {
@@ -238,9 +239,8 @@ test('automatic retrieval does not add a second summary for recent raw dialogue'
     assert.equal(plan.retrieval.length, 0);
 });
 
-test('far history with a known prefix keeps chronological order', () => {
+test('far history with complete L0 sources keeps chronological order', () => {
     const f = fixture(); f.memory.levels = {};
-    f.memory.archivePool = [f.memory.archivePool[0], f.memory.archivePool[1], f.memory.archivePool[5]];
     f.memory.farHistory = { earliestRound: 3, latestRound: 5, text: '三到五轮远史' };
     const plan = build(f);
     const positions = ['2026.1.01 剧情摘要', '2026.1.02 剧情摘要', '三到五轮远史', '2026.1.06 剧情摘要'].map(text => plan.text.indexOf(text));

@@ -1,5 +1,5 @@
 import { buildStateUpdateInstruction, stripStateUpdateMessage } from "./state-protocol.js";
-import { sanitizeSummaryFlourish, buildInjectedMemoryPrompt, buildRoundMessageIndex, computeHiddenMessageCutoff, estimatePromptTokens, numOr, parseRoundRange, resolveStateLedgerAfterEntry, getStateLedgerAtMessage, resolveStateUpdateMode } from "./memory-engine.js";
+import { sanitizeSummaryFlourish, buildInjectedMemoryPrompt, buildRoundMessageIndex, computeHiddenMessageCutoff, estimatePromptTokens, numOr, parseRoundRange, getL0CoverageRanges, isRoundRangeCovered, resolveStateLedgerAfterEntry, getStateLedgerAtMessage, resolveStateUpdateMode } from "./memory-engine.js";
 
 const historyFactsCache = new WeakMap();
 function hasHistoricalFacts(item) {
@@ -31,6 +31,7 @@ export function bindCoreHistory(coreChat, fullChat) {
 
 function selectHistoricalEntries(memory, eligibleTurns, archive) {
     const limit = eligibleTurns.length;
+    const coverage = getL0CoverageRanges(archive.filter(hasHistoricalFacts), { aiTurns: eligibleTurns });
     const candidates = archive.map(item => ({ item, rank: 0 }));
     for (let rank = 1; rank <= 3; rank++) {
         for (const item of memory.levels?.[rank] || []) candidates.push({ item, rank });
@@ -43,8 +44,9 @@ function selectHistoricalEntries(memory, eligibleTurns, archive) {
     for (const { item, rank } of candidates) {
         const { start, end } = parseRoundRange(item.roundRange);
         if (start < 1 || end > limit || !hasHistoricalFacts(item)) continue;
+        if (rank > 0 && !isRoundRangeCovered({ start, end }, coverage)) continue;
         if (rank === 0 && (item.endMessageId !== eligibleTurns[end - 1]?.idx
-            || item.startMessageId > eligibleTurns[start - 1]?.window.startMessageId
+            || item.startMessageId !== eligibleTurns[start - 1]?.window.startMessageId
             || !Number.isInteger(item.startMessageId))) continue;
         if (!byStart.has(start)) byStart.set(start, []);
         byStart.get(start).push({ item, rank, end });
