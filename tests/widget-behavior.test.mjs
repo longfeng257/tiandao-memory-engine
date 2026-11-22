@@ -505,7 +505,9 @@ test('automatic L0 summary sends only regex-filtered source dialogue', async t =
 test('embedding retrieval query also obeys outgoing regex exclusions', async t => {
     const h = harness(), ctx = h.current(), bodies = [];
     Object.assign(ctx.extensionSettings['tiandao-memory-engine'], {
-        enableRetrieval: true, useEmbeddingApi: true, embeddingApiUrl: 'https://query-regression.invalid/v1', embeddingApiKey: 'test-key',
+        enableRetrieval: true, useEmbeddingApi: true, vectorRawMemory: true,
+        autoHideOldMessages: true,
+        embeddingApiUrl: 'https://query-regression.invalid/v1', embeddingApiKey: 'test-key',
     });
     const memory = ctx.chatMetadata.tiandao_memory;
     for (let round = 1; round <= 8; round++) {
@@ -545,7 +547,9 @@ function retrievalReviewFixture() {
     const h = harness(), ctx = h.current();
     Object.assign(ctx.extensionSettings['tiandao-memory-engine'], {
         enableRetrieval: true, autoSummarizePerTurn: false,
-        useEmbeddingApi: true, embeddingApiUrl: 'https://retrieval-review.invalid/v1', embeddingApiKey: 'test-key',
+        useEmbeddingApi: true, vectorRawMemory: true,
+        autoHideOldMessages: true,
+        embeddingApiUrl: 'https://retrieval-review.invalid/v1', embeddingApiKey: 'test-key',
     });
     const memory = ctx.chatMetadata.tiandao_memory;
     for (let round = 1; round <= 8; round++) {

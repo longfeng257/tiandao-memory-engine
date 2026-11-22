@@ -53,6 +53,7 @@ export const DEFAULT_SETTINGS = {
     enableRetrieval: true,
     retrievalTopK: "", // 留空默认每轮召回 3 条
     useEmbeddingApi: false,
+    vectorRawMemory: false, // 向量记忆：对已归档原文切块建向量，命中注入原文短片段；关闭时只按关键词/词法召回 L0 摘要
     embeddingApiUrl: "",
     embeddingApiKey: "",
     embeddingModel: "",
@@ -68,7 +69,9 @@ const MAX_LLM_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const MAX_COMPLETION_RESPONSE_CHARS = 1_000_000;
 const MAX_JSON_SCAN_CHARS = 2_000_000;
 const MAX_JSON_CANDIDATES = 20;
-const MAX_ARCHIVE_EMBEDDINGS = 500;
+const MAX_RAW_VECTORS = 500; // 原文向量上限：超出后按均匀采样保留，控制聊天元数据体积
+const RAW_VECTOR_BATCH_SIZE = 24; // 单次 /embeddings 请求携带的原文块数
+const RAW_VECTOR_TIMEOUT_PER_ITEM_MS = 2500; // 批量嵌入对每条原文放宽的超时预算（慢渠道/本地推理友好）
 const MAX_MEMORY_LEVEL = 3;
 const ACTIVE_LEVEL_MIN_KEEP = { 0: 6, 1: 4, 2: 3 };
 const TOP_LEVEL_ANCHOR_COUNT = 4;
@@ -505,6 +508,8 @@ export function createEmptyMemoryData() {
             3: [],
         },
         archivePool: [],
+        // 向量记忆（原文细节召回）：仅存向量与内容签名，不复制原文
+        rawVectors: [],
         fadedHistory: {
             earliestRound: 0,
             latestRound: 0,
@@ -595,9 +600,17 @@ export function resolveStateLedgerAfterEntry(memoryData, targetEntry) {
         ? deepClone(l0Entries[keyframeIndex].postStateSnapshot)
         : null;
     for (let i = keyframeIndex + 1; i <= targetIndex; i++) {
+        const entry = l0Entries[i];
         if (!state) return null;
-        if (l0Entries[i].postStateDelta) {
-            state = applyStateDelta(state, l0Entries[i].postStateDelta);
+        if (entry.postStateSnapshot) {
+            // 链中出现完整快照时直接作为新基准（重总结可能留下更新的关键帧）。
+            state = deepClone(entry.postStateSnapshot);
+        } else if (entry.postStateDelta) {
+            state = applyStateDelta(state, entry.postStateDelta);
+        } else {
+            // 既无快照也无增量的中间条目说明状态链断档（增量损坏被清理）：
+            // 静默跳过会产出漏掉整轮变化的错误账本，与 stateSync 链遇无效即截断的策略一致。
+            return null;
         }
     }
     return state ? normalizeStateLedger(state) : null;
@@ -989,9 +1002,6 @@ const MEMORY_ENTRY_FIELDS = new Set([
     "text",
     "keywords",
     "timestamp",
-    "embedding",
-    "embeddingModel",
-    "embeddingDimension",
     "postStateSnapshot",
     "postStateDelta",
     "stateMessageId",
@@ -1008,6 +1018,7 @@ const MEMORY_DATA_FIELDS = new Set([
     "stateSync",
     "levels",
     "archivePool",
+    "rawVectors",
     "fadedHistory",
     "farHistory",
     "pendingFarHistory",
@@ -1053,26 +1064,6 @@ function sanitizeMemoryEntry(item, expectedLevel = null) {
             ? Number(item.endMessageId)
             : undefined;
         if (item.endMessageId === undefined) delete item.endMessageId;
-    }
-    if (item.embedding !== undefined) {
-        item.embedding = normalizeEmbeddingVector(item.embedding);
-        if (!item.embedding || item.embedding.length === 0) {
-            item.embedding = null;
-        }
-    }
-    if (item.embeddingModel !== undefined) {
-        item.embeddingModel = asString(item.embeddingModel, "", 200);
-    }
-    if (item.embeddingDimension !== undefined) {
-        const dimension = Number(item.embeddingDimension);
-        item.embeddingDimension = Number.isInteger(dimension) && dimension > 0
-            ? Math.min(4096, dimension)
-            : 0;
-        if (!item.embeddingDimension) delete item.embeddingDimension;
-    }
-    if (!item.embedding) {
-        delete item.embeddingModel;
-        delete item.embeddingDimension;
     }
     for (const key of ["stateMessageId", "stateRound"]) {
         if (item[key] !== undefined && (!Number.isInteger(item[key]) || item[key] < (key === "stateRound" ? 0 : -1))) delete item[key];
@@ -1175,6 +1166,8 @@ export function normalizeMemoryData(memoryData) {
             return numOr(a.startMessageId, parseRoundRange(a.roundRange).start)
                 - numOr(b.startMessageId, parseRoundRange(b.roundRange).start);
         });
+
+    data.rawVectors = sanitizeRawVectors(data.rawVectors);
 
     if (!data.fadedHistory || typeof data.fadedHistory !== "object") {
         data.fadedHistory = { earliestRound: 0, latestRound: 0, count: 0 };
@@ -1373,24 +1366,6 @@ function commitMemoryUpdate(target, working) {
     target.pendingFarHistory = working.pendingFarHistory;
 }
 
-function sampleArchiveEmbeddings(memoryData) {
-    const archivePool = memoryData?.archivePool || [];
-    if (archivePool.length <= MAX_ARCHIVE_EMBEDDINGS) return;
-    const sampleIndexes = new Set(
-        Array.from({ length: MAX_ARCHIVE_EMBEDDINGS }, (_, i) =>
-            Math.floor((i * (archivePool.length - 1)) / Math.max(1, MAX_ARCHIVE_EMBEDDINGS - 1))
-        )
-    );
-    memoryData.archivePool = archivePool.map((item, index) => {
-        if (!item?.embedding || sampleIndexes.has(index)) return item;
-        const copy = { ...item };
-        copy.embedding = null;
-        delete copy.embeddingModel;
-        delete copy.embeddingDimension;
-        return copy;
-    });
-}
-
 function selectTopLevelEntries(list) {
     if (!Array.isArray(list) || list.length <= TOP_LEVEL_ACTIVE_CAP) return list;
     return [
@@ -1461,7 +1436,8 @@ async function flushFarHistory(settings, memoryData, { signal = null } = {}) {
         }
         if (batch.length === 0) return false;
         const batchRange = getContinuousRoundRange(batch);
-        const coverage = getL0CoverageRanges(memoryData.archivePool);
+        // 与注入/缺失检测保持同一有效性口径：清理后全为空的 L0 不算覆盖。
+        const coverage = getL0CoverageRanges(memoryData.archivePool.filter(hasSummaryFacts));
         const previous = sanitizeSummaryFlourish(memoryData.farHistory?.text, Infinity);
         const existing = memoryData.farHistory || {};
         const combinedRange = previous ? {
@@ -1481,8 +1457,8 @@ async function flushFarHistory(settings, memoryData, { signal = null } = {}) {
 
 要求：
 ${SUMMARY_FACTS_ONLY_RULE}
-1. 按剧情中的实际时间顺序叙述，优先使用“某年某月某日/某个季节/数日后/多年以前”等时间表达。
-2. 只记录有原文依据的剧情时间；原文没有明确日期时使用相对时间或直接省略时间，严禁编造精确日期。
+1. 按剧情中的实际时间顺序叙述，每个阶段以该段具体的剧情内时间锚点开头（原文或账本中明确出现的日期、时刻、季节）。
+2. 锚点之后的叙述内部才可用相对推进；禁止用宽泛词作为阶段开头；整份对话都没有明确时间时，用“第一日/第二日”这类天数表达限定时间，严禁编造精确日期。
 3. 严禁把楼层编号、现实发送时间戳当作剧情时间。
 4. 保留世界背景、重大事件、人物关系变化、长期伏笔和仍未解决的历史约定。
 5. 只做事实压缩，不做主题升华、抒情、氛围渲染或心理猜测；不得添加比喻、隐喻和空泛评价。
@@ -1551,6 +1527,22 @@ export function isRoundRangeCovered(range, coveredRanges) {
         if (next > range.end) return true;
     }
     return false;
+}
+
+const summaryFactsCache = new WeakMap();
+/**
+ * 与注入覆盖（selectHistoricalEntries）保持同一无效判定：
+ * 清理套话后全为空的 L0 视为无效，缺失检测必须把它当缺口报告，
+ * 否则该轮之后的原文会被静默保留并发送。
+ */
+export function hasSummaryFacts(item) {
+    if (!item || typeof item !== "object") return false;
+    const text = String(item.text || '');
+    const cached = summaryFactsCache.get(item);
+    if (cached?.text === text) return cached.hasFacts;
+    const hasFacts = Boolean(sanitizeSummaryFlourish(text, Infinity));
+    summaryFactsCache.set(item, { text, hasFacts });
+    return hasFacts;
 }
 
 export function getL0CoverageRanges(entries, roundIndex = null) {
@@ -1832,7 +1824,7 @@ export function collectPendingAiTurns(
 export function collectMissingAiTurns(chat, memoryData, upToIndex = Infinity, includeNativeHidden = false, roundIndex = null) {
     if (!Array.isArray(chat)) return [];
     const index = roundIndex || buildRoundMessageIndex(chat, includeNativeHidden);
-    const ranges = getL0CoverageRanges(memoryData?.archivePool, index)
+    const ranges = getL0CoverageRanges((memoryData?.archivePool || []).filter(hasSummaryFacts), index)
         .sort((a, b) => a.start - b.start || a.end - b.end);
     let rangeIndex = 0;
     return index.aiTurns.filter(turn => {
@@ -2142,6 +2134,7 @@ export function reconcileMemoryAfterMessageDeletion(
     rebaseGrowthStorage(memoryData.stateLedger, mapGrowthRound, precedingGrowth);
     rebaseGrowthStorage(previousState, mapGrowthRound, precedingGrowth);
     memoryData.archivePool = retained;
+    if (reconcileRawVectorsAfterDeletion(memoryData, previous, current, cutoff, removedCount)) changed = true;
 
     for (let level = 1; level <= MAX_MEMORY_LEVEL; level++) {
         const list = memoryData.levels?.[level];
@@ -3024,7 +3017,7 @@ function clampText(value, limit = 4000) {
     return typeof value === "string" ? value.slice(0, limit) : "";
 }
 
-export const SUMMARY_FACTS_ONLY_RULE = '只总结已经发生的剧情事实；不评价、不升华、不写氛围、张力、隐喻或结尾钩子。最后一项事实写完立即停止。即使原文结尾包含这些内容也不要照搬：XX（user）尚未回应、等待玩家回应、故事停在/定格于、张力升腾、密会在火光中推向更深一层。已提出的问题和明确约定可以保留，但不要补充未回应、等待答复、下一步会怎样等收尾。';
+export const SUMMARY_FACTS_ONLY_RULE = '只总结已经发生的剧情事实；全程只用中性直述的白描，不评价、不升华、不写氛围、张力、隐喻、意象、心理猜测或任何修辞性形容，不添加原文没有的修饰词。最后一项事实写完立即停止。即使原文结尾包含这些内容也不要照搬：XX（user）尚未回应、等待玩家回应、故事停在/定格于、张力升腾、密会在火光中推向更深一层。已提出的问题和明确约定可以保留，但不要补充未回应、等待答复、下一步会怎样等收尾。';
 
 const SUMMARY_FLOURISH_PATTERNS = [
     /(?:两人|二人|双方|彼此|他们|她们)[^。！？!?\n]{0,40}(?:情感|情愫|暧昧|张力|火花)[^。！？!?\n]{0,30}(?:升腾|升温|蔓延|流动|发酵|暗涌|弥漫)/,
@@ -3100,6 +3093,8 @@ export function sanitizeSummaryFlourish(text, maxLength = 1200) {
 
 function normalizeEmbeddingVector(value) {
     if (!Array.isArray(value)) return null;
+    // 已合规的向量原样复用，避免在 normalize 高频路径上反复重建临时数组。
+    if (value.length <= 4096 && value.every(item => Number.isFinite(item))) return value;
     return value
         .slice(0, 4096)
         .map(item => Number(item))
@@ -3676,7 +3671,7 @@ ${CHARACTER_MEMORY_RULES}
    - 必须采用清楚的事实型时间线口吻（拒绝任何代码感或“第X楼”等机械字眼）。
    - 范例：“上午，在客厅里，甲脱下外套放在沙发上，和乙约定明天去码头。”
    - 用剧情中的实际人物称呼叙述，不要套用“Char/User”占位名。
-   - 只在剧情原文明确出现日期、时刻、相对时间或时间推进时记录时间；原文没有时间信息时使用“稍后/当夜/次日”等有依据的相对描述，或直接省略时间，严禁把楼层显示时间戳当作剧情时间，严禁编造精确日期。
+   - **每条摘要必须以具体的剧情内时间锚点开头**：使用原文或账本中明确出现的日期、时刻、季节等具体表达。严禁用“当夜/次日/数日后/那天”等宽泛词开头。时间锚点之后的叙述内部才可以用相对推进。整份对话都没有明确时间时，用“第一日/第二日”这类从剧情开头数起的天数表达，并以上一段账本的时间为基准继续推进。严禁把楼层显示时间戳当作剧情时间，严禁编造原文和账本都没有依据的精确日期。
    - 只记录原文已经发生的时间推进、地点、关键动作、明确对话结果和已表态的决定（${summaryWordLimit}）。原文信息少就写少，不要扩写。
    - 总结不是续写或文学润色：不得升华主题、渲染气氛、揣测心理、添加比喻/隐喻/环境抒情，或写“情感张力升腾”“空气中弥漫着暧昧氛围”等原文没有的套话。不要为了收尾另加抒情段。
    - 提取 3~5 个关键词 (keywords)。
@@ -3737,9 +3732,9 @@ ${CHARACTER_MEMORY_RULES}
   }
 }`;
 
-    if (summaryOnly) systemPrompt = "你是剧情事实归档器。仅总结提供的连续剧情，返回 JSON {\"l0_summary\":\"剧情事实\",\"keywords\":[\"关键词\"]}。不要返回或更新人物状态账本。署名只用于区分发言，不能据此虚构剧情身份。尚未公开的私密视角、密信或偷听内容不写入公共剧情时间线。l0_summary 按实际时间顺序压缩关键事件、人物关系和物品变动，关键词不超过 5 个。\n" + SUMMARY_FACTS_ONLY_RULE;
+    if (summaryOnly) systemPrompt = "你是剧情事实归档器。仅总结提供的连续剧情，返回 JSON {\"l0_summary\":\"剧情事实\",\"keywords\":[\"关键词\"]}。不要返回或更新人物状态账本。署名只用于区分发言，不能据此虚构剧情身份。尚未公开的私密视角、密信或偷听内容不写入公共剧情时间线。l0_summary 必须以具体的剧情内时间锚点开头（原文或账本中明确出现的日期/时刻/季节），严禁用“当夜/次日/数日后”等宽泛词开头；覆盖多轮时开头给出起止锚点，锚点之后的内部推进才可用相对表达；整份对话都没有明确时间时，用“第一日/第二日”这类天数表达。严禁编造没有依据的精确日期，严禁把楼层时间戳当剧情时间。正文按实际时间顺序用白描压缩关键事件、人物关系和物品变动，不写氛围、心理、比喻或任何修辞。关键词不超过 5 个。\n" + SUMMARY_FACTS_ONLY_RULE;
 
-    if (incrementalState) systemPrompt = "同时完成两项任务：l0_summary 总结本次归档范围的全部剧情，keywords 返回不超过 5 个关键词；stateUpdate 仅返回状态基准第 " + stateBaseRound + " 轮之后的新变化。禁止重新执行基准之前的转交、消耗或穿脱。不要返回完整 stateLedger 或完整物品清单。尚未公开的私密视角不写入公共总结。根对象格式：" + JSON.stringify({ l0_summary: "剧情事实", keywords: [], stateUpdate: { version: 1, baseRound: stateBaseRound, changes: {} } }) + "\n以下状态协议的完整 JSON 应放在 stateUpdate 字段内：\n" + buildStateUpdateInstruction(stateBaseRound) + "\n" + SUMMARY_FACTS_ONLY_RULE;
+    if (incrementalState) systemPrompt = "同时完成两项任务：l0_summary 以具体的剧情内时间锚点开头（原文或账本中明确出现的日期/时刻/季节；严禁“当夜/次日/数日后”等宽泛词开头，锚点之后的内部推进才可用相对表达；整份对话都没有明确时间时用“第一日/第二日”这类天数表达），总结本次归档范围的全部剧情，keywords 返回不超过 5 个关键词；stateUpdate 仅返回状态基准第 " + stateBaseRound + " 轮之后的新变化。禁止重新执行基准之前的转交、消耗或穿脱。不要返回完整 stateLedger 或完整物品清单。尚未公开的私密视角不写入公共总结。根对象格式：" + JSON.stringify({ l0_summary: "剧情事实", keywords: [], stateUpdate: { version: 1, baseRound: stateBaseRound, changes: {} } }) + "\n以下状态协议的完整 JSON 应放在 stateUpdate 字段内：\n" + buildStateUpdateInstruction(stateBaseRound) + "\n" + SUMMARY_FACTS_ONLY_RULE;
 
     const safeUserName = String(userName || "").slice(0, 200);
     const safeCharName = String(charName || "").slice(0, 200);
@@ -3848,12 +3843,6 @@ ${dialogueText}
     const stateCutoff = hasStateUpdate
         ? { endMessageId, round: currentRound } : stateSource;
 
-    const embedding = await getEmbeddingVector(
-        settings,
-        `${summaryText} ${keywords.join(" ")}`,
-        EMBEDDING_REQUEST_TIMEOUT_MS,
-        signal,
-    );
     const hasArchivedL0 = (working.archivePool || []).some(item => item?.level === 0);
     const isStateKeyframe = !hasArchivedL0
         || currentRound === 1
@@ -3871,13 +3860,6 @@ ${dialogueText}
         keywords: keywords,
         timestamp: Date.now(),
         ...(splitState ? { stateMessageId: stateCutoff.endMessageId, stateRound: stateCutoff.round } : {}),
-        embedding: embedding,
-        ...(embedding
-            ? {
-                embeddingModel: resolveEmbeddingModelName(settings),
-                embeddingDimension: embedding.length,
-            }
-            : {}),
         // 每 20 轮保存完整关键帧，其余轮次只保存相对上一轮的状态差异。
         ...(isStateKeyframe
             ? { postStateSnapshot: deepClone(summaryState) }
@@ -3895,7 +3877,6 @@ ${dialogueText}
     if (!turnInfo.shouldCommit()) {
         return null;
     }
-    sampleArchiveEmbeddings(working);
     commitMemoryUpdate(memoryData, working);
     return l0Entry;
 }
@@ -3910,7 +3891,8 @@ export async function checkAndCascadeMerge(settings, memoryData, options = {}) {
         memoryData.levels = { 0: [] };
     }
     const chunkSize = Math.min(20, Math.max(2, numOr(settings.mergeChunkSize, 5)));
-    const coverage = getL0CoverageRanges(memoryData.archivePool);
+    // 与注入/缺失检测保持同一有效性口径：清理后全为空的 L0 不算覆盖，避免在无效摘要之上合并。
+    const coverage = getL0CoverageRanges(memoryData.archivePool.filter(hasSummaryFacts));
 
     for (let lvl = 0; lvl < MAX_MEMORY_LEVEL; lvl++) {
         if (!Array.isArray(memoryData.levels[lvl])) {
@@ -3981,7 +3963,6 @@ export async function rebuildMemoryHierarchy(settings, memoryData, shouldCommit 
     working.pendingFarHistory = [];
     for (const item of l0Entries) item.level = 0;
     await checkAndCascadeMerge(settings, working, { signal });
-    sampleArchiveEmbeddings(working);
     throwIfAborted(signal);
     if (!shouldCommit()) return false;
     commitMemoryUpdate(memoryData, working);
@@ -4002,7 +3983,7 @@ async function mergeSummariesAtLevel(settings, currentLevel, items, mergedRoundR
 ${SUMMARY_FACTS_ONLY_RULE}
 1. 按剧情内先后顺序压缩事实，保留重要事件、人物关系变化、关键承诺和随身道具变动。
 2. 只做去重和压缩，不续写、不推测心理、不渲染气氛，也不添加原文没有的比喻、隐喻或结尾抒情段。
-3. 禁止使用“两人之间热烈的情感张力缓慢升腾”“空气中弥漫着暧昧的氛围”等空泛套话；没有明确时间就省略时间，不得为了“起承转合”编造过渡。
+3. 禁止使用“两人之间热烈的情感张力缓慢升腾”“空气中弥漫着暧昧的氛围”等空泛套话；段首以本段起止的具体剧情内时间锚点开头，禁止用“那一周里/数日间/近日”等宽泛词开头；段内保留各事件自带的时间标记，锚点之后才可用相对推进；整段都没有明确时间锚点时，用“第一日/第二日”这类天数表达限定时间。严禁把楼层编号或现实时间戳当作剧情时间，也不得为了“起承转合”编造过渡。
 4. **直接输出合并后的纯叙事文本**，严禁包含任何代码或格式说明。`;
 
     const listText = items
@@ -4084,9 +4065,366 @@ async function getQueryEmbedding(settings, queryText) {
     return entry.promise;
 }
 
+/**
+ * 向量记忆（原文细节召回）：已归档楼层的原文按消息切块建向量。
+ * 只存向量与内容签名，不复制原文；查询时用当前聊天核对签名，编辑过的块自动失效。
+ */
+export function rawVectorMemoryActive(settings = {}) {
+    return Boolean(settings.vectorRawMemory && settings.useEmbeddingApi
+        && String(settings.embeddingApiUrl || "").trim() && String(settings.embeddingApiKey || "").trim());
+}
+
+function buildRawChunkText(msg) {
+    return stripStateUpdateBlocks(String(msg?.mes || ""));
+}
+
+// 原文块数据（签名、文本、分词）按消息对象缓存：字符串不可变，mes 引用相同即内容未变。
+// 召回与同步每轮都会扫描全部已归档楼层，避免对同一楼层反复做状态块剥离和全量分词。
+const rawChunkDataCache = new WeakMap();
+function rawChunkData(msg) {
+    if (!msg || typeof msg !== "object") return null;
+    const cached = rawChunkDataCache.get(msg);
+    if (cached && cached.mes === msg.mes) return cached;
+    const text = buildRawChunkText(msg);
+    const data = { mes: msg.mes, text, sig: `${text.length}:${hashTodoText(text)}`,
+        tokens: extractBigramsAndTokens(text) };
+    rawChunkDataCache.set(msg, data);
+    return data;
+}
+
+// 已通过完整校验的条目按对象身份记录：normalizeMemoryData 在每次 UI 刷新都会执行，
+// 逐条重建 500×上千米级向量数组的开销不可接受；会话内只有本引擎原地改动这些条目
+// （删除重映射平移 index、采样删 embedding）， Reload 后 JSON 解析出的新对象会重新校验。
+const validatedRawVectorEntries = new WeakSet();
+
+function normalizeRawVectorEntry(entry) {
+    const index = Number(entry.index);
+    if (!Number.isInteger(index) || index < 0 || index > 10_000_000) return null;
+    const normalized = { index, sig: asString(entry.sig, "", 200) };
+    const embedding = normalizeEmbeddingVector(entry.embedding);
+    if (embedding) {
+        normalized.embedding = embedding;
+        normalized.model = asString(entry.model, "", 200);
+        normalized.dim = embedding.length;
+    }
+    return normalized;
+}
+
+function sanitizeRawVectors(value) {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set();
+    const list = [];
+    let unchanged = true;
+    for (const entry of value) {
+        let normalized = null;
+        if (validatedRawVectorEntries.has(entry)
+            && Number.isInteger(entry.index) && entry.index >= 0 && entry.index <= 10_000_000
+            && typeof entry.sig === "string") {
+            normalized = entry;
+        } else {
+            normalized = entry && typeof entry === "object" && !Array.isArray(entry)
+                ? normalizeRawVectorEntry(entry) : null;
+            if (normalized) {
+                validatedRawVectorEntries.add(normalized);
+                if (normalized !== entry) unchanged = false;
+            }
+        }
+        if (!normalized || seen.has(normalized.index)) { unchanged = false; continue; }
+        seen.add(normalized.index);
+        if (list.length && list[list.length - 1].index > normalized.index) unchanged = false;
+        list.push(normalized);
+    }
+    // 全部条目原样保留且有序时返回原数组，保持引用稳定（同步任务持有 byIndex 映射）。
+    if (unchanged) return value;
+    list.sort((a, b) => a.index - b.index);
+    return list;
+}
+
+// 超出上限时按均匀采样保留向量，未采样的条目保留签名占位，避免每次同步反复重嵌入。
+function sampleRawVectorEmbeddings(memoryData) {
+    const list = memoryData?.rawVectors;
+    if (!Array.isArray(list)) return;
+    const embedded = list.filter(entry => Array.isArray(entry.embedding));
+    if (embedded.length <= MAX_RAW_VECTORS) return;
+    const keep = new Set(Array.from({ length: MAX_RAW_VECTORS }, (_, i) =>
+        embedded[Math.floor((i * (embedded.length - 1)) / Math.max(1, MAX_RAW_VECTORS - 1))]));
+    for (const entry of embedded) {
+        if (!keep.has(entry)) {
+            delete entry.embedding;
+            delete entry.model;
+            delete entry.dim;
+        }
+    }
+}
+
+// 批量嵌入的熔断键按服务配置隔离：修正地址或 Key 后不必等旧配置的 60 秒冷却。
+function rawBatchFailureKey(settings) {
+    return `raw-batch:${embeddingServiceKey(settings)}`;
+}
+
+function recordEmbeddingFailure(settings, status = 0) {
+    const failure = { status, at: Date.now() };
+    embeddingFailures.set(rawBatchFailureKey(settings), { ...failure, until: failure.at + 60_000 });
+    diagnostics.lastEmbeddingFailure = failure;
+}
+
+/**
+ * 批量嵌入：一次 /embeddings 请求携带多段原文，按返回的 index 对齐。
+ * 需要渠道支持 OpenAI /embeddings 批量格式（data 数组带 index）；仅支持单个文本的端点不适用。
+ */
+export async function getEmbeddingVectors(settings, texts, timeoutMs = EMBEDDING_REQUEST_TIMEOUT_MS, signal = null) {
+    throwIfAborted(signal);
+    if (!rawVectorMemoryActive(settings) || !Array.isArray(texts) || texts.length === 0) return null;
+    const failureKey = rawBatchFailureKey(settings);
+    if (Date.now() < (embeddingFailures.get(failureKey)?.until || 0)) return null;
+    try {
+        const baseUrl = String(settings.embeddingApiUrl).trim().replace(/\/+$/, "");
+        const endpoint = baseUrl.endsWith("/embeddings") ? baseUrl : `${baseUrl}/embeddings`;
+        diagnostics.embeddingRequests++;
+        const res = await fetchWithTimeout(endpoint, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${String(settings.embeddingApiKey).trim()}`,
+            },
+            body: JSON.stringify({
+                model: resolveEmbeddingModelName(settings),
+                input: texts.map(text => String(text ?? "").slice(0, 1000)),
+            }),
+        }, timeoutMs, signal);
+        if (!res.ok) {
+            recordEmbeddingFailure(settings, res.status);
+            return null;
+        }
+        const data = JSON.parse(await readResponseText(res, timeoutMs, signal));
+        const rows = Array.isArray(data?.data) ? data.data.slice()
+            .sort((a, b) => numOr(a?.index, 0) - numOr(b?.index, 0)) : [];
+        const vectors = rows.map(row => normalizeEmbeddingVector(row?.embedding));
+        if (vectors.length !== texts.length || vectors.some(vector => !vector?.length)) {
+            recordEmbeddingFailure(settings);
+            return null;
+        }
+        embeddingFailures.delete(failureKey);
+        diagnostics.lastEmbeddingFailure = null;
+        return vectors;
+    } catch (e) {
+        if (signal?.aborted || e?.name === "AbortError") throw createAbortError();
+        recordEmbeddingFailure(settings);
+        return null;
+    }
+}
+
+/**
+ * 为已归档楼层补齐原文向量。每次调用最多处理 maxMessages 条，
+ * 返回本次新嵌入的数量；失败静默返回 0，由下次归档或手动回填补齐。
+ */
+export async function embedArchivedRawVectors(settings, memoryData, chat, { signal = null, maxMessages = 48 } = {}) {
+    if (!rawVectorMemoryActive(settings) || !Array.isArray(chat) || !memoryData) return 0;
+    if (!Array.isArray(memoryData.rawVectors)) memoryData.rawVectors = [];
+    const byIndex = new Map(memoryData.rawVectors.map(entry => [entry.index, entry]));
+    const upper = Math.min(numOr(memoryData.lastProcessedMessageId, -1), chat.length - 1);
+    if (upper < 0) return 0;
+    const jobs = [];
+    const replaced = new Set();
+    const currentModel = resolveEmbeddingModelName(settings);
+    for (let index = 0; index <= upper && jobs.length < maxMessages; index++) {
+        const msg = chat[index];
+        if (!msg || !isStoryMessage(msg, settings.includeNativeHidden)) continue;
+        const chunk = rawChunkData(msg);
+        // 空文本（纯状态块、空楼层）不建向量：空 input 会被多数端点拒绝并卡住整批。
+        if (!chunk || !chunk.text) continue;
+        const existing = byIndex.get(index);
+        // 签名未变化则跳过：采样占位（无向量）保持等待回填，不反复重嵌入；
+        // 已有向量但模型更换的条目重新嵌入，否则检索会因模型不符永久忽略旧向量。
+        if (existing && existing.sig === chunk.sig
+            && (!Array.isArray(existing.embedding) || existing.model === currentModel)) continue;
+        if (existing) replaced.add(index);
+        jobs.push({ index, sig: chunk.sig, text: chunk.text });
+    }
+    if (!jobs.length) return 0;
+    let embedded = 0;
+    for (let offset = 0; offset < jobs.length; offset += RAW_VECTOR_BATCH_SIZE) {
+        throwIfAborted(signal);
+        const batch = jobs.slice(offset, offset + RAW_VECTOR_BATCH_SIZE);
+        // 批量请求携带多条原文，耗时接近单条的批大小倍数；按批大小放宽超时，慢渠道不至于每批都熔断。
+        const batchTimeout = Math.max(EMBEDDING_REQUEST_TIMEOUT_MS, batch.length * RAW_VECTOR_TIMEOUT_PER_ITEM_MS);
+        const vectors = await getEmbeddingVectors(settings, batch.map(job => job.text), batchTimeout, signal);
+        if (!vectors) break;
+        if (replaced.size) {
+            memoryData.rawVectors = memoryData.rawVectors.filter(entry => !replaced.has(entry.index));
+            replaced.clear();
+        }
+        for (let i = 0; i < batch.length; i++) {
+            const entry = {
+                index: batch[i].index,
+                sig: batch[i].sig,
+                model: resolveEmbeddingModelName(settings),
+                dim: vectors[i].length,
+                embedding: vectors[i].map(value => Number(value.toFixed(4))),
+            };
+            memoryData.rawVectors.push(entry);
+            validatedRawVectorEntries.add(entry);
+            embedded++;
+        }
+    }
+    if (embedded > 0) {
+        memoryData.rawVectors.sort((a, b) => a.index - b.index);
+        sampleRawVectorEmbeddings(memoryData);
+    }
+    return embedded;
+}
+
+/**
+ * 楼层删除后重映射原文向量：删除区间内的块丢弃，其余平移并核对指纹。
+ */
+export function reconcileRawVectorsAfterDeletion(memoryData, previousFingerprint, currentFingerprint, cutoff, removedCount) {
+    const list = memoryData?.rawVectors;
+    if (!Array.isArray(list) || !list.length || !Array.isArray(previousFingerprint) || !Array.isArray(currentFingerprint)) return false;
+    const kept = [];
+    let changed = false;
+    for (const entry of list) {
+        const index = Number(entry?.index);
+        if (!Number.isInteger(index) || index < 0) { changed = true; continue; }
+        if (index < cutoff) { kept.push(entry); continue; }
+        if (index < cutoff + removedCount) { changed = true; continue; }
+        const newIndex = index - removedCount;
+        if (newIndex < 0 || newIndex >= currentFingerprint.length || previousFingerprint[index] !== currentFingerprint[newIndex]) {
+            changed = true;
+            continue;
+        }
+        if (newIndex !== index) {
+            entry.index = newIndex;
+            changed = true;
+        }
+        kept.push(entry);
+    }
+    memoryData.rawVectors = kept;
+    return changed;
+}
+
+function roundForMessageIndex(roundIndex, index) {
+    const turns = roundIndex?.aiTurns || [];
+    for (const turn of turns) {
+        if (turn.idx >= index) return turn.round;
+    }
+    return turns.length ? turns.at(-1).round : 0;
+}
+
+// 按句末标点切分；不用 lookbehind，避免 Safari 16.4 之前解析整个模块失败。
+function splitStorySentences(source) {
+    const parts = [];
+    let start = 0;
+    for (let i = 0; i < source.length; i++) {
+        if ("。！？!?\n".includes(source[i])) {
+            parts.push(source.slice(start, i + 1));
+            start = i + 1;
+        }
+    }
+    if (start < source.length) parts.push(source.slice(start));
+    return parts.map(part => part.trim()).filter(Boolean);
+}
+
+// 命中的原文块可能很长；围绕与问题重合度最高的一句裁出短片段。
+function buildRawExcerpt(text, queryBigrams, limit = 320) {
+    const source = String(text || "").trim();
+    if (source.length <= limit) return source;
+    const sentences = splitStorySentences(source);
+    if (!sentences.length) return source.slice(0, limit) + "……";
+    let best = 0, bestOverlap = -1;
+    for (let i = 0; i < sentences.length; i++) {
+        const tokens = extractBigramsAndTokens(sentences[i]);
+        let overlap = 0;
+        for (const token of tokens) if (queryBigrams.has(token)) overlap++;
+        if (overlap > bestOverlap) { bestOverlap = overlap; best = i; }
+    }
+    let start = best, end = best, length = sentences[best].length;
+    while (length < limit) {
+        const prev = start > 0 ? sentences[start - 1].length : Infinity;
+        const next = end < sentences.length - 1 ? sentences[end + 1].length : Infinity;
+        if (prev === Infinity && next === Infinity) break;
+        if (prev <= next) { start--; length += prev; } else { end++; length += next; }
+    }
+    let excerpt = sentences.slice(start, end + 1).join("");
+    // 省略号计入总长，最终片段严格不超过 limit。
+    const head = start > 0 ? "……" : "";
+    const tail = end < sentences.length - 1 ? "……" : "";
+    const budget = limit - head.length - tail.length;
+    if (excerpt.length > budget) excerpt = excerpt.slice(0, Math.max(0, budget));
+    return head + excerpt + tail;
+}
+
+async function retrieveRawExcerpts(settings, memoryData, queryText, options) {
+    const chat = options.chat;
+    if (!Array.isArray(chat)) return [];
+    const focus = String(options.focusQuery || queryText).toLowerCase();
+    const names = [];
+    for (const [name, character] of Object.entries(memoryData.stateLedger?.characters || {})) {
+        const aliases = [...characterAliases(name, character)];
+        if (aliases.some(alias => focus.includes(String(alias).toLowerCase()))) names.push(...aliases);
+    }
+    const expanded = [focus, ...new Set(names)].join(' ');
+    const queryEmbedding = await getQueryEmbedding(settings, expanded);
+    const embeddingModel = resolveEmbeddingModelName(settings);
+    const queryBigrams = extractBigramsAndTokens(expanded);
+    const upper = Math.min(numOr(memoryData.lastProcessedMessageId, -1), chat.length - 1);
+    const scored = [];
+    for (const entry of memoryData.rawVectors || []) {
+        if (!Array.isArray(entry.embedding) || !Number.isInteger(entry.index)) continue;
+        if (entry.index > upper) continue;
+        const msg = chat[entry.index];
+        const chunk = rawChunkData(msg);
+        if (!chunk || entry.sig !== chunk.sig) continue;
+        // 查询向量不可用（超时/熔断/断网）时退化为纯词法召回，而不是零召回；
+        // 词法打分不依赖向量维度与模型，此时对全部条目放行。
+        if (queryEmbedding && (entry.dim !== queryEmbedding.length || entry.model !== embeddingModel)) continue;
+        const text = chunk.text;
+        if (!text) continue;
+        let score = 0;
+        const reasons = [];
+        const alias = names.find(name => text.toLowerCase().includes(String(name).toLowerCase()));
+        if (alias) { score += 0.25; reasons.push('人物别名：' + alias); }
+        const tokens = chunk.tokens;
+        let overlap = 0;
+        for (const token of queryBigrams) if (tokens.has(token)) overlap++;
+        const lexical = queryBigrams.size && tokens.size ? overlap / Math.sqrt(queryBigrams.size * tokens.size) : 0;
+        score += lexical * 0.6;
+        if (lexical >= 0.2) reasons.push('原文词语相近');
+        const similarity = queryEmbedding ? Math.max(0, cosineSimilarity(queryEmbedding, entry.embedding)) : 0;
+        score += similarity * 1.2;
+        if (similarity >= 0.2) reasons.push('向量语义相关');
+        if (score < 0.12) continue;
+        scored.push({ entry, text, score, reason: reasons.join('；') || '话题词语相关' });
+    }
+    scored.sort((a, b) => b.score - a.score || a.entry.index - b.entry.index);
+    const topK = Math.min(20, Math.max(1, numOr(settings.retrievalTopK, 3)));
+    const selected = [];
+    const seenTexts = new Set();
+    for (const result of scored) {
+        if (selected.length >= topK) break;
+        const round = roundForMessageIndex(options.roundIndex, result.entry.index);
+        const excerpt = buildRawExcerpt(result.text, queryBigrams);
+        const dedupeKey = excerpt.replace(/\s+/g, '').toLowerCase();
+        if (seenTexts.has(dedupeKey)) continue;
+        seenTexts.add(dedupeKey);
+        const item = {
+            id: `raw-${result.entry.index}`,
+            roundRange: String(Math.max(1, round)),
+            text: excerpt,
+            isRaw: true,
+            messageId: result.entry.index,
+        };
+        selected.push(item);
+        if (Array.isArray(options.details)) options.details.push({ id: item.id, roundRange: item.roundRange, score: result.score, reason: result.reason });
+    }
+    return selected;
+}
+
 export async function retrieveRelevantArchivedMemories(settings, memoryData, queryText, options = {}) {
     if (!settings.enableRetrieval || !queryText || !Array.isArray(memoryData.archivePool)) return [];
     if (!options.skipNormalize) normalizeMemoryData(memoryData);
+    if (rawVectorMemoryActive(settings) && Array.isArray(options.chat)) {
+        return retrieveRawExcerpts(settings, memoryData, queryText, options);
+    }
     const activeL0Ids = new Set((memoryData.levels[0] || []).map(item => item.id));
     const candidates = memoryData.archivePool.filter(item => !activeL0Ids.has(item.id));
     if (!candidates.length) return [];
@@ -4097,8 +4435,6 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
         if (aliases.some(alias => focus.includes(String(alias).toLowerCase()))) names.push(...aliases);
     }
     const expanded = [focus, ...new Set(names)].join(' ');
-    const queryEmbedding = await getQueryEmbedding(settings, expanded);
-    const embeddingModel = resolveEmbeddingModelName(settings);
     const queryBigrams = extractBigramsAndTokens(expanded);
     const scored = candidates.map(item => {
         let score = 0;
@@ -4114,14 +4450,6 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
         const lexical = queryBigrams.size && tokens.size ? overlap / Math.sqrt(queryBigrams.size * tokens.size) : 0;
         score += lexical * 0.6;
         if (lexical >= 0.2) reasons.push('原文词语相近');
-        const compatible = queryEmbedding && Array.isArray(item.embedding)
-            && item.embedding.length === queryEmbedding.length && item.embeddingModel === embeddingModel
-            && item.embeddingDimension === queryEmbedding.length;
-        if (compatible) {
-            const similarity = Math.max(0, cosineSimilarity(queryEmbedding, item.embedding));
-            score += similarity * 1.2;
-            if (similarity >= 0.2) reasons.push('向量语义相关');
-        }
         return { item, score, reason: reasons.join('；') || '话题词语相关' };
     });
     scored.sort((a, b) => b.score - a.score || numOr(b.item.endMessageId, parseRoundRange(b.item.roundRange).end) - numOr(a.item.endMessageId, parseRoundRange(a.item.roundRange).end));
@@ -4307,7 +4635,10 @@ export function buildInjectedMemoryPrompt(
         orderStart: parseRoundRange(item.roundRange).start,
         orderEnd: parseRoundRange(item.roundRange).end,
         level: 0,
-        text: `• [过往回忆·第 ${item.roundRange} 轮] ${sanitizeSummaryFlourish(item.text, Infinity)}`,
+        // 向量记忆召回的是原文片段，不做套话清理（会误删正文），仅原样注入。
+        text: item?.isRaw
+            ? `• [过往原文·第 ${item.roundRange} 轮] ${String(item.text || "")}`
+            : `• [过往回忆·第 ${item.roundRange} 轮] ${sanitizeSummaryFlourish(item.text, Infinity)}`,
     }));
 
     const renderPrompt = (blocks, timeline, retrieved) => {

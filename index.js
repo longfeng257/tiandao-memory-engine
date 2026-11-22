@@ -46,6 +46,7 @@ import {
     sanitizeSummaryFlourish,
     resolveStateUpdateMode, getStateLedgerCursor, getStateLedgerAtMessage, ensureLiveStateStorage,
     recordStateLedger, applyStateChanges, extractStateChanges, formatCharacterGrowth, characterDisplayName,
+    embedArchivedRawVectors, rawVectorMemoryActive,
 } from "./memory-engine.js";
 import { readMainResponseState, stripStateUpdateMessage } from "./state-protocol.js";
 import { loadHostPromptProcessor, createPromptTextReader, preparePromptHistory } from "./host-prompt.js";
@@ -68,7 +69,24 @@ let abortBackfillFlag = false;
 let activeBackfillChatKey = null;
 let summaryQueue = Promise.resolve();
 let summaryEpoch = 0;
-const activeSummaryChats = new Set();
+// 按任务 token 记账：聊天切换 clear() 之后，旧任务 finally 的注销不会误删新任务的标记。
+const activeSummaryChats = new Map();
+function markSummaryChat(chatKey) {
+    let tokens = activeSummaryChats.get(chatKey);
+    if (!tokens) {
+        tokens = new Set();
+        activeSummaryChats.set(chatKey, tokens);
+    }
+    const token = Symbol("summary-task");
+    tokens.add(token);
+    return token;
+}
+function unmarkSummaryChat(chatKey, token) {
+    if (!token) return;
+    const tokens = activeSummaryChats.get(chatKey);
+    if (!tokens?.delete(token)) return;
+    if (!tokens.size) activeSummaryChats.delete(chatKey);
+}
 let chatSaveTimer = null;
 let lastChatFingerprint = [];
 let statusBarHideTimer = null;
@@ -819,6 +837,21 @@ async function saveChatMemory() {
     }
 }
 
+// 事件回调里的保存失败不能变成 unhandled rejection；切换聊天属正常竞争只记日志，真实失败提示状态栏。
+async function saveMemoryQuietly() {
+    try {
+        await saveChatMemory();
+        return true;
+    } catch (error) {
+        if (error?.persistenceStatus === CHAT_PERSISTENCE_STATUS.failed) {
+            updateStatusBar("⚠️ 记忆保存失败：" + String(error?.message || error).slice(0, 100), true);
+        } else {
+            console.warn("[溯微] 记忆保存未确认（聊天可能已切换）:", error?.message || error);
+        }
+        return false;
+    }
+}
+
 function updateStatusBar(text, isError = false) {
     const el = document.getElementById("tiandao_status_bar");
     if (!el) return;
@@ -1031,9 +1064,13 @@ async function refreshPromptInjection(customQuery = "", options = {}) {
     const queryText = customQuery || (needsRetrieval ? buildRecentContextQuery(coreChat, settings.targetContentTags, settings.customStripTags) : '');
     const retrievalDetails = [];
     let retrieved = [];
-    if (settings.enableRetrieval && queryText && !options.skipRetrieval) {
+    if (settings.enableRetrieval && queryText && !options.skipRetrieval
+        // 向量召回的原文片段只注入被记忆替换的旧区域；关闭「自动隐藏旧消息」时全文仍在
+        // 提示词里，召回只会重复内容并白付 Embedding 调用，直接跳过。
+        && !(rawVectorMemoryActive(settings) && !settings.autoHideOldMessages)) {
         retrieved = await retrieveRelevantArchivedMemories(settings, memoryData, queryText,
-            { skipNormalize: true, details: retrievalDetails, focusQuery: buildLatestUserQuery(coreChat, settings) });
+            { skipNormalize: true, details: retrievalDetails, focusQuery: buildLatestUserQuery(coreChat, settings),
+              chat: fullChat, roundIndex: getCachedRoundIndex(fullChat, settings.includeNativeHidden) });
     }
     if (!isCurrentChat(chatKey) || requestEpoch !== summaryEpoch
         || currentMemoryReference(ctx) !== memoryData) return null;
@@ -1081,13 +1118,6 @@ function renderInjectionPreview() {
 
 function clonePlainData(value) {
     return value == null ? value : JSON.parse(JSON.stringify(value));
-}
-
-function clearEntryEmbedding(item) {
-    if (!item || typeof item !== "object") return;
-    item.embedding = null;
-    item.embeddingModel = null;
-    item.embeddingDimension = null;
 }
 
 async function buildL0GroupSummaryInput(chat, turns, settings, ctx) {
@@ -1331,7 +1361,7 @@ function runStoryResummarize(turns, {
     storyPage = 0;
     renderStoryTimeline();
     if (button) button.disabled = true;
-    activeSummaryChats.add(chatKey);
+    const summaryChatToken = markSummaryChat(chatKey);
     updateFloatingWidgetUI();
     let task = null;
     let saved = false;
@@ -1408,6 +1438,7 @@ function runStoryResummarize(turns, {
         updateFloatingWidgetUI();
         renderStoryTimeline();
         const complete = rebuiltSuccessfully && !cancelled && !failure;
+        if (complete) runRawVectorSync(chat, memoryData);
         const status = complete
             ? `已重新总结第 ${fromRound}-${toRound} 轮`
             : `已${cancelled ? "停止" : "保存部分结果"}：完成 ${completedRounds}/${resummarizeTurns.length} 轮；未完成轮次保留原摘要`;
@@ -1417,7 +1448,7 @@ function runStoryResummarize(turns, {
     }, title);
     job.finally(() => {
         if (!saved) checkpoint.rollback();
-        activeSummaryChats.delete(chatKey);
+        unmarkSummaryChat(chatKey, summaryChatToken);
         if (button) button.disabled = false;
         if (task) finishSummaryTask(task);
         updateFloatingWidgetUI();
@@ -1464,7 +1495,7 @@ globalThis.tiandaoMemoryInterceptor = async function (chat, _contextSize, abort,
 /**
  * 恢复旧版本由本插件隐藏的原文。发送内容仅在生成副本中替换。
  */
-function syncHiddenMessagesState(_forceRestoreAll = false) {
+function syncHiddenMessagesState() {
     const ctx = getSTContext();
     const chat = ctx.chat || [];
     let restoredCount = 0;
@@ -1484,6 +1515,106 @@ function syncHiddenMessagesState(_forceRestoreAll = false) {
         try { ctx.refresh?.(); } catch (_) { /* Older hosts do not expose refresh. */ }
     }
     return restoredCount;
+}
+
+/**
+ * 向量记忆（原文细节召回）：归档保存成功后静默补齐新原文的向量，不阻塞发送。
+ */
+let rawVectorSyncBusy = false;
+let rawVectorSyncPending = false;
+async function runRawVectorSync(chat, memoryData, { maxMessages = 24 } = {}) {
+    let settings = getSettings();
+    if (!settings.enabled || !rawVectorMemoryActive(settings)) return;
+    // 同步进行中又有归档登记时不丢弃请求：结束后用当前聊天状态补跑一轮。
+    if (rawVectorSyncBusy) { rawVectorSyncPending = true; return; }
+    rawVectorSyncBusy = true;
+    try {
+        for (;;) {
+            rawVectorSyncPending = false;
+            if (!Array.isArray(chat) || !memoryData) break;
+            // 补跑轮次前复查开关：同步进行中用户可能关闭引擎或向量记忆。
+            settings = getSettings();
+            if (!settings.enabled || !rawVectorMemoryActive(settings)) break;
+            const ctx = getSTContext();
+            if (!isActiveChatContext(ctx)) break;
+            const chatKey = getChatKey();
+            const epoch = summaryEpoch;
+            const metadata = ctx.chatMetadata || window.chat_metadata;
+            const embedded = await embedArchivedRawVectors(settings, memoryData, chat, { maxMessages });
+            if (embedded > 0 && epoch === summaryEpoch && isCurrentChat(chatKey)
+                && (ctx.chatMetadata || window.chat_metadata) === metadata && currentMemoryReference(ctx) === memoryData) {
+                scheduleChatSave();
+                updateFloatingWidgetUI();
+            }
+            if (!rawVectorSyncPending) break;
+            chat = getSTContext().chat || [];
+            memoryData = getChatMemory();
+        }
+    } catch (error) {
+        if (error?.name !== "AbortError") console.warn("[溯微] 原文向量同步失败:", error?.name || "unknown");
+    } finally {
+        rawVectorSyncBusy = false;
+    }
+}
+
+/**
+ * 开启向量记忆后的一次性回填：为全部已归档原文补齐向量，可随时停止。
+ */
+async function runRawVectorBackfill() {
+    const ctx = getSTContext();
+    const chatKey = getChatKey();
+    const settings = getSettings();
+    const memoryData = getChatMemory();
+    const chat = ctx.chat || [];
+    if (!rawVectorMemoryActive(settings)) {
+        updateStatusBar("⚠️ 请先勾选「启用外部 Embedding 向量 API」并填写地址与 Key", true);
+        return;
+    }
+    if (!isActiveChatContext(ctx) || !memoryData) return;
+    const epoch = summaryEpoch;
+    const task = await acquireSummaryTask({ label: "向量记忆回填", total: 1, canCancel: true },
+        () => isCurrentChat(chatKey) && epoch === summaryEpoch);
+    if (!task) return;
+    const signal = task.controller?.signal || null;
+    let embeddedTotal = 0;
+    try {
+        updateSummaryTask(task, { detail: "正在为已归档原文构建向量…" });
+        updateStatusBar("⏳ 向量记忆回填中：正在为已归档原文构建向量…");
+        let failedPasses = 0;
+        while (!signal?.aborted) {
+            const embedded = await embedArchivedRawVectors(settings, memoryData, chat, { signal, maxMessages: 48 });
+            if (!embedded) {
+                // 无待补任务时返回 0 属正常收尾；渠道失败（熔断 60 秒）则等待后重试，
+                // 连续 3 轮仍失败才放弃，避免慢渠道/限流渠道直接终止回填。
+                const failure = getRuntimeDiagnostics().lastEmbeddingFailure;
+                if (!failure || Date.now() - failure.at > 5_000 || ++failedPasses >= 3) break;
+                updateSummaryTask(task, { detail: `向量请求失败（HTTP ${failure.status || "网络/响应格式"}），等待渠道恢复后自动重试…` });
+                updateStatusBar(`⏳ 向量请求失败，等待渠道恢复后自动重试 (${failedPasses}/3)…`, true);
+                await new Promise(resolve => setTimeout(resolve, 3_000));
+                continue;
+            }
+            failedPasses = 0;
+            embeddedTotal += embedded;
+            updateSummaryTask(task, { detail: `已嵌入 ${embeddedTotal} 条原文…` });
+        }
+        await saveChatMemory();
+        if (!isCurrentChat(chatKey) || epoch !== summaryEpoch) return;
+        const failure = getRuntimeDiagnostics().lastEmbeddingFailure;
+        updateStatusBar(signal?.aborted
+            ? `⏸️ 向量回填已停止，本次共嵌入 ${embeddedTotal} 条原文`
+            : embeddedTotal > 0 && failure
+                ? `⚠️ 已嵌入 ${embeddedTotal} 条原文；末次请求失败（HTTP ${failure.status || "网络/响应格式"}），可稍后再次回填补齐`
+                : embeddedTotal > 0 || !failure
+                    ? `✅ 向量记忆回填完成，共嵌入 ${embeddedTotal} 条原文`
+                    : `❌ 向量记忆回填失败（HTTP ${failure.status || "网络/响应格式"}），请检查 Embedding 地址与 Key`, embeddedTotal === 0 && Boolean(failure));
+    } catch (error) {
+        if (error?.name !== "AbortError") {
+            if (isCurrentChat(chatKey)) updateStatusBar("❌ 向量回填失败：" + String(error?.message || error), true);
+        }
+    } finally {
+        finishSummaryTask(task);
+        updateFloatingWidgetUI();
+    }
 }
 
 /**
@@ -1522,7 +1653,7 @@ function enqueueLiveStateUpdates(chat, upToIndex, options = {}) {
         const task = await acquireSummaryTask({ label: mode === "independent" ? "逐轮同步状态" : "读取正文状态", total: 1, canCancel: true }, valid);
         if (!task) return;
         const signal = task.controller.signal;
-        let before = null, sourceSignature = '', target = pending.at(-1), saving = false;
+        let before = null, sourceSignature = '', target = pending.at(-1), saving = false, stateChatToken = null;
         try {
             // When both are due after a reply, one normal summary request returns story and state.
             const settings = getSettings();
@@ -1540,7 +1671,7 @@ function enqueueLiveStateUpdates(chat, upToIndex, options = {}) {
             if (!pending.length) return;
             target = pending.at(-1);
             sourceSignature = recoveryChatSignature(chat.slice(0, target.idx + 1));
-            activeSummaryChats.add(chatKey);
+            stateChatToken = markSummaryChat(chatKey);
             let next;
             if (mode === "main_response") {
                 const payload = readMainResponseState(chat[target.idx]?.mes);
@@ -1592,7 +1723,7 @@ function enqueueLiveStateUpdates(chat, upToIndex, options = {}) {
             await saveChatMemory().catch(() => {});
             if (valid()) updateStatusBar("⚠️ 状态未同步：" + String(error.message || error).slice(0, 200), true);
         } finally {
-            activeSummaryChats.delete(chatKey);
+            unmarkSummaryChat(chatKey, stateChatToken);
             finishSummaryTask(task);
             updateFloatingWidgetUI({ forceLedger: true });
         }
@@ -1659,7 +1790,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
     const roundNumber = lastTurn.round;
     const roundRange = startRound === roundNumber ? String(roundNumber) : `${startRound}-${roundNumber}`;
 
-    activeSummaryChats.add(chatKey);
+    const summaryChatToken = markSummaryChat(chatKey);
     const ownsTask = !options.summaryTask;
     const task = options.summaryTask || await acquireSummaryTask({
         label: isManual ? "补总结剧情" : "自动总结剧情",
@@ -1667,7 +1798,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
         canCancel: true,
     }, () => isCurrentChat(chatKey) && epoch === summaryEpoch);
     if (!task) {
-        activeSummaryChats.delete(chatKey);
+        unmarkSummaryChat(chatKey, summaryChatToken);
         return false;
     }
     const signal = task?.controller?.signal || null;
@@ -1739,6 +1870,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
                 console.warn("[溯微] 归档已保存，但刷新提示词注入失败:", error?.name || "refresh failed");
             });
             syncHiddenMessagesState();
+            runRawVectorSync(chat, memoryData);
         }
         if (isCurrentChat(chatKey)) {
             updateStatusBar(`✅ 第 ${roundRange} 轮已归档为 L0`);
@@ -1778,7 +1910,7 @@ async function processSingleAiTurn(targetMessageId, isManual = false, options = 
         }
         return false;
     } finally {
-        activeSummaryChats.delete(chatKey);
+        unmarkSummaryChat(chatKey, summaryChatToken);
         if (ownsTask) finishSummaryTask(task);
         updateFloatingWidgetUI();
     }
@@ -1874,7 +2006,7 @@ function enqueuePendingAiTurns(chat, upToIndex, options = {}) {
         } finally {
             if (stopped) {
                 await saveChatMemory().catch(() => {});
-                updateStatusBar(`⏸️ 已停止总结，已保存前 ${memoryData.lastProcessedRound || 0} 轮进度`);
+                if (isCurrentChat(chatKey)) updateStatusBar(`⏸️ 已停止总结，已保存前 ${memoryData.lastProcessedRound || 0} 轮进度`);
             }
             finishSummaryTask(task);
         }
@@ -2929,6 +3061,13 @@ function initFloatingWidget() {
                                 <input id="tiandao_retrieval_topk" type="number" class="tiandao-input tiandao-input-sm" min="1" max="10" placeholder="3" />
                             </div>
                             <label class="tiandao-toggle-row" style="margin-top:6px;">
+                                <span class="tiandao-toggle-label"><b>向量记忆</b>（召回已归档原文细节）</span>
+                                <input id="tiandao_vector_raw_memory" type="checkbox" class="tiandao-checkbox" />
+                            </label>
+                            <div class="tiandao-field-caption" style="margin:5px 0 0;">
+                                开启后召回来源改为已归档原文的向量片段（需同时启用下方 Embedding API），命中注入原文短句；关闭则为纯总结记忆（关键词/词法召回 L0 摘要）。开启后新归档轮次自动建向量，可在弹窗确认后回填旧历史；向量随聊天存档保存（上限 500 块，超出按均匀采样保留，会增大聊天文件体积）。需保持「自动隐藏旧消息」开启——只有被记忆替换的旧区域才注入召回片段；渠道需支持 OpenAI /embeddings 批量格式（data 数组带 index）。
+                            </div>
+                            <label class="tiandao-toggle-row" style="margin-top:6px;">
                                 <span class="tiandao-toggle-label">启用外部 Embedding 向量 API (默认本地词法分词)</span>
                                 <input id="tiandao_use_embedding" type="checkbox" class="tiandao-checkbox" aria-controls="tiandao_embedding_box" />
                             </label>
@@ -3721,7 +3860,9 @@ function renderFloatingWidgetUI({ forceLedger = false } = {}) {
             : "";
         const fadedCount = numOr(memoryData.fadedHistory?.count, 0);
         const fadedText = fadedCount > 0 ? ` · 远史:${fadedCount}` : "";
-        summaryInfo.textContent = `L0(${l0Count}) L1(${l1Count}) L2(${l2Count}) L3(${l3Count}) · 回溯池:${memoryData.archivePool?.length || 0}${fadedText}${tokenText}`;
+        const rawVectorCount = (memoryData.rawVectors || []).filter(entry => Array.isArray(entry.embedding)).length;
+        const rawVectorText = rawVectorCount > 0 ? ` · 原文向量:${rawVectorCount}` : "";
+        summaryInfo.textContent = `L0(${l0Count}) L1(${l1Count}) L2(${l2Count}) L3(${l3Count}) · 回溯池:${memoryData.archivePool?.length || 0}${fadedText}${rawVectorText}${tokenText}`;
     }
 
     if (!bodyInner) return;
@@ -4380,7 +4521,6 @@ async function rebuildHierarchyLevelsFromL0(settings, memoryData, textOverrides,
             const override = getHierarchyTextOverride(textOverrides, 0, copy);
             if (override !== null) {
                 copy.text = override;
-                clearEntryEmbedding(copy);
             }
             return copy;
         });
@@ -4524,11 +4664,10 @@ window.tiandaoSaveStoryEntry = async (lvl, idx) => {
             || (Number.isInteger(item.startMessageId) && Number.isInteger(item.endMessageId)
                 && entry.startMessageId === item.startMessageId && entry.endMessageId === item.endMessageId))
     ) : null;
-    // A manual text edit invalidates the prior embedding for both active and archived copies.
+    // 摘要不再携带向量；原文向量按消息内容签名自动失效，编辑摘要文本无需清理嵌入。
     for (const entry of new Set([draftItem, archiveEntry])) {
         if (!entry) continue;
         entry.text = newText;
-        clearEntryEmbedding(entry);
     }
     const epoch = ++summaryEpoch;
     storyEditingKey = null;
@@ -4911,7 +5050,7 @@ function bindSettingsUI() {
 
     bindCheck("tiandao_enabled", "enabled", () => {
         invalidateActiveSummaryWork("插件开关已变更");
-        refreshPromptInjection();
+        refreshPromptInjection().catch(error => console.warn("[溯微] 开关切换后刷新注入失败:", error?.name || error?.message || error));
         syncHiddenMessagesState();
         updateFloatingWidgetUI();
     });
@@ -4947,7 +5086,7 @@ function bindSettingsUI() {
         const latest = sync.entries.at(-1) || sync.base;
         latest.sourceFingerprint = buildChatMessageFingerprint([(getSTContext().chat || [])[latest.endMessageId]])[0] || "";
         saveChatMemory().catch(error => updateStatusBar("⚠️ 模式已切换，但状态基准保存失败：" + error.message, true));
-        refreshPromptInjection("", { skipRetrieval: true });
+        refreshPromptInjection("", { skipRetrieval: true }).catch(error => console.warn("[溯微] 模式切换后刷新注入失败:", error?.name || error?.message || error));
         updateFloatingWidgetUI({ forceLedger: true });
         updateStatusBar("✅ 状态更新方式已切换，仅对后续回复生效；未自动调用 API 或重跑历史");
     });
@@ -4981,7 +5120,7 @@ function bindSettingsUI() {
     });
 
     bindCheck("tiandao_auto_hide", "autoHideOldMessages", (checked) => {
-        const count = syncHiddenMessagesState(!checked);
+        const count = syncHiddenMessagesState();
         if (!checked) {
             updateStatusBar(`👁️ 已改为发送全部可见原文${count ? `，并恢复 ${count} 条旧版隐藏记录` : ""}`);
         } else {
@@ -5016,7 +5155,24 @@ function bindSettingsUI() {
     refreshApiProfileSelect();
 
     bindInput("tiandao_merge_chunk", "mergeChunkSize", true);
-    bindCheck("tiandao_enable_retrieval", "enableRetrieval", () => refreshPromptInjection());
+    bindCheck("tiandao_enable_retrieval", "enableRetrieval", () => refreshPromptInjection().catch(error => console.warn("[溯微] 召回开关切换后刷新注入失败:", error?.name || error?.message || error)));
+    bindCheck("tiandao_vector_raw_memory", "vectorRawMemory", async (checked) => {
+        refreshPromptInjection("", { skipRetrieval: true }).catch(() => {});
+        updateFloatingWidgetUI();
+        if (!checked) {
+            updateStatusBar("📚 已切回纯总结记忆：召回改为关键词/词法检索 L0 摘要，已保存的原文向量保留备用");
+            return;
+        }
+        if (!rawVectorMemoryActive(getSettings())) {
+            updateStatusBar("⚠️ 已勾选向量记忆；还需勾选「启用外部 Embedding 向量 API」并填写地址与 Key 才会生效", true);
+            return;
+        }
+        updateStatusBar("📚 已开启向量记忆：新归档轮次会自动建立原文向量");
+        const backlog = (getSTContext().chat || []).length && getChatMemory()?.lastProcessedMessageId >= 0;
+        if (backlog && confirm("是否现在为全部已归档旧楼层回填原文向量？\n会调用 Embedding API（按渠道计费），可在总结进度框随时停止。\n取消则只为之后新归档的轮次建立向量。")) {
+            await runRawVectorBackfill();
+        }
+    });
     bindInput("tiandao_retrieval_topk", "retrievalTopK", true);
 
     // Embedding 配置区展开/收起：未勾选时显示「└ Embedding URL / Key / 模型 · 勾选后展开」提示行
@@ -5078,7 +5234,7 @@ function bindSettingsUI() {
 
     const restoreHiddenBtn = document.getElementById("tiandao_restore_hidden_btn");
     if (restoreHiddenBtn) restoreHiddenBtn.addEventListener("click", () => {
-        syncHiddenMessagesState(true);
+        syncHiddenMessagesState();
         settings.autoHideOldMessages = false;
         const autoHideEl = document.getElementById("tiandao_auto_hide");
         if (autoHideEl) autoHideEl.checked = false;
@@ -5155,7 +5311,8 @@ function bindSettingsUI() {
                 expandedCharacterCards.clear();
                 expandedInventoryCards.clear();
                 refreshChatFingerprint(getSTContext().chat || []);
-                await refreshPromptInjection(); syncHiddenMessagesState(); updateFloatingWidgetUI();
+                await refreshPromptInjection().catch(error => console.warn("[溯微] 聊天切换后刷新注入失败:", error?.name || error?.message || error));
+                syncHiddenMessagesState(); updateFloatingWidgetUI();
             });
             if (eventTypes.GENERATION_STARTED) eventSource.on(eventTypes.GENERATION_STARTED, async (type, _options, dryRun) => {
                 const settings = getSettings();
@@ -5164,7 +5321,7 @@ function bindSettingsUI() {
                 // 这里只刷新提示词，不触发摘要，避免预览时消耗 API。
                 if (!dryRun) return;
                 syncHiddenMessagesState();
-                await refreshPromptInjection("", { generationType: type });
+                await refreshPromptInjection("", { generationType: type }).catch(error => console.warn("[溯微] 预览刷新注入失败:", error?.name || error?.message || error));
             });
             if (eventTypes.USER_MESSAGE_RENDERED) eventSource.on(eventTypes.USER_MESSAGE_RENDERED, () => {
                 const chat = getSTContext().chat || [];
@@ -5214,7 +5371,7 @@ function bindSettingsUI() {
                 if (reconciled || clearedDeletedRoundError) {
                     // 删除的可能正是失败轮次；即使存档游标未变化，也清除过期错误并保存。
                     memoryData.lastSummaryError = null;
-                    await saveChatMemory();
+                    await saveMemoryQuietly();
                     await refreshPromptInjection().catch(() => {});
                 }
                 syncHiddenMessagesState(); updateFloatingWidgetUI();
@@ -5230,7 +5387,7 @@ function bindSettingsUI() {
                 if (Math.max(memoryData.lastProcessedMessageId, getStateLedgerCursor(memoryData).endMessageId) >= idx) {
                     rollbackMemoryFromMessageIndex(memoryData, idx, { skipNormalize: true });
                     memoryData.lastSummaryError = null;
-                    await saveChatMemory();
+                    await saveMemoryQuietly();
                     syncHiddenMessagesState();
                 }
                 const targetMsg = chat[idx];
@@ -5276,7 +5433,7 @@ function bindSettingsUI() {
                 if (Math.max(memoryData.lastProcessedMessageId, getStateLedgerCursor(memoryData).endMessageId) >= startFloor) {
                     rollbackMemoryFromMessageIndex(memoryData, startFloor, { skipNormalize: true });
                     memoryData.lastSummaryError = null;
-                    await saveChatMemory();
+                    await saveMemoryQuietly();
                     syncHiddenMessagesState();
                     await refreshPromptInjection().catch(() => {});
                     updateFloatingWidgetUI();

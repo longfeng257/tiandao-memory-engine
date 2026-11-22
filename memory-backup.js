@@ -164,6 +164,22 @@ function validateMemory(memory) {
     }
     if (owns(memory, "lastSummaryError")) validateError(memory.lastSummaryError, "roundNumber", "lastSummaryError");
 
+    if (owns(memory, "rawVectors")) {
+        const vectors = memory.rawVectors;
+        requireValid(Array.isArray(vectors) && vectors.length <= MAX_MEMORY_ENTRIES, "rawVectors");
+        vectors.forEach((entry, index) => {
+            const path = `rawVectors[${index}]`;
+            requireValid(isRecord(entry) && isInt(entry.index) && isNonemptyText(entry.sig), path);
+            if (owns(entry, "model")) requireValid(isText(entry.model) && entry.model.length <= 200, `${path}.model`);
+            if (owns(entry, "dim")) requireValid(isInt(entry.dim, 1) && entry.dim <= 4096, `${path}.dim`);
+            if (owns(entry, "embedding")) {
+                requireValid(Array.isArray(entry.embedding) && entry.embedding.length <= 4096
+                    && entry.embedding.every(Number.isFinite), `${path}.embedding`);
+                if (owns(entry, "dim")) requireValid(entry.dim === entry.embedding.length, `${path}.dim`);
+            }
+        });
+    }
+
     const sync = memory.stateSync;
     if (sync === null || sync === undefined) return;
     requireValid(isRecord(sync) && sync.version === 1 && isRecord(sync.base), "stateSync");

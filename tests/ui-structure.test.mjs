@@ -532,7 +532,8 @@ test("resummarize expands overlapping L0 and hidden raw rounds keep their summar
     assert.match(historySource, /end > limit/);
     assert.match(historySource, /rawStart = eligibleTurns\[pastRound\]\.window\.startMessageId/);
     assert.match(indexSource, /eventTypes\.MESSAGE_SWIPED[\s\S]{0,1800}scheduleAfterReplySwipeRepair\(getChatKey\(\)\)/);
-    assert.match(indexSource, /clearEntryEmbedding\(entry\)/);
+    // 摘要不再携带向量；手工编辑摘要文本只更新文本本身，不得再出现嵌入清理残留。
+    assert.doesNotMatch(indexSource, /clearEntryEmbedding/);
     assert.match(indexSource, /for \(const entry of new Set\(\[draftItem, archiveEntry\]\)\)/);
 });
 

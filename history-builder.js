@@ -1,15 +1,7 @@
 import { buildStateUpdateInstruction, stripStateUpdateMessage } from "./state-protocol.js";
-import { sanitizeSummaryFlourish, buildInjectedMemoryPrompt, buildRoundMessageIndex, computeHiddenMessageCutoff, estimatePromptTokens, numOr, parseRoundRange, getL0CoverageRanges, isRoundRangeCovered, resolveStateLedgerAfterEntry, getStateLedgerAtMessage, resolveStateUpdateMode } from "./memory-engine.js";
+import { sanitizeSummaryFlourish, buildInjectedMemoryPrompt, buildRoundMessageIndex, computeHiddenMessageCutoff, estimatePromptTokens, numOr, parseRoundRange, getL0CoverageRanges, hasSummaryFacts, isRoundRangeCovered, resolveStateLedgerAfterEntry, getStateLedgerAtMessage, resolveStateUpdateMode } from "./memory-engine.js";
 
-const historyFactsCache = new WeakMap();
-function hasHistoricalFacts(item) {
-    const text = String(item.text || '');
-    const cached = historyFactsCache.get(item);
-    if (cached?.text === text) return cached.hasFacts;
-    const hasFacts = Boolean(sanitizeSummaryFlourish(text, Infinity));
-    historyFactsCache.set(item, { text, hasFacts });
-    return hasFacts;
-}
+const hasHistoricalFacts = hasSummaryFacts;
 
 // Bind the host's preprocessed copies to source positions, never to filtered array offsets.
 export function bindCoreHistory(coreChat, fullChat) {
@@ -107,13 +99,17 @@ export function buildChatHistoryReplacement(memory, fullChat, coreChat, settings
             const message = stripStateUpdateMessage(item.message, fullChat[item.sourceIndex]);
             return message === item.message ? item : { ...item, message };
         });
+    const retrievedL0s = (retrieved || []).filter(item => item && !item.isRaw);
+    const retrievedRaw = (retrieved || []).filter(item => item?.isRaw);
     const detailById = new Map();
-    for (const item of [...(memory.archivePool || []).filter(item => item.pinned), ...retrieved]) {
+    for (const item of [...(memory.archivePool || []).filter(item => item.pinned), ...retrievedL0s]) {
         if (!Number.isInteger(item.endMessageId) || item.endMessageId > generationEnd) continue;
         detailById.set(item.id || item.roundRange, item);
     }
     const details = [...detailById.values()];
     const pastDetails = details.filter(item => parseRoundRange(item.roundRange).end <= pastRound);
+    // 已在近期原文窗口里的片段不再重复注入；只保留被记忆替换掉的旧原文片段。
+    const rawDetails = retrievedRaw.filter(item => Number.isInteger(item.messageId) && item.messageId >= 0 && item.messageId < rawStart);
     const events = raw.map((item, sequence) => ({ position: Number.isInteger(item.sourceIndex) ? item.sourceIndex : item.order + 0.01, sequence, message: item.message }));
     if (selected.length) {
         const levels = { 0: [], 1: [], 2: [], 3: [] };
@@ -122,7 +118,7 @@ export function buildChatHistoryReplacement(memory, fullChat, coreChat, settings
             if (rank === 4) farHistory = memory.farHistory;
             else levels[rank].push(item);
         }
-        const text = buildInjectedMemoryPrompt({ levels, farHistory }, pastDetails, primaryName, { omitLedger: true });
+        const text = buildInjectedMemoryPrompt({ levels, farHistory }, [...pastDetails, ...rawDetails], primaryName, { omitLedger: true });
         events.push({ position: -1, sequence: -1, message: narrator(text, 'history', pastRound) });
     }
     const preservesAssistantTail = ["continue", "impersonate"].includes(options.generationType);
@@ -153,6 +149,11 @@ export function buildChatHistoryReplacement(memory, fullChat, coreChat, settings
     const text = formatHistoryPreview(messages);
     return { messages, text, tokens: estimatePromptTokens(text), rawStart, rawMessages: raw.length,
         memoryMessages: messages.filter(message => message.extra?.suwei_history).length,
-        retrieval: details.filter(item => retrieved.includes(item) && parseRoundRange(item.roundRange).end <= pastRound).map(item => ({ id: item.id, roundRange: item.roundRange,
-            reason: options.retrievalDetails?.find(detail => detail.id === item.id)?.reason || '话题相关', retainedRaw: item.endMessageId >= rawStart })) };
+        retrieval: [
+            ...details.filter(item => retrievedL0s.includes(item) && parseRoundRange(item.roundRange).end <= pastRound)
+                .map(item => ({ id: item.id, roundRange: item.roundRange,
+                    reason: options.retrievalDetails?.find(detail => detail.id === item.id)?.reason || '话题相关', retainedRaw: item.endMessageId >= rawStart })),
+            ...retrievedRaw.map(item => ({ id: item.id, roundRange: item.roundRange,
+                reason: options.retrievalDetails?.find(detail => detail.id === item.id)?.reason || '话题相关', retainedRaw: item.messageId >= rawStart })),
+        ] };
 }

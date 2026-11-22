@@ -51,6 +51,10 @@ import {
     maskSensitiveText,
     setMemoryEntryPinned,
     getRuntimeDiagnostics,
+    embedArchivedRawVectors,
+    rawVectorMemoryActive,
+    getEmbeddingVectors,
+    reconcileRawVectorsAfterDeletion,
 } from "../memory-engine.js";
 
 function memoryWithRounds(lastRound = 5) {
@@ -2739,6 +2743,13 @@ test("import normalization drops unknown fields and bounds snapshots and vectors
             todosAndPromises: [],
         },
         archivePool: [],
+        rawVectors: [
+            { index: 3, sig: "12:abc", embedding: [0.12345678, 2] },
+            { index: 3, sig: "dup", embedding: [9] },
+            { index: -1, sig: "bad" },
+            { index: 5, sig: "" },
+            "junk",
+        ],
     });
 
     const entry = data.archivePool[0];
@@ -2748,7 +2759,15 @@ test("import normalization drops unknown fields and bounds snapshots and vectors
     assert.equal(entry.level, 0);
     assert.equal(entry.id.length, 200);
     assert.equal(entry.timestamp, 0);
-    assert.equal(entry.embedding.length, 4096);
+    // 摘要不再携带向量；向量只存在于 rawVectors。
+    assert.equal(entry.embedding, undefined);
+    assert.equal(entry.embeddingModel, undefined);
+    assert.equal(entry.embeddingDimension, undefined);
+    // 原文向量：按楼层去重，非法条目丢弃；精度收敛发生在嵌入写入时，归一化保持原值。
+    assert.deepEqual(data.rawVectors.map(item => item.index), [3, 5]);
+    assert.equal(data.rawVectors[0].sig, "12:abc");
+    assert.equal(data.rawVectors[0].embedding[0], 0.12345678);
+    assert.equal(data.rawVectors[1].embedding, undefined);
     assert.equal(Object.keys(entry.postStateSnapshot.characters).length, 200);
     assert.equal(entry.postStateSnapshot.unknownStateField, undefined);
     assert.equal(
@@ -2758,11 +2777,12 @@ test("import normalization drops unknown fields and bounds snapshots and vectors
     assert.equal(entry.postStateDelta.v.length, 4000);
 });
 
-test("new summaries record which embedding model produced their vectors", async () => {
+test("summaries never call the embedding API; vectors come from raw archived messages", async () => {
     const originalFetch = globalThis.fetch;
+    let embeddingCalls = 0;
     globalThis.fetch = async (url, options = {}) => {
         if (String(url).endsWith("/embeddings")) {
-            assert.equal(JSON.parse(options.body).model, "custom-embedding");
+            embeddingCalls++;
             return new Response(JSON.stringify({ data: [{ embedding: [1, 2, 3] }] }), {
                 status: 200,
                 headers: { "Content-Type": "application/json" },
@@ -2772,7 +2792,7 @@ test("new summaries record which embedding model produced their vectors", async 
             choices: [{
                 message: {
                     content: JSON.stringify({
-                        l0_summary: "带向量的摘要",
+                        l0_summary: "不带向量的摘要",
                         keywords: ["向量"],
                         stateLedger: {
                             time: "下午",
@@ -2805,56 +2825,296 @@ test("new summaries record which embedding model produced their vectors", async 
             shouldCommit: () => true,
             dialogueText: "第一轮对话",
         });
+        assert.equal(embeddingCalls, 0);
         const entry = data.archivePool[0];
-        assert.equal(entry.embeddingModel, "custom-embedding");
-        assert.equal(entry.embeddingDimension, 3);
+        assert.equal(entry.embedding, undefined);
+        assert.equal(entry.embeddingModel, undefined);
     } finally {
         globalThis.fetch = originalFetch;
     }
 });
 
-test("vectors from another embedding model are ignored during retrieval", async () => {
+test("raw vectors from another embedding model are ignored during retrieval", async () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => new Response(JSON.stringify({
-        data: [{ embedding: [1, 0, 0] }],
+        data: [{ index: 0, embedding: [1, 0] }, { index: 1, embedding: [1, 0] }],
     }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
     });
     try {
         const data = createEmptyMemoryData();
-        const item = {
-            id: "L0_old_vector",
-            level: 0,
-            roundRange: "1",
-            startMessageId: 0,
-            endMessageId: 1,
-            text: "完全无关的旧事",
-            keywords: [],
-            embedding: [1, 0, 0],
-            embeddingModel: "old-embedding",
-            embeddingDimension: 3,
-        };
-        data.archivePool = [item];
+        const chat = [
+            { is_user: true, mes: "铜钥匙放在柜子里。" },
+            { is_user: false, mes: "守卫点头离开。" },
+        ];
+        data.lastProcessedMessageId = 1;
+        // 游标跟随 L0 归档校准：像真实存档一样提供覆盖第 1 轮的 L0。
+        data.archivePool.push({
+            id: "L0_r1", level: 0, roundRange: "1", startMessageId: 0, endMessageId: 1,
+            text: "玩家把铜钥匙放进柜子，守卫确认后离开。", keywords: ["铜钥匙"],
+        });
         const settings = {
             enableRetrieval: true,
             retrievalTopK: 3,
             useEmbeddingApi: true,
+            vectorRawMemory: true,
             embeddingApiUrl: "https://embed.test/v1",
             embeddingApiKey: "embed-key",
             embeddingModel: "current-embedding",
         };
+        assert.equal(rawVectorMemoryActive(settings), true);
+        assert.equal(await embedArchivedRawVectors(settings, data, chat), 2);
+        assert.deepEqual(data.rawVectors.map(entry => entry.index), [0, 1]);
+        assert.equal(data.rawVectors[0].model, "current-embedding");
 
-        assert.deepEqual(
-            await retrieveRelevantArchivedMemories(settings, data, "今天的新问题"),
-            [],
-        );
-        item.embeddingModel = "current-embedding";
-        const recalled = await retrieveRelevantArchivedMemories(settings, data, "今天的新问题");
-        assert.deepEqual(recalled.map(entry => entry.id), ["L0_old_vector"]);
+        const recalled = await retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { chat });
+        assert.deepEqual(recalled.map(entry => entry.id).sort(), ["raw-0", "raw-1"]);
+        assert.ok(recalled.every(entry => entry.isRaw && entry.roundRange === "1"));
+
+        const ignored = await retrieveRelevantArchivedMemories(
+            { ...settings, embeddingModel: "other-embedding" }, data, "铜钥匙", { chat });
+        assert.deepEqual(ignored, []);
     } finally {
         globalThis.fetch = originalFetch;
     }
+});
+
+test("an empty or state-only floor is skipped so it cannot stall the raw vector queue", async () => {
+    const originalFetch = globalThis.fetch;
+    const stateOnlyMes = '<details hidden data-suwei-state="1"><summary>溯微状态</summary><suwei_state>{"version":1,"baseRound":0,"changes":{}}</suwei_state></details>';
+    globalThis.fetch = async (url, options = {}) => {
+        if (String(url).endsWith("/embeddings")) {
+            const body = JSON.parse(options.body);
+            if (body.input.some(text => !String(text).trim())) {
+                return new Response("empty input", { status: 400 });
+            }
+            return new Response(JSON.stringify({
+                data: body.input.map((text, index) => ({ index, embedding: [1, 0] })),
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error("unexpected fetch");
+    };
+    try {
+        const data = createEmptyMemoryData();
+        const chat = [
+            { is_user: true, mes: "旅人把铜钥匙放在柜子里。" },
+            { is_user: false, mes: stateOnlyMes },
+            { is_user: false, mes: "守卫确认后离开。" },
+        ];
+        data.lastProcessedMessageId = 2;
+        data.archivePool.push({
+            id: "L0_r1", level: 0, roundRange: "1", startMessageId: 0, endMessageId: 2,
+            text: "旅人把铜钥匙放进柜子，守卫确认后离开。", keywords: ["铜钥匙"],
+        });
+        const settings = {
+            enableRetrieval: true, retrievalTopK: 3, useEmbeddingApi: true, vectorRawMemory: true,
+            embeddingApiUrl: "https://empty-floor.invalid/v1", embeddingApiKey: "embed-key",
+            embeddingModel: "m-empty",
+        };
+        // 纯状态块楼层剥离后为空：必须跳过而不是发送空 input 让端点 400 卡住整批。
+        assert.equal(await embedArchivedRawVectors(settings, data, chat), 2);
+        assert.deepEqual(data.rawVectors.map(entry => entry.index), [0, 2]);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("switching the embedding model re-embeds stored vectors so recall does not die silently", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options = {}) => {
+        if (String(url).endsWith("/embeddings")) {
+            const body = JSON.parse(options.body);
+            const inputs = Array.isArray(body.input) ? body.input : [body.input];
+            return new Response(JSON.stringify({
+                data: inputs.map((text, index) => ({ index, embedding: [1, 0] })),
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error("unexpected fetch");
+    };
+    try {
+        const data = createEmptyMemoryData();
+        const chat = [
+            { is_user: true, mes: "旅人把铜钥匙放在柜子里。" },
+            { is_user: false, mes: "守卫确认后离开。" },
+        ];
+        data.lastProcessedMessageId = 1;
+        data.archivePool.push({
+            id: "L0_r1", level: 0, roundRange: "1", startMessageId: 0, endMessageId: 1,
+            text: "旅人把铜钥匙放进柜子，守卫确认后离开。", keywords: ["铜钥匙"],
+        });
+        const settings = {
+            enableRetrieval: true, retrievalTopK: 3, useEmbeddingApi: true, vectorRawMemory: true,
+            embeddingApiUrl: "https://model-switch.invalid/v1", embeddingApiKey: "embed-key",
+            embeddingModel: "model-a",
+        };
+        assert.equal(await embedArchivedRawVectors(settings, data, chat), 2);
+        // 模型未变且签名相同：不重复嵌入，避免重复计费。
+        assert.equal(await embedArchivedRawVectors(settings, data, chat), 0);
+        // 更换模型后旧向量必须重建；否则检索按模型不符全部忽略且永远不会自愈。
+        const switched = { ...settings, embeddingModel: "model-b" };
+        assert.equal(await embedArchivedRawVectors(switched, data, chat), 2);
+        assert.ok(data.rawVectors.every(entry => entry.model === "model-b"));
+        const recalled = await retrieveRelevantArchivedMemories(switched, data, "铜钥匙", { chat });
+        assert.ok(recalled.length > 0);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("a failed query embedding degrades to lexical recall instead of zero results", async () => {
+    const originalFetch = globalThis.fetch;
+    const okVectors = () => new Response(JSON.stringify({
+        data: [{ index: 0, embedding: [1, 0] }, { index: 1, embedding: [1, 0] }],
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+    try {
+        const data = createEmptyMemoryData();
+        const chat = [
+            { is_user: true, mes: "旅人把铜钥匙放在柜子里。" },
+            { is_user: false, mes: "守卫确认后离开。" },
+        ];
+        data.lastProcessedMessageId = 1;
+        data.archivePool.push({
+            id: "L0_r1", level: 0, roundRange: "1", startMessageId: 0, endMessageId: 1,
+            text: "旅人把铜钥匙放进柜子，守卫确认后离开。", keywords: ["铜钥匙"],
+        });
+        const settings = {
+            enableRetrieval: true, retrievalTopK: 3, useEmbeddingApi: true, vectorRawMemory: true,
+            embeddingApiUrl: "https://query-fallback.invalid/v1", embeddingApiKey: "embed-key",
+            embeddingModel: "m-fallback",
+        };
+        globalThis.fetch = async () => okVectors();
+        assert.equal(await embedArchivedRawVectors(settings, data, chat), 2);
+        // 查询向量失败（500 + 60s 熔断）后，仍按词法重合召回原文，而不是零召回。
+        globalThis.fetch = async () => new Response("boom", { status: 500 });
+        const recalled = await retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { chat });
+        assert.ok(recalled.length > 0);
+        assert.ok(recalled.every(entry => entry.isRaw));
+        assert.ok(recalled.some(entry => entry.text.includes("铜钥匙")));
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("long archived floors excerpt around the matching sentence without lookbehind regex", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options = {}) => {
+        if (String(url).endsWith("/embeddings")) {
+            const body = JSON.parse(options.body);
+            const inputs = Array.isArray(body.input) ? body.input : [body.input];
+            return new Response(JSON.stringify({
+                data: inputs.map((text, index) => ({ index, embedding: [1, 0] })),
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error("unexpected fetch");
+    };
+    try {
+        const data = createEmptyMemoryData();
+        const filler = "庭院里的风吹过回廊，远处传来钟声，仆人端着茶盘走过石阶。";
+        const key = "旅人在码头与守卫会面，交还了那枚铜钥匙。";
+        const longMes = Array.from({ length: 30 }, (_, i) => i === 15 ? key : filler).join("");
+        const chat = [
+            { is_user: true, mes: "我们接下来做什么？" },
+            { is_user: false, mes: longMes },
+        ];
+        data.lastProcessedMessageId = 1;
+        data.archivePool.push({
+            id: "L0_r1", level: 0, roundRange: "1", startMessageId: 0, endMessageId: 1,
+            text: "旅人在码头与守卫会面交还铜钥匙。", keywords: ["码头"],
+        });
+        const settings = {
+            enableRetrieval: true, retrievalTopK: 3, useEmbeddingApi: true, vectorRawMemory: true,
+            embeddingApiUrl: "https://excerpt.invalid/v1", embeddingApiKey: "embed-key",
+            embeddingModel: "m-excerpt",
+        };
+        assert.equal(await embedArchivedRawVectors(settings, data, chat), 2);
+        const recalled = await retrieveRelevantArchivedMemories(settings, data, "码头", { chat });
+        const raw = recalled.find(entry => entry.id === "raw-1");
+        assert.ok(raw, "long floor should be recalled");
+        assert.ok(raw.text.length <= 320, "excerpt stays within the limit");
+        assert.ok(raw.text.includes("码头"), "excerpt centers on the matching sentence");
+        assert.ok(raw.text.length < longMes.length, "excerpt is shorter than the floor text");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("editing a message re-signs its raw vector and excludes the stale chunk from recall", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options = {}) => {
+        if (String(url).endsWith("/embeddings")) {
+            const body = JSON.parse(options.body);
+            const inputs = Array.isArray(body.input) ? body.input : [body.input];
+            return new Response(JSON.stringify({
+                data: inputs.map((text, index) => ({ index, embedding: [1, 0] })),
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error("unexpected fetch");
+    };
+    try {
+        const data = createEmptyMemoryData();
+        const chat = [
+            { is_user: true, mes: "旅人把铜钥匙放在柜子里。" },
+            { is_user: false, mes: "守卫确认后离开。" },
+        ];
+        data.lastProcessedMessageId = 1;
+        data.archivePool.push({
+            id: "L0_r1", level: 0, roundRange: "1", startMessageId: 0, endMessageId: 1,
+            text: "旅人把铜钥匙放进柜子，守卫确认后离开。", keywords: ["铜钥匙"],
+        });
+        const settings = {
+            enableRetrieval: true, retrievalTopK: 3, useEmbeddingApi: true, vectorRawMemory: true,
+            embeddingApiUrl: "https://edit-invalidate.invalid/v1", embeddingApiKey: "embed-key",
+            embeddingModel: "m-edit",
+        };
+        assert.equal(await embedArchivedRawVectors(settings, data, chat), 2);
+        // 原地编辑消息文本：签名与分词缓存必须失效，不能拿旧内容继续召回或跳过重嵌入。
+        chat[1].mes = "守卫去了码头，与旅人约好明日再会。";
+        const recalled = await retrieveRelevantArchivedMemories(settings, data, "码头", { chat });
+        assert.ok(!recalled.some(entry => entry.id === "raw-1"), "edited chunk no longer matches its stored signature");
+        assert.equal(await embedArchivedRawVectors(settings, data, chat), 1, "edited message re-embeds on next sync");
+        const recalledAgain = await retrieveRelevantArchivedMemories(settings, data, "码头", { chat });
+        assert.ok(recalledAgain.some(entry => entry.id === "raw-1"));
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("normalizeMemoryData reuses validated raw vectors instead of rebuilding them", () => {
+    const data = createEmptyMemoryData();
+    data.rawVectors = [
+        { index: 3, sig: "3:abc", embedding: [0.5, 0.25], model: "m", dim: 2 },
+        { index: 1, sig: "1:abc" },
+    ];
+    const first = normalizeMemoryData(data);
+    assert.deepEqual(first.rawVectors.map(entry => entry.index), [1, 3]);
+    const firstArray = first.rawVectors;
+    const firstEntry = first.rawVectors[1];
+    const second = normalizeMemoryData(first);
+    assert.equal(second.rawVectors, firstArray, "unchanged data keeps the same array identity");
+    assert.equal(second.rawVectors[1], firstEntry, "validated entries are reused by identity");
+    // 形状被外部改坏的条目仍会被重新校验重建。
+    second.rawVectors[1].index = "9";
+    const third = normalizeMemoryData(second);
+    assert.equal(typeof third.rawVectors.find(entry => entry.sig === "1:abc")?.index, "number");
+});
+
+test("a broken state delta in the archive chain stops replay instead of producing wrong state", () => {
+    const memory = createEmptyMemoryData();
+    memory.archivePool.push(
+        { id: "L0_1", level: 0, roundRange: "1", startMessageId: 0, endMessageId: 1,
+            text: "第一轮", postStateSnapshot: { time: "清晨", characters: {}, todosAndPromises: [] } },
+        { id: "L0_2", level: 0, roundRange: "2", startMessageId: 2, endMessageId: 3,
+            text: "第二轮", postStateDelta: { t: "o", v: { time: { t: "v", v: "正午" } } } },
+        { id: "L0_3", level: 0, roundRange: "3", startMessageId: 4, endMessageId: 5,
+            text: "第三轮（增量损坏，规范化时已被清理）" },
+        { id: "L0_4", level: 0, roundRange: "4", startMessageId: 6, endMessageId: 7,
+            text: "第四轮", postStateDelta: { t: "o", v: { time: { t: "v", v: "黄昏" } } } },
+    );
+    // 断档之前的回放不受影响。
+    assert.equal(resolveStateLedgerAfterEntry(memory, memory.archivePool[1]).time, "正午");
+    // 修复前：跳过第三轮继续应用第四轮 → 返回 time=黄昏 的错误状态；现在按断档截断。
+    assert.equal(resolveStateLedgerAfterEntry(memory, memory.archivePool[3]), null);
 });
 
 test("editing summary text invalidates embedding metadata instead of restoring it", () => {
@@ -3109,26 +3369,46 @@ test("explicit L0 resummarizing preserves the pin on the replacement range", () 
 });
 
 test("query vector cache coalesces requests and expires while ranking live memory", async t => {
-    const data = memoryWithRounds(2);
-    data.levels[0] = [];
-    data.archivePool.forEach(item => Object.assign(item, { keywords: ["铜钥匙"], embedding: [1, 0], embeddingModel: "query-cache", embeddingDimension: 2 }));
-    const settings = { enableRetrieval: true, useEmbeddingApi: true, embeddingApiUrl: "https://cache.test/v1", embeddingApiKey: "cache-key", embeddingModel: "query-cache" };
+    const data = createEmptyMemoryData();
+    const chat = [
+        { is_user: true, mes: "铜钥匙放在柜子里。" },
+        { is_user: false, mes: "守卫点头离开。" },
+    ];
+    data.lastProcessedMessageId = 1;
+    // 游标跟随 L0 归档校准：像真实存档一样提供覆盖第 1 轮的 L0。
+    data.archivePool.push({
+        id: "L0_r1", level: 0, roundRange: "1", startMessageId: 0, endMessageId: 1,
+        text: "玩家把铜钥匙放进柜子，守卫确认后离开。", keywords: ["铜钥匙"],
+    });
+    const settings = {
+        enableRetrieval: true, useEmbeddingApi: true, vectorRawMemory: true,
+        embeddingApiUrl: "https://cache.test/v1", embeddingApiKey: "cache-key", embeddingModel: "query-cache",
+    };
     let calls = 0, now = 1_800_000_000_000;
     t.mock.method(Date, "now", () => now);
-    t.mock.method(globalThis, "fetch", async () => { calls++; return new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] })); });
-    const both = await Promise.all([retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { skipNormalize: true }), retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { skipNormalize: true })]);
+    t.mock.method(globalThis, "fetch", async () => {
+        calls++;
+        return new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 0] }, { index: 1, embedding: [1, 0] }] }));
+    });
+    assert.equal(await embedArchivedRawVectors(settings, data, chat), 2);
     assert.equal(calls, 1);
-    assert.ok(both[0].length > 0);
-    data.archivePool = [];
-    assert.deepEqual(await retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { skipNormalize: true }), []);
-    data.archivePool = [both[0][0]];
-    now += 10 * 60_000 + 1;
-    await retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { skipNormalize: true });
+    const both = await Promise.all([
+        retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { chat, skipNormalize: true }),
+        retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { chat, skipNormalize: true }),
+    ]);
     assert.equal(calls, 2);
-    await retrieveRelevantArchivedMemories({ ...settings, embeddingApiUrl: "https://other-cache.test/v1" }, data, "铜钥匙", { skipNormalize: true });
+    assert.ok(both[0].length > 0);
+    const savedVectors = data.rawVectors;
+    data.rawVectors = [];
+    assert.deepEqual(await retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { chat, skipNormalize: true }), []);
+    data.rawVectors = savedVectors;
+    now += 10 * 60_000 + 1;
+    await retrieveRelevantArchivedMemories(settings, data, "铜钥匙", { chat, skipNormalize: true });
     assert.equal(calls, 3);
-    await retrieveRelevantArchivedMemories({ ...settings, embeddingApiKey: "new-key" }, data, "铜钥匙", { skipNormalize: true });
+    await retrieveRelevantArchivedMemories({ ...settings, embeddingApiUrl: "https://other-cache.test/v1" }, data, "铜钥匙", { chat, skipNormalize: true });
     assert.equal(calls, 4);
+    await retrieveRelevantArchivedMemories({ ...settings, embeddingApiKey: "new-key" }, data, "铜钥匙", { chat, skipNormalize: true });
+    assert.equal(calls, 5);
 });
 
 test("embedding auth failure is visible and does not disable a different provider", async t => {

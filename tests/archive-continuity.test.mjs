@@ -4,7 +4,8 @@ import {
     DEFAULT_SETTINGS, createEmptyMemoryData, normalizeMemoryData, buildRoundMessageIndex,
     collectMissingAiTurns, collectPendingAiTurns, getContinuousRoundRange, getL0CoverageRanges,
     isRoundRangeCovered, groupAiTurnsForL0, checkAndCascadeMerge, backfillExistingChatHistory,
-    reconcileMemoryAfterMessageDeletion, buildChatMessageFingerprint,
+    reconcileMemoryAfterMessageDeletion, buildChatMessageFingerprint, hasSummaryFacts,
+    reconcileRawVectorsAfterDeletion,
 } from "../memory-engine.js";
 import { buildChatHistoryReplacement } from "../history-builder.js";
 
@@ -53,6 +54,19 @@ test("L0 coverage validates both round ends against the real message windows", (
     const ranges = getL0CoverageRanges(memory.archivePool, index);
     assert.equal(isRoundRangeCovered({ start: 1, end: 4 }, ranges), false);
     assert.deepEqual(collectMissingAiTurns(chat, memory, Infinity, false, index).map(turn => turn.round), [2, 3]);
+});
+
+test("an L0 that sanitizes to pure flourish is reported missing so backfill can heal it", () => {
+    const { memory, chat } = fixture(5);
+    memory.archivePool[2].text = "空气中弥漫着暧昧的氛围，两人之间的情感张力缓慢升腾。";
+    memory.levels[0] = memory.archivePool.slice();
+    normalizeMemoryData(memory);
+    // Only the hole itself is pending; healing it restores the contiguous tiling after it.
+    assert.deepEqual(collectMissingAiTurns(chat, memory).map(turn => turn.round), [3]);
+    const index = buildRoundMessageIndex(chat);
+    // Injection tiling filters the same invalid entries; both views must agree on the first hole.
+    const ranges = getL0CoverageRanges(memory.archivePool.filter(hasSummaryFacts), index);
+    assert.equal(isRoundRangeCovered({ start: 1, end: 5 }, ranges), false);
 });
 
 test("overlapping valid L0 spans cover the union without inventing a missing round", () => {
@@ -296,4 +310,33 @@ test("a missing endpoint beyond the real chat cannot mask a backfill gap", async
     await assert.rejects(backfillExistingChatHistory(settings, memory, chat, "旅人", "守卫"), { code: "MEMORY_HISTORY_GAP" });
     assert.equal(prompts.length, 0);
     assert.equal(JSON.stringify(memory), before);
+});
+
+test("deleted floors remap raw vectors and drop the deleted span", () => {
+    const memory = createEmptyMemoryData();
+    memory.rawVectors = [
+        { index: 0, sig: "a" }, { index: 3, sig: "b" }, { index: 5, sig: "c" }, { index: 9, sig: "d" },
+    ];
+    const previous = Array.from({ length: 10 }, () => "fp");
+    const current = previous.filter((_, index) => index !== 3);
+    assert.equal(reconcileRawVectorsAfterDeletion(memory, previous, current, 3, 1), true);
+    assert.deepEqual(memory.rawVectors.map(entry => entry.index), [0, 4, 8]);
+});
+
+test("vector-memory raw excerpts inject as past text, skip the recent window and keep original wording", () => {
+    const { memory, chat } = fixture(6);
+    const recalled = [
+        { id: "raw-1", roundRange: "2", text: "空气中弥漫着暧昧的氛围，守卫收好钥匙。", isRaw: true, messageId: 2 },
+        { id: "raw-5", roundRange: "5", text: "近期原文里已有的片段", isRaw: true, messageId: 9 },
+    ];
+    const plan = buildChatHistoryReplacement(memory, chat, chat, { ...settings, keepRecentRoundsCount: 2 }, recalled, "", {
+        retrievalDetails: [{ id: "raw-1", reason: "向量语义相关" }],
+    });
+    // 原文片段不做套话清理，原样注入。
+    assert.match(plan.text, /\[过往原文·第 2 轮\] 空气中弥漫着暧昧的氛围，守卫收好钥匙。/);
+    assert.doesNotMatch(plan.text, /近期原文里已有的片段/);
+    const report = Object.fromEntries(plan.retrieval.map(item => [item.id, item]));
+    assert.equal(report["raw-1"].retainedRaw, false);
+    assert.equal(report["raw-1"].reason, "向量语义相关");
+    assert.equal(report["raw-5"].retainedRaw, true);
 });
