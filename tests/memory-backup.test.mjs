@@ -6,6 +6,9 @@ import * as backup from "../memory-backup.js";
 import * as engine from "../memory-engine.js";
 import * as recovery from "../recovery-store.js";
 import * as hostPersistence from "../host-persistence.js";
+import * as history from "../history-builder.js";
+import * as visibility from "../native-visibility.js";
+import * as bridge from "../prompt-bridge.js";
 import { createSummaryTaskGate } from "../task-gate.js";
 
 const RECOVERY_KEY = "suwei_memory_recovery_v1";
@@ -55,7 +58,7 @@ function makeHarness({ readsThrow = false, readbackUnavailable = false } = {}) {
         load(result) { this.result = result; return this.onload(); }
     }
     const scope = vm.createContext({
-        ...engine, ...recovery, ...backup, ...hostPersistence, createSummaryTaskGate, Blob, AbortController,
+        ...engine, ...recovery, ...backup, ...hostPersistence, ...history, ...visibility, ...bridge, createSummaryTaskGate, Blob, AbortController,
         window: {}, SillyTavern: { getContext: () => ctx },
         document: {
             getElementById: id => nodes.get(id) || null,

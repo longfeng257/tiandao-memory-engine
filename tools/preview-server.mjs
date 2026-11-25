@@ -2,7 +2,7 @@ import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 const root = new URL("../", import.meta.url);
-const allowed = new Set(["index.js", "memory-engine.js", "host-persistence.js", "memory-backup.js", "task-gate.js", "recovery-store.js", "history-builder.js", "host-prompt.js", "state-protocol.js", "character-memory.js", "style.css", "tests/fixtures/widget-preview.html"]);
+const allowed = new Set(["index.js", "memory-engine.js", "host-persistence.js", "memory-backup.js", "task-gate.js", "recovery-store.js", "history-builder.js", "native-visibility.js", "prompt-bridge.js", "host-prompt.js", "state-protocol.js", "character-memory.js", "style.css", "tests/fixtures/widget-preview.html"]);
 const server = http.createServer(async (request, response) => {
     let path;
     try { path = decodeURIComponent(new URL(request.url, "http://localhost").pathname).slice(1) || "tests/fixtures/widget-preview.html"; }

@@ -5,7 +5,10 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_SETTINGS, createEmptyMemoryData } from '../memory-engine.js';
-import { buildChatHistoryReplacement } from '../history-builder.js';
+import { buildHistoryCoverage, buildChatHistoryReplacement } from '../history-builder.js';
+
+import { reconcileNativeVisibility } from '../native-visibility.js';
+import { publishDryRunPrompts, clearDryRunPrompts } from '../prompt-bridge.js';
 
 const hostRoot = process.env.SILLYTAVERN_ROOT || fileURLToPath(new URL('../../../SillyTavern/', import.meta.url));
 async function optionalSource(relative) {
@@ -15,6 +18,7 @@ async function optionalSource(relative) {
 const extensionSource = await optionalSource('public/scripts/extensions.js');
 const openaiSource = await optionalSource('public/scripts/openai.js');
 const generationSource = await optionalSource('public/script.js');
+const chatsSource = await optionalSource('public/scripts/chats.js');
 function extractFunction(source, declaration) {
     const start = source.indexOf(declaration);
     assert.ok(start >= 0, 'Expected native host function: ' + declaration);
@@ -74,4 +78,73 @@ test('actual host prepares the replacement before native formatting and keeps it
     assert.ok(intercept>=0 && formatting>intercept);
     assert.match(openaiSource,/chatCompletion\.add\(new MessageCollection\('chatHistory'\), prompts\.index\('chatHistory'\)\)/);
     assert.match(openaiSource,/messages = messages\.reverse\(\)/);
+});
+
+function bridgeContext() {
+    const ctx = { extensionPrompts: {} };
+    ctx.setExtensionPrompt = (key, value, position, depth, scan, role) => { ctx.extensionPrompts[key] = { value, position, depth, scan, role }; };
+    return ctx;
+}
+function nativeInjectionScope(ctx) {
+    return { console, extension_prompt_types: { IN_CHAT: 1 }, extension_prompt_roles: { SYSTEM: 0, USER: 1, ASSISTANT: 2 },
+        getExtensionPromptMaxDepth: () => Math.max(0, ...Object.values(ctx.extensionPrompts).map(prompt => prompt.depth)),
+        getExtensionPrompt: async (_position, depth, separator, role) => Object.values(ctx.extensionPrompts)
+            .filter(prompt => prompt.depth === depth && prompt.role === role).map(prompt => prompt.value).filter(Boolean).join(separator),
+        name1: '旅人', name2: '守卫', system_message_types: { NARRATOR: 'narrator' } };
+}
+for (const backend of ['text', 'openai']) {
+    test('actual ' + backend + ' dry-run injection preserves history and ledger source placement without duplication',
+        { skip: !generationSource || !openaiSource }, async () => {
+        const f = fixture(), ctx = bridgeContext();
+        for (const entry of f.memory.archivePool) entry.postStateSnapshot = { time: '第' + entry.roundRange + '轮', characters: {}, todosAndPromises: [] };
+        // Keep ledger before the newest round so a wrong depth would visibly move it.
+        f.memory.archivePool.at(-1).postStateSnapshot = undefined;
+        const coverage = buildHistoryCoverage(f.memory, f.chat, f.settings);
+        reconcileNativeVisibility(f.chat, coverage.hiddenIndexes, true);
+        const core = f.chat.filter(message => !message.is_system).map((message, index) => ({ ...message, index }));
+        const plan = buildChatHistoryReplacement(f.memory, f.chat, core, f.settings);
+        publishDryRunPrompts(ctx, plan);
+        const scope = vm.createContext(nativeInjectionScope(ctx));
+        let result;
+        if (backend === 'text') {
+            vm.runInContext(extractFunction(generationSource, 'async function doChatInject(') + '\nglobalThis.inject=doChatInject;', scope);
+            result = core.map(message => ({ ...message }));
+            await scope.inject(result, false);
+        } else {
+            Object.assign(scope, { oai_settings: { chat_completion_source: 'test', names_behavior: 0 },
+                getChatCompletionModel: () => '', IGNORE_SYMBOL: Symbol(), selected_group: false, getMediaDisplay: () => 'gallery', getMediaIndex: () => 0,
+                character_names_behavior: { NONE: 0, DEFAULT: 1, CONTENT: 2, COMPLETION: 3 } });
+            vm.runInContext(extractFunction(openaiSource, 'function setOpenAIMessages(') + '\nglobalThis.format=setOpenAIMessages;', scope);
+            vm.runInContext(extractFunction(openaiSource, 'async function populationInjectionPrompts(') + '\nglobalThis.inject=populationInjectionPrompts;', scope);
+            result = (await scope.inject([], scope.format(core))).map(message => ({ mes: message.content }));
+        }
+        assert.deepEqual(Array.from(result, message => message.mes), plan.messages.map(message => message.mes));
+        clearDryRunPrompts(ctx);
+        assert.ok(!Object.keys(ctx.extensionPrompts).some(key => key.startsWith('suwei_dry_run_')));
+    });
+}
+
+test('actual native range hiding updates flags, visible DOM, swipe controls and full-chat save', { skip: !chatsSource }, async () => {
+    const f = fixture(), attrs = new Map(); let refreshes = 0, saves = 0, persisted;
+    const scope = vm.createContext({ console, chat: f.chat, isNaN,
+        $: selector => ({ length: 1, attr: (name, value) => attrs.set(selector, [name, value]) }),
+        refreshSwipeButtons: () => { refreshes++; }, saveChatConditional: async () => { saves++; persisted = structuredClone(f.chat); } });
+    vm.runInContext(extractFunction(chatsSource, 'export async function hideChatMessageRange(') + '\nglobalThis.hide=hideChatMessageRange;', scope);
+    f.chat[0].extra = { tiandao_hidden: true };
+    await scope.hide(0, 1, false);
+    assert.equal(saves, 1); assert.equal(refreshes, 1);
+    assert.equal(attrs.size, 2); assert.equal(persisted[0].extra.tiandao_hidden, true);
+    assert.equal(persisted[1].is_system, true);
+    assert.equal(persisted.length, f.chat.length);
+    await scope.hide(0, 1, true);
+    assert.equal(f.chat[0].is_system, false);
+});
+
+test('actual host waits for generation setup before raw filtering and skips interceptors only in dry-run', { skip: !generationSource }, () => {
+    const start = generationSource.indexOf('await eventSource.emit(event_types.GENERATION_STARTED');
+    const filter = generationSource.indexOf('let coreChat = chat.filter', start);
+    const intercept = generationSource.indexOf('await runGenerationInterceptors(coreChat', filter);
+    assert.ok(start >= 0 && filter > start && intercept > filter);
+    assert.match(generationSource.slice(filter, intercept), /if \(!dryRun\)/);
+    assert.match(generationSource, /await eventSource\.emit\(event_types\.GENERATE_AFTER_DATA, generate_data, dryRun\)/);
 });

@@ -50,11 +50,14 @@ import {
 } from "./memory-engine.js";
 import { readMainResponseState, stripStateUpdateMessage } from "./state-protocol.js";
 import { loadHostPromptProcessor, createPromptTextReader, preparePromptHistory } from "./host-prompt.js";
-import { bindCoreHistory, buildChatHistoryReplacement } from "./history-builder.js";
+import { bindCoreHistory, buildChatHistoryReplacement, buildHistoryCoverage } from "./history-builder.js";
 import { createSummaryTaskGate } from "./task-gate.js";
 import { createRecoveryPoint, appendRecoveryPoint, restoreRecoveryPoint, recoveryChatSignature } from "./recovery-store.js";
 import { createMemoryBackup, parseMemoryBackup, MAX_IMPORT_FILE_BYTES } from "./memory-backup.js";
-import { saveAndVerifyChatMetadata, readPersistedFields, CHAT_PERSISTENCE_STATUS } from "./host-persistence.js";
+import { saveAndVerifyChatMetadata, saveAndVerifyChatMessages, readPersistedFields, readPersistedMessageVisibility, CHAT_PERSISTENCE_STATUS } from "./host-persistence.js";
+import { reconcileNativeVisibility, rollbackNativeVisibility, visibilitySnapshot, visibilityRanges } from "./native-visibility.js";
+
+import { clearDryRunPrompts, publishDryRunPrompts } from "./prompt-bridge.js";
 
 const EXTENSION_NAME = "tiandao-memory-engine";
 const PROMPT_KEY = "tiandao_memory_prompt";
@@ -69,6 +72,13 @@ let abortBackfillFlag = false;
 let activeBackfillChatKey = null;
 let summaryQueue = Promise.resolve();
 let summaryEpoch = 0;
+let chatLoadEpoch = 0;
+let visibilitySaveQueue = Promise.resolve();
+const pendingVisibilitySaves = new Map();
+const confirmedMemories = new WeakMap();
+let hostVisibilityModule;
+let swipePreviewTimer = null;
+let generationSetup = null;
 // 按任务 token 记账：聊天切换 clear() 之后，旧任务 finally 的注销不会误删新任务的标记。
 const activeSummaryChats = new Map();
 function markSummaryChat(chatKey) {
@@ -148,12 +158,13 @@ function getStateSaveKey(ctx) {
 }
 
 function captureChatSaveIdentity(ctx, metadata) {
+    const epoch = chatLoadEpoch;
     const key = getStateSaveKey(ctx);
     const chat = ctx.chat;
     const memory = metadata?.tiandao_memory;
     return () => {
         const current = getSTContext();
-        return getStateSaveKey(current) === key && current.chat === chat
+        return chatLoadEpoch === epoch && getStateSaveKey(current) === key && current.chat === chat
             && (current.chatMetadata || window.chat_metadata) === metadata
             && metadata?.tiandao_memory === memory;
     };
@@ -479,9 +490,13 @@ function getCachedRoundIndex(chat, includeNativeHidden = false) {
         return buildRoundMessageIndex(chat, includeNativeHidden);
     }
     const cached = roundIndexCache.get(chat);
-    if (cached?.includeNativeHidden === includeNativeHidden) return cached.index;
+    const identity = getStateSaveKey(getSTContext());
+    const mask = chat.map(message => [Boolean(message?.is_user), Boolean(message?.is_system), Boolean(message?.extra?.tiandao_hidden)].join(":" )).join("|");
+    if (cached?.includeNativeHidden === includeNativeHidden && cached.epoch === chatLoadEpoch
+        && cached.identity === identity && cached.mask === mask && cached.messages.length === chat.length
+        && cached.messages.every((message, index) => message === chat[index])) return cached.index;
     const index = buildRoundMessageIndex(chat, includeNativeHidden);
-    roundIndexCache.set(chat, { includeNativeHidden, index });
+    roundIndexCache.set(chat, { includeNativeHidden, index, epoch: chatLoadEpoch, identity, mask, messages: chat.slice() });
     return index;
 }
 
@@ -490,7 +505,7 @@ function invalidateRoundIndexCache(chat) {
 }
 
 function buildChatFingerprint(chat) {
-    return buildChatMessageFingerprint(chat);
+    return buildChatMessageFingerprint(chat, true);
 }
 
 function refreshChatFingerprint(chat = getSTContext().chat || []) {
@@ -793,6 +808,7 @@ function getChatMemory() {
     if (cleanupPlaceholderCharacters(memoryData, ctx.name1 || "", true)) {
         scheduleChatSave();
     }
+    if (!confirmedMemories.has(metadata)) confirmedMemories.set(metadata, clonePlainData(memoryData));
     return memoryData;
 }
 
@@ -835,6 +851,7 @@ async function saveChatMemory() {
         error.persistenceStatus = result.status;
         throw error;
     }
+    confirmedMemories.set(metadata, clonePlainData(expectedFields.tiandao_memory));
 }
 
 // 事件回调里的保存失败不能变成 unhandled rejection；切换聊天属正常竞争只记日志，真实失败提示状态栏。
@@ -1043,11 +1060,18 @@ function currentMemoryReference(ctx = getSTContext()) {
 async function refreshPromptInjection(customQuery = "", options = {}) {
     const requestSequence = ++injectionRequestSequence;
     const requestEpoch = summaryEpoch;
+    const loadEpoch = chatLoadEpoch;
     const ctx = getSTContext();
     const settings = getSettings();
+    const settingsSignature = JSON.stringify(settings);
+    if (generationSetup?.dryRun && generationSetup.settingsSignature !== settingsSignature) {
+        generationSetup.stale = true;
+        clearDryRunPrompts(ctx);
+    }
     // Clear the legacy depth prompt on every path; memory now belongs only to chat history.
     ctx.setExtensionPrompt?.(PROMPT_KEY, "", 1, 0, false, 0);
     if (!settings.enabled || !isActiveChatContext(ctx)) {
+        clearDryRunPrompts(ctx);
         lastInjectionPreview = null;
         lastMemoryPromptTokens = 0;
         renderInjectionPreview();
@@ -1055,11 +1079,14 @@ async function refreshPromptInjection(customQuery = "", options = {}) {
         return null;
     }
     const chatKey = getChatKey();
+    const scopeKey = getStateSaveKey(ctx);
     const memoryData = getChatMemory();
     const fullChat = ctx.chat || [];
+    const canUseTools = Boolean(ctx.isToolCallingSupported?.());
     const needsRetrieval = settings.enableRetrieval && !options.skipRetrieval;
-    const coreChat = options.coreChat || preparePromptHistory(fullChat, await loadHostPromptProcessor(ctx), options.generationType);
-    if (!isCurrentChat(chatKey) || requestEpoch !== summaryEpoch || currentMemoryReference(ctx) !== memoryData) return null;
+    if (!options.coreChat) syncHiddenMessagesState({ generationType: options.generationType, restoreOnly: Boolean(options.rawOnly) });
+    const coreChat = options.coreChat || preparePromptHistory(fullChat, await loadHostPromptProcessor(ctx), options.generationType, canUseTools);
+    if (!isCurrentChat(chatKey) || requestEpoch !== summaryEpoch || loadEpoch !== chatLoadEpoch || scopeKey !== getStateSaveKey(getSTContext()) || currentMemoryReference(ctx) !== memoryData) return null;
     // Query exactly the host's outgoing source, including swipe removal and other extensions' filtering.
     const queryText = customQuery || (needsRetrieval ? buildRecentContextQuery(coreChat, settings.targetContentTags, settings.customStripTags) : '');
     const retrievalDetails = [];
@@ -1069,15 +1096,26 @@ async function refreshPromptInjection(customQuery = "", options = {}) {
         // 提示词里，召回只会重复内容并白付 Embedding 调用，直接跳过。
         && !(rawVectorMemoryActive(settings) && !settings.autoHideOldMessages)) {
         retrieved = await retrieveRelevantArchivedMemories(settings, memoryData, queryText,
-            { skipNormalize: true, details: retrievalDetails, focusQuery: buildLatestUserQuery(coreChat, settings),
+            { skipNormalize: true, allowNetwork: Boolean(options.coreChat) && options.allowNetwork !== false, details: retrievalDetails, focusQuery: buildLatestUserQuery(coreChat, settings),
               chat: fullChat, roundIndex: getCachedRoundIndex(fullChat, settings.includeNativeHidden) });
     }
-    if (!isCurrentChat(chatKey) || requestEpoch !== summaryEpoch
+    if (!isCurrentChat(chatKey) || requestEpoch !== summaryEpoch || loadEpoch !== chatLoadEpoch || scopeKey !== getStateSaveKey(getSTContext())
         || currentMemoryReference(ctx) !== memoryData) return null;
     if (requestSequence !== injectionRequestSequence && !options.coreChat) return null;
-    const plan = buildChatHistoryReplacement(memoryData, fullChat, coreChat, settings, retrieved, ctx.name1 || "", {
-        bound: options.bound, generationType: options.generationType, roundIndex: getCachedRoundIndex(fullChat, settings.includeNativeHidden), retrievalDetails,
+    if (settingsSignature !== JSON.stringify(getSettings())) return null;
+    const plan = buildChatHistoryReplacement(getPlanningMemory(ctx, memoryData), fullChat, coreChat, options.rawOnly ? { ...settings, autoHideOldMessages: false } : settings, retrieved, ctx.name1 || "", {
+        bound: options.bound, generationType: options.generationType, canUseTools, roundIndex: getCachedRoundIndex(fullChat, settings.includeNativeHidden), retrievalDetails,
     });
+    if (options.coreChat) {
+        const present = new Set((options.bound || bindGenerationHistory(coreChat, fullChat, ctx)).map(item => item.sourceIndex));
+        const omitted = generationSetup?.key === scopeKey && generationSetup.loadEpoch === loadEpoch ? generationSetup.hiddenMessages : null;
+        for (let index = plan.rawStart; index <= plan.generationEnd; index++) {
+            const message = fullChat[index];
+            if ((message?.extra?.tiandao_hidden || omitted?.has(message)) && !present.has(index)) {
+                throw new Error("原文窗口在宿主过滤后发生变化，已停止本次生成，请重新发送以保留完整原文");
+            }
+        }
+    }
     lastMemoryPromptTokens = plan.tokens;
     lastInjectionPreview = { ...plan, chatKey, at: Date.now(), applied: Boolean(options.coreChat) };
     renderInjectionPreview();
@@ -1110,8 +1148,15 @@ function renderInjectionPreview() {
     const value = preview?.text || "尚未准备聊天记录；启用引擎并进入聊天后会在这里显示。";
     if (text.value !== value) text.value = value;
     info.textContent = preview
-        ? "最近" + (preview.applied ? "替换于 " : "准备于 ") + new Date(preview.at).toLocaleTimeString() + " · 原生聊天记录区块 · 约 " + preview.tokens + " Token（估算；原文已应用发出正则） · 原文 " + preview.rawMessages + " 条 / 记忆 " + preview.memoryMessages + " 条" + (preview.retrieval?.length ? " · 召回：" + preview.retrieval.map(item => "第 " + item.roundRange + " 轮（" + item.reason + "）").join("；") : "")
-        : "本页显示已应用发出正则的聊天记录区块；实际生成时以酒馆处理后的副本为准，不包含角色卡与其他预设。查看不会调用 API。";
+        ? "最近" + (preview.applied ? "替换于 " : "准备于 ") + new Date(preview.at).toLocaleTimeString()
+            + " · 设置保留最近 " + preview.keepRounds + " 轮"
+            + (preview.fallback ? " · " + preview.fallback : "")
+            + (preview.coveredRounds > 0 ? " · 记忆覆盖第 1-" + preview.coveredRounds + " 轮" : "")
+            + " · 原文 " + preview.rawMessages + " 条 ~" + preview.rawTokens + "tk"
+            + " / 记忆 " + preview.memoryMessages + " 条 ~" + preview.memoryTokens + "tk"
+            + " · 合计 ~" + preview.tokens + "tk（估算）"
+            + (preview.retrieval?.length ? " · 召回：" + preview.retrieval.map(item => "第 " + item.roundRange + " 轮（" + item.reason + "）").join("；") : "")
+        : "聊天记录区块预览，不含角色卡与其他预设，查看不调用 API。";
     const copy = document.getElementById("tiandao_injection_copy");
     if (copy) copy.disabled = !preview;
 }
@@ -1456,15 +1501,35 @@ function runStoryResummarize(turns, {
     return job;
 }
 
+function bindGenerationHistory(core, fullChat, ctx = getSTContext()) {
+    const setup = generationSetup;
+    const canUseTools = Boolean(ctx.isToolCallingSupported?.());
+    const current = setup && setup.key === getStateSaveKey(ctx) && setup.loadEpoch === chatLoadEpoch;
+    let sources = current ? [...setup.sourceMessages, ...fullChat.slice(setup.sourceLength)
+        .filter(message => message && (!message.is_system || (canUseTools && Array.isArray(message.extra?.tool_invocations))))] : null;
+    if (sources) {
+        const live = fullChat.filter(message => message && (!message.is_system || (canUseTools && Array.isArray(message.extra?.tool_invocations))));
+        if (setup.type === "swipe") live.pop();
+        const indexedLength = core.reduce((length, message) => Number.isInteger(message.index) ? Math.max(length, message.index + 1) : length, 0);
+        if (indexedLength === live.length && indexedLength !== sources.length) sources = live;
+    }
+    return bindCoreHistory(core, fullChat, canUseTools, sources);
+}
+
 globalThis.tiandaoMemoryInterceptor = async function (chat, _contextSize, abort, type) {
     const ctx = getSTContext();
     const chatKey = getChatKey();
     try {
+        clearDryRunPrompts(ctx);
+        if (generationSetup && (generationSetup.stale || generationSetup.loadEpoch !== chatLoadEpoch
+            || generationSetup.epoch !== summaryEpoch || generationSetup.key !== getStateSaveKey(ctx))) {
+            throw new Error("聊天或原文在生成准备期间已变化，已停止过期生成");
+        }
         const settings = getSettings();
         ctx.setExtensionPrompt?.(PROMPT_KEY, "", 1, 0, false, 0);
         const fullChat = ctx.chat || [];
         if (!Array.isArray(chat) || chat === fullChat) throw new Error("酒馆未提供独立的生成聊天副本，已停止以保护原始聊天记录");
-        const bound = bindCoreHistory(chat, fullChat);
+        const bound = bindGenerationHistory(chat, fullChat, ctx);
         const sanitized = new Map();
         for (const item of bound) {
             const message = stripStateUpdateMessage(item.message, fullChat[item.sourceIndex]);
@@ -1492,29 +1557,136 @@ globalThis.tiandaoMemoryInterceptor = async function (chat, _contextSize, abort,
     }
 };
 
-/**
- * 恢复旧版本由本插件隐藏的原文。发送内容仅在生成副本中替换。
- */
-function syncHiddenMessagesState() {
-    const ctx = getSTContext();
-    const chat = ctx.chat || [];
-    let restoredCount = 0;
-    // Sending no longer toggles is_system. Migrate only this plugin's legacy hidden flags.
-    for (let i = 0; i < chat.length; i++) {
-        const msg = chat[i];
-        if (!msg?.extra?.tiandao_hidden) continue;
-        msg.is_system = false;
-        delete msg.extra.tiandao_hidden;
-        restoredCount++;
-        document.querySelector?.('.mes[mesid="' + i + '"]')?.setAttribute("is_system", "false");
+// A loaded snapshot or a confirmed save grants hiding eligibility; in-flight drafts do not.
+function getPlanningMemory(ctx, memory) {
+    const saved = confirmedMemories.get(ctx.chatMetadata || window.chat_metadata);
+    if (!saved) return memory;
+    const signature = item => JSON.stringify([item.id, item.roundRange, item.startMessageId, item.endMessageId, item.text]);
+    const archive = new Set((saved.archivePool || []).map(signature));
+    const levels = {};
+    for (let level = 0; level <= 3; level++) {
+        const signatures = new Set((saved.levels?.[level] || []).map(signature));
+        levels[level] = (memory.levels?.[level] || []).filter(item => signatures.has(signature(item)));
     }
-    if (restoredCount) {
+    return { ...memory, archivePool: (memory.archivePool || []).filter(item => archive.has(signature(item))), levels,
+        farHistory: JSON.stringify(saved.farHistory) === JSON.stringify(memory.farHistory) ? memory.farHistory : {} };
+}
+
+function updateVisibilityDom(chat, changes, rollback = false) {
+    const visualChanges = changes.filter(change => Boolean(rollback ? change.after.is_system : change.before.is_system) !== Boolean(change.message.is_system));
+    if (!visualChanges.length) return;
+    for (const change of visualChanges) {
+        if (chat[change.index] !== change.message) continue;
+        document.querySelector?.('.mes[mesid="' + change.index + '"]')?.setAttribute("is_system", String(Boolean(change.message.is_system)));
+    }
+    try { getSTContext().swipe?.refresh?.(); } catch (_) { /* Optional in older hosts. */ }
+}
+
+function queueVisibilitySave(ctx, changes) {
+    const key = getStateSaveKey(ctx), chat = ctx.chat;
+    const isActive = captureChatSaveIdentity(ctx, ctx.chatMetadata || window.chat_metadata);
+    const expected = chat.map(visibilitySnapshot);
+    const fingerprint = JSON.stringify(expected);
+    const prior = pendingVisibilitySaves.get(key);
+    if (prior?.isActive()) {
+        const merged = new Map(prior.changes.filter(change => chat[change.index] === change.message).map(change => [change.message, change]));
+        for (const change of changes) {
+            const previous = merged.get(change.message);
+            merged.set(change.message, previous ? { ...change, before: previous.before } : change);
+        }
+        changes = [...merged.values()].sort((left, right) => left.index - right.index);
+    }
+    const job = { changes, expected, isActive, fingerprint, status: "pending" };
+    pendingVisibilitySaves.set(key, job);
+    const valid = () => pendingVisibilitySaves.get(key) === job && isActive()
+        && JSON.stringify(chat.map(visibilitySnapshot)) === fingerprint;
+    visibilitySaveQueue = visibilitySaveQueue.then(async () => {
+        if (!valid()) return;
+        let hideRange = ctx.hideChatMessageRange;
+        if (typeof hideRange !== "function" && typeof window !== "undefined") {
+            hostVisibilityModule ||= import("../../../../scripts/chats.js").catch(() => null);
+            const module = await hostVisibilityModule;
+            if (!valid()) return;
+            hideRange = module?.hideChatMessageRange;
+        }
+        const ranges = visibilityRanges(changes);
+        const saver = typeof hideRange === "function" && ranges.length ? async () => {
+            for (const range of ranges) {
+                if (!valid()) return false;
+                await hideRange.call(ctx, range.start, range.end, !range.hide);
+                if (!valid()) return false;
+            }
+        } : typeof ctx.saveChat === "function" ? () => ctx.saveChat() : null;
+        // A transient readback failure must be retryable without writing the same chat again.
+        let result = prior?.fingerprint === fingerprint
+            ? await readPersistedMessageVisibility(ctx, expected, globalThis.fetch, null, valid) : null;
+        if (!valid()) return;
+        if (!result || result.status === CHAT_PERSISTENCE_STATUS.failed) {
+            result = await saveAndVerifyChatMessages(ctx, expected, saver, globalThis.fetch, valid);
+        }
+        if (!isActive() || pendingVisibilitySaves.get(key) !== job) return;
+        job.status = result.status;
+        if (result.status === CHAT_PERSISTENCE_STATUS.confirmed) pendingVisibilitySaves.delete(key);
+        else {
+            if (result.status === CHAT_PERSISTENCE_STATUS.failed && valid()) {
+                rollbackNativeVisibility(chat, changes, { newlyHiddenOnly: true });
+                updateVisibilityDom(chat, changes, true);
+                invalidateRoundIndexCache(chat);
+                refreshChatFingerprint(chat);
+            }
+            updateStatusBar("⚠️ 隐藏状态" + (result.status === CHAT_PERSISTENCE_STATUS.unknown ? "保存未确认：" : "保存失败：") + result.reason, true);
+        }
+    }).catch(error => {
+        if (isActive()) updateStatusBar("⚠️ 隐藏状态保存未确认：" + String(error?.message || error), true);
+    });
+}
+
+// Apply synchronously so native coreChat filtering always sees safe raw floors.
+function syncHiddenMessagesState({ generationType = "", restoreOnly = false } = {}) {
+    const ctx = getSTContext(), chat = ctx.chat || [], settings = getSettings();
+    const memory = getChatMemory();
+    const canUseTools = Boolean(ctx.isToolCallingSupported?.());
+    const visible = chat.map((message, index) => ({ message, index }))
+        .filter(({ message }) => message && (!message.is_system || message.extra?.tiandao_hidden
+            || (canUseTools && Array.isArray(message.extra?.tool_invocations))));
+    if (generationType === "swipe") visible.pop();
+    const generationEnd = visible.at(-1)?.index ?? -1;
+    const plan = buildHistoryCoverage(getPlanningMemory(ctx, memory), chat, settings, {
+        roundIndex: getCachedRoundIndex(chat, settings.includeNativeHidden), generationEnd, canUseTools,
+    });
+    const supported = typeof ctx.saveChat === "function" || typeof ctx.hideChatMessageRange === "function";
+    const enabled = settings.enabled && settings.autoHideOldMessages && !restoreOnly && supported && isActiveChatContext(ctx);
+    const result = reconcileNativeVisibility(chat, plan.hiddenIndexes, enabled);
+    if (result.changes.length) {
         invalidateRoundIndexCache(chat);
         refreshChatFingerprint(chat);
-        scheduleChatSave();
-        try { ctx.refresh?.(); } catch (_) { /* Older hosts do not expose refresh. */ }
+        updateVisibilityDom(chat, result.changes);
+        queueVisibilitySave(ctx, result.changes);
+    } else {
+        const pending = pendingVisibilitySaves.get(getStateSaveKey(ctx));
+        if (pending && (pending.status === CHAT_PERSISTENCE_STATUS.unknown || !pending.isActive()
+            || pending.fingerprint !== JSON.stringify(chat.map(visibilitySnapshot)))) queueVisibilitySave(ctx, []);
     }
-    return restoredCount;
+    return result.restored;
+}
+
+function scheduleRestoredSwipePreview() {
+    clearTimeout(swipePreviewTimer);
+    const epoch = chatLoadEpoch, key = getStateSaveKey(getSTContext());
+    const refresh = () => {
+        if (epoch !== chatLoadEpoch || key !== getStateSaveKey(getSTContext())) return;
+        const state = getSTContext().swipe?.state?.();
+        if ((state && state !== "none" && state !== "editing") || document.body?.dataset?.swiping) {
+            swipePreviewTimer = setTimeout(refresh, 30);
+            return;
+        }
+        swipePreviewTimer = null;
+        const chat = getSTContext().chat || [];
+        invalidateRoundIndexCache(chat);
+        syncHiddenMessagesState();
+        refreshPromptInjection("", { allowNetwork: false }).catch(() => {});
+    };
+    swipePreviewTimer = setTimeout(refresh, 0);
 }
 
 /**
@@ -5122,7 +5294,7 @@ function bindSettingsUI() {
     bindCheck("tiandao_auto_hide", "autoHideOldMessages", (checked) => {
         const count = syncHiddenMessagesState();
         if (!checked) {
-            updateStatusBar(`👁️ 已改为发送全部可见原文${count ? `，并恢复 ${count} 条旧版隐藏记录` : ""}`);
+            updateStatusBar(`👁️ 已改为发送全部可见原文${count ? `，并恢复 ${count} 条插件隐藏记录` : ""}`);
         } else {
             updateStatusBar(`📚 已开启聊天记录替换：保留最近 ${numOr(settings.keepRecentRoundsCount, 5)} 轮一问一答原文`);
         }
@@ -5234,8 +5406,8 @@ function bindSettingsUI() {
 
     const restoreHiddenBtn = document.getElementById("tiandao_restore_hidden_btn");
     if (restoreHiddenBtn) restoreHiddenBtn.addEventListener("click", () => {
-        syncHiddenMessagesState();
         settings.autoHideOldMessages = false;
+        syncHiddenMessagesState();
         const autoHideEl = document.getElementById("tiandao_auto_hide");
         if (autoHideEl) autoHideEl.checked = false;
         saveSettings();
@@ -5263,27 +5435,17 @@ function bindSettingsUI() {
 
 }
 
-(async function initTiandaoMemoryExtension() {
-    try {
-        initFloatingWidget();
-        const repositionFloatingWidget = () => requestAnimationFrame(positionFloatingWidgetCard);
-        window.addEventListener("resize", repositionFloatingWidget);
-        window.addEventListener("orientationchange", repositionFloatingWidget);
-        window.visualViewport?.addEventListener("resize", repositionFloatingWidget);
-
-        const ctx = getSTContext();
-        const eventSource = ctx.eventSource || window.eventSource;
-        const eventTypes = ctx.eventTypes || ctx.event_types || window.event_types || window.eventTypes || {};
-        const startupMemory = getChatMemory();
-        if (startupMemory.lastSummaryError) {
-            startupMemory.lastSummaryError = null;
-            await saveChatMemory().catch(() => {});
-        }
-        refreshChatFingerprint(ctx.chat || []);
-        syncHiddenMessagesState();
-
+function registerMemoryEvents(ctx = getSTContext()) {
+    const eventSource = ctx.eventSource || window.eventSource;
+    const eventTypes = ctx.eventTypes || ctx.event_types || window.event_types || window.eventTypes || {};
         if (eventSource && eventTypes) {
             if (eventTypes.CHAT_CHANGED) eventSource.on(eventTypes.CHAT_CHANGED, async () => {
+                if (generationSetup) generationSetup.stale = true;
+                chatLoadEpoch++;
+                const loadEpoch = chatLoadEpoch;
+                clearDryRunPrompts(getSTContext());
+                clearTimeout(swipePreviewTimer);
+                invalidateRoundIndexCache(getSTContext().chat || []);
                 summaryEpoch++;
                 summaryQueue = Promise.resolve();
                 activeSummaryChats.clear();
@@ -5308,21 +5470,56 @@ function bindSettingsUI() {
                     changedChatMemory.lastSummaryError = null;
                     await saveChatMemory().catch(() => {});
                 }
+                if (loadEpoch !== chatLoadEpoch) return;
                 expandedCharacterCards.clear();
                 expandedInventoryCards.clear();
                 refreshChatFingerprint(getSTContext().chat || []);
+                syncHiddenMessagesState();
                 await refreshPromptInjection().catch(error => console.warn("[溯微] 聊天切换后刷新注入失败:", error?.name || error?.message || error));
                 syncHiddenMessagesState(); updateFloatingWidgetUI();
             });
             if (eventTypes.GENERATION_STARTED) eventSource.on(eventTypes.GENERATION_STARTED, async (type, _options, dryRun) => {
-                const settings = getSettings();
+                const current = getSTContext();
+                const loadEpoch = chatLoadEpoch, key = getStateSaveKey(current);
+                clearDryRunPrompts(current);
                 clearSwipeRepairTimer();
-                // 正常生成由 generate_interceptor 统一处理；dryRun 不会运行拦截器，
-                // 这里只刷新提示词，不触发摘要，避免预览时消耗 API。
-                if (!dryRun) return;
-                syncHiddenMessagesState();
-                await refreshPromptInjection("", { generationType: type }).catch(error => console.warn("[溯微] 预览刷新注入失败:", error?.name || error?.message || error));
+                invalidateRoundIndexCache(current.chat || []);
+                syncHiddenMessagesState({ generationType: type, restoreOnly: type === "quiet" || (dryRun && typeof current.setExtensionPrompt !== "function") });
+                await visibilitySaveQueue;
+                if (loadEpoch !== chatLoadEpoch || key !== getStateSaveKey(getSTContext())) return;
+                const sourceMessages = (current.chat || []).filter(message => message && (!message.is_system
+                    || (current.isToolCallingSupported?.() && Array.isArray(message.extra?.tool_invocations))));
+                if (type === "swipe") sourceMessages.pop();
+                generationSetup = { key, loadEpoch, type, epoch: summaryEpoch, settingsSignature: JSON.stringify(getSettings()), dryRun: Boolean(dryRun), sourceMessages, sourceLength: current.chat?.length || 0,
+                    hiddenMessages: new Set((current.chat || []).filter(message => message?.is_system && message.extra?.tiandao_hidden)) };
+                if (!dryRun || !getSettings().enabled || type === "quiet") return;
+                const canInject = typeof current.setExtensionPrompt === "function";
+                let plan = await refreshPromptInjection("", { generationType: type, allowNetwork: false, rawOnly: !canInject });
+                if (loadEpoch !== chatLoadEpoch || key !== getStateSaveKey(getSTContext())) return;
+                const outgoing = preparePromptHistory(current.chat || [], text => text, type, Boolean(current.isToolCallingSupported?.()));
+                // Failed native writes or unavailable interfaces must not produce duplicate history.
+                if (plan && outgoing.length !== plan.rawMessages) plan = await refreshPromptInjection("", { generationType: type, allowNetwork: false, rawOnly: true });
+                if (canInject && plan && loadEpoch === chatLoadEpoch && key === getStateSaveKey(getSTContext())) publishDryRunPrompts(current, plan);
             });
+            const verifyDryRun = () => {
+                const setup = generationSetup;
+                if (!setup?.dryRun) return;
+                if (setup.stale || setup.loadEpoch !== chatLoadEpoch || setup.epoch !== summaryEpoch
+                    || setup.settingsSignature !== JSON.stringify(getSettings()) || setup.key !== getStateSaveKey(getSTContext())) {
+                    clearDryRunPrompts(getSTContext());
+                    throw new Error("聊天、原文或设置已变化，已取消过期的干跑预览");
+                }
+            };
+            if (eventTypes.CHAT_COMPLETION_PROMPT_READY) eventSource.on(eventTypes.CHAT_COMPLETION_PROMPT_READY, data => {
+                if (data.dryRun) verifyDryRun();
+            });
+            if (eventTypes.GENERATE_AFTER_DATA) eventSource.on(eventTypes.GENERATE_AFTER_DATA, (_data, dryRun) => {
+                if (dryRun) { verifyDryRun(); clearDryRunPrompts(getSTContext()); }
+                generationSetup = null;
+            });
+            for (const event of [eventTypes.GENERATION_STOPPED, eventTypes.GENERATION_ENDED].filter(Boolean)) {
+                eventSource.on(event, () => { clearDryRunPrompts(getSTContext()); scheduleRestoredSwipePreview(); });
+            }
             if (eventTypes.USER_MESSAGE_RENDERED) eventSource.on(eventTypes.USER_MESSAGE_RENDERED, () => {
                 const chat = getSTContext().chat || [];
                 invalidateRoundIndexCache(chat);
@@ -5351,6 +5548,8 @@ function bindSettingsUI() {
                 }
             });
             if (eventTypes.MESSAGE_DELETED) eventSource.on(eventTypes.MESSAGE_DELETED, async () => {
+                const eventCtx = getSTContext();
+                const isActive = captureChatSaveIdentity(eventCtx, eventCtx.chatMetadata || window.chat_metadata);
                 clearSwipeRepairTimer();
                 const chat = getSTContext().chat || [];
                 invalidateRoundIndexCache(chat);
@@ -5371,12 +5570,17 @@ function bindSettingsUI() {
                 if (reconciled || clearedDeletedRoundError) {
                     // 删除的可能正是失败轮次；即使存档游标未变化，也清除过期错误并保存。
                     memoryData.lastSummaryError = null;
+                    syncHiddenMessagesState();
                     await saveMemoryQuietly();
+                    if (!isActive()) return;
                     await refreshPromptInjection().catch(() => {});
+                    if (!isActive()) return;
                 }
                 syncHiddenMessagesState(); updateFloatingWidgetUI();
             });
             if (eventTypes.MESSAGE_EDITED) eventSource.on(eventTypes.MESSAGE_EDITED, async (idx) => {
+                const eventCtx = getSTContext();
+                const isActive = captureChatSaveIdentity(eventCtx, eventCtx.chatMetadata || window.chat_metadata);
                 clearSwipeRepairTimer();
                 invalidateActiveSummaryWork("消息已编辑");
                 const currentCtx = getSTContext();
@@ -5387,7 +5591,9 @@ function bindSettingsUI() {
                 if (Math.max(memoryData.lastProcessedMessageId, getStateLedgerCursor(memoryData).endMessageId) >= idx) {
                     rollbackMemoryFromMessageIndex(memoryData, idx, { skipNormalize: true });
                     memoryData.lastSummaryError = null;
+                    syncHiddenMessagesState();
                     await saveMemoryQuietly();
+                    if (!isActive()) return;
                     syncHiddenMessagesState();
                 }
                 const targetMsg = chat[idx];
@@ -5419,10 +5625,13 @@ function bindSettingsUI() {
                     });
                 } else {
                     await refreshPromptInjection().catch(() => {});
+                    if (!isActive()) return;
                 }
                 updateFloatingWidgetUI();
             });
             if (eventTypes.MESSAGE_SWIPED) eventSource.on(eventTypes.MESSAGE_SWIPED, async (idx) => {
+                const eventCtx = getSTContext();
+                const isActive = captureChatSaveIdentity(eventCtx, eventCtx.chatMetadata || window.chat_metadata);
                 clearSwipeRepairTimer();
                 invalidateActiveSummaryWork("已切换 Swipe");
                 const chat = getSTContext().chat || [];
@@ -5433,12 +5642,18 @@ function bindSettingsUI() {
                 if (Math.max(memoryData.lastProcessedMessageId, getStateLedgerCursor(memoryData).endMessageId) >= startFloor) {
                     rollbackMemoryFromMessageIndex(memoryData, startFloor, { skipNormalize: true });
                     memoryData.lastSummaryError = null;
+                    syncHiddenMessagesState();
                     await saveMemoryQuietly();
+                    if (!isActive()) return;
                     syncHiddenMessagesState();
                     await refreshPromptInjection().catch(() => {});
+                    if (!isActive()) return;
                     updateFloatingWidgetUI();
                 }
                 if (resolveStateUpdateMode(getSettings()) !== "with_summary") enqueueLiveStateUpdates(chat, idx, { allowSummary: false });
+                syncHiddenMessagesState();
+                await refreshPromptInjection("", { allowNetwork: false }).catch(() => {});
+                if (!isActive()) return;
                 scheduleAfterReplySwipeRepair(getChatKey());
             });
             if (eventTypes.MESSAGE_UPDATED) eventSource.on(eventTypes.MESSAGE_UPDATED, () => {
@@ -5447,6 +5662,30 @@ function bindSettingsUI() {
                 refreshChatFingerprint(chat);
             });
         }
+}
+
+(async function initTiandaoMemoryExtension() {
+    try {
+        initFloatingWidget();
+        const repositionFloatingWidget = () => requestAnimationFrame(positionFloatingWidgetCard);
+        window.addEventListener("resize", repositionFloatingWidget);
+        window.addEventListener("orientationchange", repositionFloatingWidget);
+        window.visualViewport?.addEventListener("resize", repositionFloatingWidget);
+
+        const ctx = getSTContext();
+        const eventSource = ctx.eventSource || window.eventSource;
+        const eventTypes = ctx.eventTypes || ctx.event_types || window.event_types || window.eventTypes || {};
+        const startupMemory = getChatMemory();
+        if (startupMemory.lastSummaryError) {
+            startupMemory.lastSummaryError = null;
+            await saveChatMemory().catch(() => {});
+        }
+        invalidateRoundIndexCache(ctx.chat || []);
+        refreshChatFingerprint(ctx.chat || []);
+        syncHiddenMessagesState();
+        await refreshPromptInjection("", { allowNetwork: false });
+
+        registerMemoryEvents(ctx);
         updateFloatingWidgetUI();
         console.log("[溯微] v1.18.1 (角色成长·身份衔接·删除回退修复) 加载完毕！");
     } catch (err) { console.error("[溯微] 初始化异常:", err); }

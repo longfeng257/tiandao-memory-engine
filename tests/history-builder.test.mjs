@@ -125,6 +125,16 @@ test('fixed memories inside recent raw dialogue are inserted at their own round'
     assert.ok(plan.text.indexOf('2026.1.07 剧情摘要') < plan.text.indexOf('2026.1.08 玩家原文'));
 });
 
+test('preview reports the raw/memory token split and covered rounds', () => {
+    const f = fixture();
+    f.fullChat.push({ is_user: true, name: '旅人', mes: '2026.1.09 当前问题' });
+    const plan = build(f);
+    assert.equal(plan.coveredRounds, 6);
+    assert.ok(plan.rawTokens > 0);
+    assert.ok(plan.memoryTokens > 0);
+    assert.ok(Math.abs(plan.rawTokens + plan.memoryTokens - plan.tokens) <= 2);
+});
+
 test('long selected summaries are not cut to a fixed prompt budget', () => {
     const f = fixture();
     f.memory.levels[1][0].text = '必须完整保留的历史细节'.repeat(900) + '【末尾事实】';
@@ -312,3 +322,44 @@ for (const completed of [6, 7, 8, 9]) {
         assert.equal(JSON.stringify(f.memory), before);
     });
 }
+
+for (const defect of ['none', 'gap', 'endpoint', 'swipe']) {
+    test('301–325 L1 source validation: ' + defect, () => {
+        const f = fixture(328);
+        f.settings.keepRecentRoundsCount = 3;
+        f.memory.levels[1] = [{ id: 'L1-301', level: 1, roundRange: '301-325', startMessageId: 600, endMessageId: 649, text: '已验证的301至325阶段' }];
+        if (defect === 'gap') f.memory.archivePool = f.memory.archivePool.filter(item => item.roundRange !== '310');
+        if (defect === 'endpoint') f.memory.levels[1][0].endMessageId = 651;
+        const plan = build(f, defect === 'swipe' ? { core: f.core(649) } : {});
+        if (defect === 'none') {
+            assert.match(plan.text, /已验证的301至325阶段/);
+            assert.equal(plan.text.split('已验证的301至325阶段').length - 1, 1);
+            assert.equal(plan.rawStart, 650);
+        } else {
+            assert.doesNotMatch(plan.text, /已验证的301至325阶段/);
+            if (defect === 'gap') assert.equal(plan.rawStart, 618);
+        }
+    });
+}
+
+test('empty and entirely foreign core histories cannot inject discarded future facts', () => {
+    const f = fixture();
+    f.memory.levels[1][0].text = '未来不可用阶段';
+    for (const core of [[], [{ is_user: false, mes: '其他扩展消息' }]]) {
+        const plan = build(f, { core });
+        assert.equal(plan.generationEnd, -1);
+        assert.equal(plan.coveredRounds, 0);
+        assert.doesNotMatch(plan.text, /未来不可用阶段|2026\.1\.08/);
+    }
+});
+
+test('a grouped L0 validated against full turns is still never cropped into the raw window', () => {
+    const f = fixture();
+    f.memory.archivePool.splice(4, 4, { id: 'g', level: 0, roundRange: '5-8', startMessageId: 8, endMessageId: 15, text: '完整分组不能裁切' });
+    f.memory.levels[1] = [];
+    const plan = build(f);
+    assert.equal(plan.rawStart, 8);
+    assert.doesNotMatch(plan.text, /完整分组不能裁切/);
+    assert.equal(plan.retainedRounds, 4);
+    assert.match(plan.fallback, /分组/);
+});

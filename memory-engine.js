@@ -143,7 +143,7 @@ export function isActiveChatContext(ctx) {
  */
 const messageTextHashCache = new WeakMap();
 
-export function buildChatMessageFingerprint(chat) {
+export function buildChatMessageFingerprint(chat, normalizePluginHidden = false) {
     if (!Array.isArray(chat)) return [];
     return chat.map(msg => {
         if (!msg) return "";
@@ -158,7 +158,7 @@ export function buildChatMessageFingerprint(chat) {
             msg.send_date || "",
             msg.name || "",
             msg.is_user ? "u" : "a",
-            msg.is_system ? "s" : "n",
+            msg.is_system && !(normalizePluginHidden && msg.extra?.tiandao_hidden) ? "s" : "n",
             text.length,
             cached.hash,
             text.slice(0, 120),
@@ -4040,7 +4040,7 @@ function cosineSimilarity(vecA, vecB) {
 }
 
 
-async function getQueryEmbedding(settings, queryText) {
+async function getQueryEmbedding(settings, queryText, allowNetwork = true) {
     if (!settings.useEmbeddingApi || !settings.embeddingApiUrl || !settings.embeddingApiKey) return null;
     // Config/credentials scope the cache; result selection is recomputed against live memory.
     const key = JSON.stringify([embeddingServiceKey(settings), queryText.slice(0, 1000)]);
@@ -4051,6 +4051,7 @@ async function getQueryEmbedding(settings, queryText) {
         diagnostics.embeddingCacheHits++;
         return cached.promise;
     }
+    if (!allowNetwork) return null;
     const entry = { expiresAt: Date.now() + QUERY_CACHE_TTL_MS, promise: null };
     entry.promise = getEmbeddingVector(settings, queryText, 2500).then(vector => {
         if (!vector && queryEmbeddingCache.get(key) === entry) queryEmbeddingCache.delete(key);
@@ -4363,7 +4364,7 @@ async function retrieveRawExcerpts(settings, memoryData, queryText, options) {
         if (aliases.some(alias => focus.includes(String(alias).toLowerCase()))) names.push(...aliases);
     }
     const expanded = [focus, ...new Set(names)].join(' ');
-    const queryEmbedding = await getQueryEmbedding(settings, expanded);
+    const queryEmbedding = await getQueryEmbedding(settings, expanded, options.allowNetwork !== false);
     const embeddingModel = resolveEmbeddingModelName(settings);
     const queryBigrams = extractBigramsAndTokens(expanded);
     const upper = Math.min(numOr(memoryData.lastProcessedMessageId, -1), chat.length - 1);
@@ -4915,8 +4916,7 @@ export async function backfillExistingChatHistory(
     const batchSaveSize = Math.min(20, Math.max(1, Math.floor(numOr(saveEvery, 5))));
     const readPromptText = createPromptTextReader(chatMessages, processPromptText, '', settings.includeNativeHidden);
     normalizeMemoryData(memoryData);
-    const sourceSignature = end => buildChatMessageFingerprint(chatMessages.slice(0, end + 1)
-        .map(message => message?.extra?.tiandao_hidden ? { ...message, is_system: false } : message)).join("\n");
+    const sourceSignature = end => buildChatMessageFingerprint(chatMessages.slice(0, end + 1), true).join("\n");
     const restore = snapshot => {
         for (const key of Object.keys(memoryData)) delete memoryData[key];
         Object.assign(memoryData, deepClone(snapshot));

@@ -4,13 +4,21 @@ import { sanitizeSummaryFlourish, buildInjectedMemoryPrompt, buildRoundMessageIn
 const hasHistoricalFacts = hasSummaryFacts;
 
 // Bind the host's preprocessed copies to source positions, never to filtered array offsets.
-export function bindCoreHistory(coreChat, fullChat) {
-    const visible = fullChat.map((message, index) => ({ message, index }))
-        .filter(({ message }) => message && (!message.is_system || Array.isArray(message.extra?.tool_invocations)));
+export function bindCoreHistory(coreChat, fullChat, canUseTools = false, sourceMessages = null) {
     const identities = new Map(fullChat.map((message, index) => [message, index]));
+    const visible = sourceMessages
+        ? sourceMessages.filter(message => identities.has(message)).map(message => ({ message, index: identities.get(message) }))
+        : fullChat.map((message, index) => ({ message, index }))
+            .filter(({ message }) => message && (!message.is_system || (canUseTools && Array.isArray(message.extra?.tool_invocations))));
     let previous = -1;
     return coreChat.filter(message => !message?.extra?.suwei_history).map(message => {
         let sourceIndex = identities.get(message);
+        if (sourceIndex === undefined) {
+            const candidates = visible.filter(item => item.message.is_user === message.is_user
+                && ((message.extra && item.message.extra === message.extra)
+                    || (message.send_date && item.message.send_date === message.send_date && item.message.name === message.name)));
+            if (candidates.length === 1) sourceIndex = candidates[0].index;
+        }
         if (sourceIndex === undefined && Number.isInteger(message.index)) sourceIndex = visible[message.index]?.index;
         if (sourceIndex === undefined) {
             const match = visible.find(item => item.index > previous && item.message.is_user === message.is_user && item.message.mes === message.mes);
@@ -21,9 +29,9 @@ export function bindCoreHistory(coreChat, fullChat) {
     });
 }
 
-function selectHistoricalEntries(memory, eligibleTurns, archive) {
+function selectHistoricalEntries(memory, eligibleTurns, archive, turns = eligibleTurns) {
     const limit = eligibleTurns.length;
-    const coverage = getL0CoverageRanges(archive.filter(hasHistoricalFacts), { aiTurns: eligibleTurns });
+    const coverage = getL0CoverageRanges(archive.filter(hasHistoricalFacts), { aiTurns: turns });
     const candidates = archive.map(item => ({ item, rank: 0 }));
     for (let rank = 1; rank <= 3; rank++) {
         for (const item of memory.levels?.[rank] || []) candidates.push({ item, rank });
@@ -35,11 +43,15 @@ function selectHistoricalEntries(memory, eligibleTurns, archive) {
     const byStart = new Map();
     for (const { item, rank } of candidates) {
         const { start, end } = parseRoundRange(item.roundRange);
-        if (start < 1 || end > limit || !hasHistoricalFacts(item)) continue;
-        if (rank > 0 && !isRoundRangeCovered({ start, end }, coverage)) continue;
-        if (rank === 0 && (item.endMessageId !== eligibleTurns[end - 1]?.idx
-            || item.startMessageId !== eligibleTurns[start - 1]?.window.startMessageId
+        if (start < 1 || start > limit || !hasHistoricalFacts(item)) continue;
+        if (end > limit || end < start) continue;
+        if (end > turns.length || (rank > 0 && !isRoundRangeCovered({ start, end }, coverage))) continue;
+        if (rank === 0 && (item.endMessageId !== turns[end - 1]?.idx
+            || item.startMessageId !== turns[start - 1]?.window.startMessageId
             || !Number.isInteger(item.startMessageId))) continue;
+        // Higher tiers may omit legacy endpoints, but an explicit endpoint must match.
+        if (rank > 0 && ((item.startMessageId !== undefined && item.startMessageId !== turns[start - 1]?.window.startMessageId)
+            || (item.endMessageId !== undefined && item.endMessageId !== turns[end - 1]?.idx))) continue;
         if (!byStart.has(start)) byStart.set(start, []);
         byStart.get(start).push({ item, rank, end });
     }
@@ -79,22 +91,49 @@ export function formatHistoryPreview(messages) {
     }).join('\n\n');
 }
 
-// Replace only the host's ephemeral chat-history array. Source chats, cards and presets remain native.
-export function buildChatHistoryReplacement(memory, fullChat, coreChat, settings, retrieved = [], primaryName = '', options = {}) {
-    const bound = options.bound || bindCoreHistory(coreChat, fullChat);
-    const sourceEnd = bound.reduce((max, item) => Number.isInteger(item.sourceIndex) ? Math.max(max, item.sourceIndex) : max, -1);
-    const generationEnd = sourceEnd >= 0 ? sourceEnd : fullChat.length - 1;
+// The same pure coverage decision drives native visibility and outgoing replacement.
+export function buildHistoryCoverage(memory, fullChat, settings, options = {}) {
+    const generationEnd = Math.min(fullChat.length - 1, options.generationEnd ?? fullChat.length - 1);
     const roundIndex = options.roundIndex || buildRoundMessageIndex(fullChat, settings.includeNativeHidden);
     const turns = roundIndex.aiTurns.filter(turn => turn.idx <= generationEnd);
     const archive = (memory.archivePool || []).filter(item => Number.isInteger(item.endMessageId) && item.endMessageId <= generationEnd);
     let rawStart = settings.autoHideOldMessages
         ? computeHiddenMessageCutoff(fullChat.slice(0, generationEnd + 1), Math.max(1, numOr(settings.keepRecentRoundsCount, 5)), memory.lastProcessedMessageId, settings.includeNativeHidden, { aiTurns: turns })
         : 0;
+    let boundaryReason = "";
+    if (options.canUseTools) {
+        const toolTurn = turns.find(turn => turn.idx < rawStart && fullChat.slice(turn.window.startMessageId, turn.idx + 1)
+            .some(message => Array.isArray(message?.extra?.tool_invocations) || message?.extra?.tool_call_id));
+        if (toolTurn) { rawStart = toolTurn.window.startMessageId; boundaryReason = "工具调用链需要保留原文"; }
+    }
     const eligibleTurns = turns.filter(turn => turn.idx < rawStart);
-    const { selected, covered: pastRound } = selectHistoricalEntries(memory, eligibleTurns, archive);
+    const { selected, covered: pastRound } = selectHistoricalEntries(memory, eligibleTurns, archive, turns);
     if (pastRound < eligibleTurns.length) rawStart = eligibleTurns[pastRound].window.startMessageId;
+    const hiddenIndexes = new Set();
+    for (const turn of turns) {
+        if (turn.idx >= rawStart) break;
+        for (let index = turn.window.startMessageId; index <= turn.idx; index++) {
+            const message = fullChat[index];
+            if (message && (!message.is_system || message.extra?.tiandao_hidden)
+                && !(options.canUseTools && Array.isArray(message.extra?.tool_invocations))) hiddenIndexes.add(index);
+        }
+    }
+    return { rawStart, selected, coveredRounds: pastRound, generationEnd, hiddenIndexes,
+        keepRounds: Math.max(1, Math.floor(numOr(settings.keepRecentRoundsCount, 5))),
+        retainedRounds: turns.length - pastRound, fallback: pastRound < eligibleTurns.length ? '缺档或分组摘要跨入原文窗口，保留原文' : boundaryReason };
+}
+
+// Replace only the host's ephemeral chat-history array. Source chats, cards and presets remain native.
+export function buildChatHistoryReplacement(memory, fullChat, coreChat, settings, retrieved = [], primaryName = '', options = {}) {
+    const bound = options.bound || bindCoreHistory(coreChat, fullChat, options.canUseTools);
+    const sourceEnd = bound.reduce((max, item) => Number.isInteger(item.sourceIndex) ? Math.max(max, item.sourceIndex) : max, -1);
+    const generationEnd = options.generationEnd ?? sourceEnd;
+    const coverage = buildHistoryCoverage(memory, fullChat, settings, { ...options, generationEnd });
+    const { rawStart, selected, coveredRounds: pastRound } = coverage;
     // Other extensions' synthetic messages have no source position and must be retained.
-    const raw = bound.filter(item => !Number.isInteger(item.sourceIndex) || item.sourceIndex >= rawStart)
+    const raw = bound.filter(item => !Number.isInteger(item.sourceIndex) || item.sourceIndex >= rawStart
+        || fullChat[item.sourceIndex]?.extra?.suwei_auto_hide_opt_out
+        || (options.canUseTools && Array.isArray(item.message.extra?.tool_invocations)))
         .map(item => {
             const message = stripStateUpdateMessage(item.message, fullChat[item.sourceIndex]);
             return message === item.message ? item : { ...item, message };
@@ -147,8 +186,16 @@ export function buildChatHistoryReplacement(memory, fullChat, coreChat, settings
     events.sort((a, b) => a.position - b.position || a.sequence - b.sequence);
     const messages = events.map(event => event.message);
     const text = formatHistoryPreview(messages);
+    const injected = messages.filter(message => message.extra?.suwei_history);
     return { messages, text, tokens: estimatePromptTokens(text), rawStart, rawMessages: raw.length,
-        memoryMessages: messages.filter(message => message.extra?.suwei_history).length,
+        rawTokens: estimatePromptTokens(formatHistoryPreview(raw.map(item => item.message))),
+        memoryMessages: injected.length,
+        memoryTokens: estimatePromptTokens(formatHistoryPreview(injected)),
+        coveredRounds: pastRound, generationEnd, keepRounds: coverage.keepRounds, retainedRounds: coverage.retainedRounds, fallback: coverage.fallback,
+        injections: events.filter(event => event.message.extra?.suwei_history).map(event => ({
+            text: event.message.mes, kind: event.message.extra.suwei_kind,
+            depth: raw.filter(item => (item.sourceIndex ?? item.order + 0.01) > event.position).length,
+        })),
         retrieval: [
             ...details.filter(item => retrievedL0s.includes(item) && parseRoundRange(item.roundRange).end <= pastRound)
                 .map(item => ({ id: item.id, roundRange: item.roundRange,

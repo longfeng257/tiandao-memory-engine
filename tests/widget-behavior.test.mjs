@@ -8,6 +8,8 @@ import * as history from "../history-builder.js";
 import * as hostPrompt from "../host-prompt.js";
 import * as stateProtocol from "../state-protocol.js";
 import * as hostPersistence from "../host-persistence.js";
+import * as visibility from "../native-visibility.js";
+import * as bridge from "../prompt-bridge.js";
 import * as memoryBackup from "../memory-backup.js";
 import { createSummaryTaskGate } from "../task-gate.js";
 
@@ -29,7 +31,7 @@ function makeContext(id = "a") {
         setExtensionPrompt(_key, text) { this.injected = text; },
     };
 }
-function harness({ renderTimeline = false } = {}) {
+function harness({ renderTimeline = false, nativeSync = false, events = false } = {}) {
     let current = makeContext();
     const messages = [], readers = [];
     const nodes = new Map();
@@ -39,12 +41,28 @@ function harness({ renderTimeline = false } = {}) {
         readAsText() {}
         async complete(value) { this.result = value; await this.onload(); }
     }
-    const persisted = new Map();
+    const persisted = new Map(), persistedChats = new Map();
+    let nativeSaves = 0, swipeRefreshes = 0, readbacks = 0, readbackAvailable = true;
+    const listeners = new Map();
+    const eventTypes = Object.fromEntries(["CHAT_CHANGED", "GENERATION_STARTED", "GENERATION_ENDED", "GENERATION_STOPPED", "GENERATE_AFTER_DATA", "CHAT_COMPLETION_PROMPT_READY", "USER_MESSAGE_RENDERED", "CHARACTER_MESSAGE_RENDERED", "MESSAGE_EDITED", "MESSAGE_UPDATED", "MESSAGE_DELETED", "MESSAGE_SWIPED"].map(name => [name, name]));
+    const eventSource = { on(name, listener) { if (!listeners.has(name)) listeners.set(name, []); listeners.get(name).push(listener); },
+        async emit(name, ...args) { for (const listener of listeners.get(name) || []) await listener(...args); } };
     const installed = new WeakSet();
     const contextKey = ctx => JSON.stringify([ctx.characters?.[ctx.characterId]?.avatar, ctx.chatId]);
     const installStorage = ctx => {
         if (installed.has(ctx)) return;
         installed.add(ctx);
+        ctx.eventSource = eventSource; ctx.eventTypes = eventTypes;
+        ctx.extensionPrompts = {};
+        ctx.setExtensionPrompt = function(key, text, position, depth, scan, role) {
+            this.injected = text; this.extensionPrompts[key] = { value: text, position, depth, scan, role };
+        };
+        ctx.swipe = { refresh: () => { swipeRefreshes++; }, state: () => "none" };
+        if (nativeSync) ctx.saveChat = async () => {
+            nativeSaves++;
+            persisted.set(contextKey(ctx), structuredClone(ctx.chatMetadata));
+            persistedChats.set(contextKey(ctx), structuredClone(ctx.chat));
+        };
         if (!persisted.has(contextKey(ctx))) persisted.set(contextKey(ctx), structuredClone(ctx.chatMetadata));
         let saver = ctx.saveMetadata;
         Object.defineProperty(ctx, 'saveMetadata', { configurable: true, enumerable: true,
@@ -59,15 +77,17 @@ function harness({ renderTimeline = false } = {}) {
     };
     installStorage(current);
     const scope = vm.createContext({
-        ...engine, ...recovery, ...history, ...hostPrompt, ...stateProtocol, ...hostPersistence, ...memoryBackup, createSummaryTaskGate,
+        ...engine, ...recovery, ...history, ...hostPrompt, ...stateProtocol, ...hostPersistence, ...visibility, ...bridge, ...memoryBackup, createSummaryTaskGate,
         window: {}, SillyTavern: { getContext: () => current },
         document: { getElementById: id => nodes.get(id) || null },
         FileReader: Reader, confirm: () => true, console,
         fetch: async (url, options) => {
             const body = JSON.parse(options?.body || "{}");
             if (url === "/api/chats/get" || url === "/api/chats/group/get") {
+                readbacks++;
+                if (!readbackAvailable) throw Error("readback temporarily unavailable");
                 const key = JSON.stringify([body.avatar_url, body.file_name]);
-                return { ok: true, json: async () => [{ chat_metadata: structuredClone(persisted.get(key) || {}) }] };
+                return { ok: true, json: async () => [{ chat_metadata: structuredClone(persisted.get(key) || {}) }, ...structuredClone(persistedChats.get(key) || [])] };
             }
             return globalThis.fetch(url, options);
         },
@@ -75,9 +95,13 @@ function harness({ renderTimeline = false } = {}) {
     });
     scope.messages = messages;
     scope.renderTimeline = renderTimeline;
-    vm.runInContext(source + '\nconst nativeSyncHidden = syncHiddenMessagesState; updateFloatingWidgetUI = () => { if (renderTimeline) renderStoryTimeline(); }; renderRecoveryPoints = () => {}; if (!renderTimeline) renderStoryTimeline = () => {}; syncHiddenMessagesState = () => {}; updateStatusBar = text => messages.push(text); globalThis.api = { scanChatHistory, runStoryResummarize, resummarizeStoryRange, getPendingBacklog, buildResummarizePlan, resummarizeRoundInPlace, refreshLedgerFromLatestL0, enqueueLiveStateUpdates, processSingleAiTurn, refreshPromptInjection, retryPendingSummarySave, getPendingSummarySave, recoverPendingSummaries, renderStoryRecoveryState, invalidateActiveSummaryWork, syncLegacyHidden: nativeSyncHidden, interceptor: globalThis.tiandaoMemoryInterceptor, requestSummaryTaskStop, checkpointBeforeChange, importMemoryJsonFile, restoreSelectedRecovery, buildTimelineHtml, buildLedgerHtml, getLedgerFreshness, invalidateRoundIndexCache, updateTodoCompletion, deleteLedgerItem, memoryOperationBusy, clearCurrentChatMemory, saveStoryEntry: window.tiandaoSaveStoryEntry, preview: () => lastInjectionPreview, setScope: value => {storyMemoryScope=value}, setSearch: value => {storySearchQuery=value} };', scope);
+    scope.nativeSync = nativeSync; scope.registerEvents = events;
+    vm.runInContext(source + '\nconst nativeSyncHidden = syncHiddenMessagesState; updateFloatingWidgetUI = () => { if (renderTimeline) renderStoryTimeline(); }; renderRecoveryPoints = () => {}; if (!renderTimeline) renderStoryTimeline = () => {}; if (!nativeSync) syncHiddenMessagesState = () => {}; updateStatusBar = text => messages.push(text); globalThis.api = { scanChatHistory, runStoryResummarize, resummarizeStoryRange, getPendingBacklog, buildResummarizePlan, resummarizeRoundInPlace, refreshLedgerFromLatestL0, enqueueLiveStateUpdates, processSingleAiTurn, refreshPromptInjection, retryPendingSummarySave, getPendingSummarySave, recoverPendingSummaries, renderStoryRecoveryState, invalidateActiveSummaryWork, syncLegacyHidden: nativeSyncHidden, saveChatMemory, registerMemoryEvents, flushVisibility: () => visibilitySaveQueue, getCachedRoundIndex, interceptor: globalThis.tiandaoMemoryInterceptor, requestSummaryTaskStop, checkpointBeforeChange, importMemoryJsonFile, restoreSelectedRecovery, buildTimelineHtml, buildLedgerHtml, getLedgerFreshness, invalidateRoundIndexCache, updateTodoCompletion, deleteLedgerItem, memoryOperationBusy, clearCurrentChatMemory, saveStoryEntry: window.tiandaoSaveStoryEntry, preview: () => lastInjectionPreview, setScope: value => {storyMemoryScope=value}, setSearch: value => {storySearchQuery=value} }; if (registerEvents) registerMemoryEvents();', scope);
     return { api: scope.api, nodes, readers, messages, current: () => current, switchTo: value => { installStorage(value); current = value; },
         persist: value => persisted.set(contextKey(current), structuredClone(value || current.chatMetadata)),
+        emit: (name, ...args) => eventSource.emit(name, ...args), nativeSaves: () => nativeSaves, swipeRefreshes: () => swipeRefreshes,
+        persistedChat: () => persistedChats.get(contextKey(current)),
+        readbacks: () => readbacks, setReadbackAvailable: value => { readbackAvailable = value; },
     };
 }
 
@@ -524,6 +548,9 @@ test('embedding retrieval query also obeys outgoing regex exclusions', async t =
         return new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), { headers: { 'Content-Type': 'application/json' } });
     });
     await h.api.refreshPromptInjection();
+    assert.equal(bodies.length, 0, "cold-cache previews must not request embeddings");
+    const core = hostPrompt.preparePromptHistory(ctx.chat, text => ctx.getRegexedString(text));
+    await h.api.interceptor(core, 10000, () => assert.fail("unexpected abort"), "normal");
     assert.equal(bodies.length, 1);
     assert.match(bodies[0].input, /铜钥匙/);
     assert.doesNotMatch(bodies[0].input, /秘密|<options>/);
@@ -1366,4 +1393,356 @@ test('a preview failure after a confirmed range save preserves the archive and i
     assert.equal(ctx.chatMetadata.suwei_memory_recovery_v1.length, 1);
     assert.equal(h.api.getPendingSummarySave(), null);
     assert.ok(h.messages.some(message => message.includes('存档已保存，但预览刷新失败')));
+});
+
+function seedVisibilityChat(ctx, count = 8) {
+    ctx.chat.splice(0);
+    const memory = engine.createEmptyMemoryData();
+    for (let round = 1; round <= count; round++) {
+        ctx.chat.push({ is_user: true, mes: '真实提问' + round }, { is_user: false, mes: '真实剧情' + round });
+        memory.archivePool.push({ id: 'native-' + round, level: 0, roundRange: String(round), startMessageId: round * 2 - 2,
+            endMessageId: round * 2 - 1, text: '已保存事实' + round });
+    }
+    memory.levels[0] = memory.archivePool.slice(-3);
+    memory.lastProcessedMessageId = count * 2 - 1; memory.lastProcessedRound = count;
+    ctx.chatMetadata.tiandao_memory = memory;
+    Object.assign(ctx.extensionSettings['tiandao-memory-engine'], { autoHideOldMessages: true, keepRecentRoundsCount: 3,
+        autoSummarizePerTurn: false, enableRetrieval: false });
+    return memory;
+}
+
+test('real generation event hides safe floors, persists flags and 3→5 restores before host filtering', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+    seedVisibilityChat(ctx);
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    assert.equal(ctx.chat.filter(message => message.is_system).length, 10);
+    assert.equal(h.persistedChat().filter(message => message.extra?.tiandao_hidden).length, 10);
+    const firstSaves = h.nativeSaves();
+    await h.emit('GENERATION_STARTED', 'normal', {}, false);
+    assert.equal(h.nativeSaves(), firstSaves, 'idempotent generation must not save unchanged state');
+    ctx.extensionSettings['tiandao-memory-engine'].keepRecentRoundsCount = 5;
+    await h.emit('GENERATION_STARTED', 'normal', {}, false);
+    assert.equal(ctx.chat.filter(message => message.is_system).length, 6);
+    const core = hostPrompt.preparePromptHistory(ctx.chat, text => text);
+    assert.ok(core.some(message => message.mes === '真实提问4'));
+    assert.ok(core.some(message => message.mes === '真实剧情5'));
+    await h.api.interceptor(core, 32768, () => assert.fail('unexpected abort'), 'normal');
+    assert.equal(core.filter(message => message.extra?.suwei_kind === 'history').length, 1);
+    assert.ok(core.some(message => message.mes === '真实提问4'));
+});
+
+test('383-round screenshot regression keeps L1 selection, five raw rounds, tokens and ledger stable across reopen and cancelled reroll', async t => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+    const memory = seedVisibilityChat(ctx, 383);
+    const external = t.mock.method(globalThis, 'fetch', async () => assert.fail('preview requested an external API'));
+    ctx.extensionSettings['tiandao-memory-engine'].keepRecentRoundsCount = 5;
+    const phase = (level, start, end) => ({ id: 'screenshot-' + start, level, roundRange: start + '-' + end,
+        startMessageId: start * 2 - 2, endMessageId: end * 2 - 1, text: '阶段事实[' + start + '-' + end + ']' });
+    memory.levels[3] = [phase(3, 1, 125), phase(3, 126, 250)];
+    memory.levels[1] = [[251, 275], [276, 300], [301, 325], [326, 350], [351, 370]]
+        .map(([start, end]) => phase(1, start, end));
+    memory.archivePool = memory.archivePool.slice(0, 379);
+    memory.levels[0] = memory.archivePool.slice(-9);
+    memory.lastProcessedRound = 379; memory.lastProcessedMessageId = 757;
+    memory.stateLedger.time = '第383轮的真实状态';
+    engine.recordStateLedger(memory, { endMessageId: 765, roundNumber: 383 }, memory.stateLedger);
+    const sourceBodies = ctx.chat.map(message => message.mes);
+    // Prime the reused array cache with an earlier archive before loading the full saved chat.
+    const completeChat = ctx.chat.slice(); ctx.chat.splice(600);
+    h.api.getCachedRoundIndex(ctx.chat);
+    ctx.chat.splice(0, ctx.chat.length, ...completeChat);
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    const stable = h.api.preview();
+    assert.equal(stable.coveredRounds, 378);
+    assert.equal(stable.rawMessages, 10);
+    assert.match(stable.text, /阶段事实\[301-325\]/);
+    for (let round = 301; round <= 325; round++) assert.doesNotMatch(stable.text, new RegExp('已保存事实' + round + '(?![0-9])'));
+    for (let round = 371; round <= 378; round++) assert.match(stable.text, new RegExp('已保存事实' + round + '(?![0-9])'));
+    assert.equal(ctx.chat.filter(message => !message.is_system).length, 10);
+    const freshness = h.api.getLedgerFreshness(memory);
+    assert.equal(freshness.latestRound, 383); assert.equal(freshness.snapshotRound, 383); assert.equal(freshness.stale, false);
+    await h.emit('GENERATION_STARTED', 'normal', {}, false);
+    const core = hostPrompt.preparePromptHistory(ctx.chat, text => text);
+    await h.api.interceptor(core, 32768, () => assert.fail('unexpected abort'), 'normal');
+    assert.equal(h.api.preview().text, stable.text);
+    assert.equal(h.api.preview().tokens, stable.tokens);
+    await h.emit('GENERATE_AFTER_DATA', {}, false);
+    let swipeState = 'none'; ctx.swipe.state = () => swipeState;
+    for (const dryRun of [true, false]) {
+        swipeState = 'swiping';
+        await h.emit('GENERATION_STARTED', 'swipe', {}, dryRun);
+        if (!dryRun) {
+            const swipeCore = hostPrompt.preparePromptHistory(ctx.chat, text => text, 'swipe');
+            await h.api.interceptor(swipeCore, 32768, () => assert.fail('unexpected swipe abort'), 'swipe');
+        }
+        assert.doesNotMatch(h.api.preview().text, /真实剧情383/);
+        await h.emit('GENERATION_STOPPED');
+        swipeState = 'none';
+        await new Promise(resolve => setTimeout(resolve, 80)); await h.api.flushVisibility();
+        assert.equal(h.api.preview().text, stable.text);
+        assert.equal(h.api.preview().tokens, stable.tokens);
+        assert.equal(h.api.getLedgerFreshness(memory).stale, false);
+    }
+    const restored = makeContext(ctx.chatId);
+    restored.chat = structuredClone(h.persistedChat());
+    restored.chatMetadata = structuredClone(ctx.chatMetadata);
+    restored.extensionSettings = structuredClone(ctx.extensionSettings);
+    h.switchTo(restored);
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    assert.equal(h.api.preview().text, stable.text);
+    assert.equal(h.api.preview().tokens, stable.tokens);
+    assert.equal(h.api.preview().rawMessages, 10);
+    assert.equal(h.api.getLedgerFreshness(restored.chatMetadata.tiandao_memory).stale, false);
+    assert.deepEqual(restored.chat.map(message => message.mes), sourceBodies);
+    assert.equal(external.mock.callCount(), 0);
+});
+
+test('same chat array reloaded with the same length has the correct first preview and opening window', async () => {
+    const h = harness({ nativeSync: true, events: true }), a = h.current();
+    seedVisibilityChat(a); await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    const reused = a.chat, b = makeContext('b'); seedVisibilityChat(b);
+    b.chat.unshift({ is_user: false, mes: '新存档开场白' }); b.chat.pop();
+    b.chatMetadata.tiandao_memory = engine.createEmptyMemoryData();
+    reused.splice(0, reused.length, ...b.chat); b.chat = reused;
+    h.switchTo(b); await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    assert.equal(h.api.preview().chatKey, 'b');
+    assert.equal(h.api.preview().coveredRounds, 0);
+    assert.equal(h.api.getCachedRoundIndex(reused).aiTurns.length, 7);
+    assert.equal(h.api.getCachedRoundIndex(reused).openingIndex, 0);
+    assert.equal(h.api.preview().rawMessages, 16);
+    assert.match(h.api.preview().text, /新存档开场白/);
+});
+
+test('deleting a saved summary restores missing raw floors before the next dry-run', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+    const memory = seedVisibilityChat(ctx); await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    memory.archivePool = memory.archivePool.filter(item => item.roundRange !== '3');
+    await h.emit('GENERATION_STARTED', 'normal', {}, true);
+    assert.equal(ctx.chat.filter(message => message.is_system).length, 4);
+    assert.equal(h.api.preview().rawMessages, 12);
+    assert.match(h.api.preview().text, /真实提问3/);
+    assert.match(h.api.preview().fallback, /缺档/);
+});
+
+test('dry-run without a prompt injection interface restores raw history before host filtering', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+    seedVisibilityChat(ctx);
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    assert.equal(ctx.chat.filter(message => message.is_system).length, 10);
+    delete ctx.setExtensionPrompt;
+    await h.emit('GENERATION_STARTED', 'normal', {}, true);
+    await h.api.flushVisibility();
+    assert.equal(ctx.chat.filter(message => message.extra?.tiandao_hidden).length, 0);
+    assert.equal(hostPrompt.preparePromptHistory(ctx.chat, text => text).length, 16);
+    assert.equal(h.api.preview().rawMessages, 16);
+    assert.equal(h.api.preview().coveredRounds, 0);
+    assert.ok(!Object.keys(ctx.extensionPrompts).some(key => key.startsWith('suwei_dry_run_')));
+    assert.ok(h.persistedChat().every(message => !message.is_system));
+});
+
+test('cold-cache dry-runs inject memory once and normal generation clears the bridge without extra API work', async t => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+    seedVisibilityChat(ctx);
+    Object.assign(ctx.extensionSettings['tiandao-memory-engine'], { enableRetrieval: true, useEmbeddingApi: true,
+        vectorRawMemory: true, embeddingApiUrl: 'https://must-not-call.invalid/v1', embeddingApiKey: 'test' });
+    const external = t.mock.method(globalThis, 'fetch', async () => assert.fail('preview called an external API'));
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    for (let run = 0; run < 2; run++) {
+        await h.emit('GENERATION_STARTED', 'normal', {}, true);
+        const prompts = Object.entries(ctx.extensionPrompts).filter(([key, value]) => key.startsWith('suwei_dry_run_') && value.value);
+        assert.equal(prompts.length, 1);
+        assert.equal(prompts[0][1].depth, 6);
+        assert.equal(prompts[0][1].value.split('已保存事实1').length - 1, 1);
+    }
+    const dryText = h.api.preview().text;
+    await h.emit('GENERATION_STARTED', 'normal', {}, false);
+    assert.ok(!Object.keys(ctx.extensionPrompts).some(key => key.startsWith('suwei_dry_run_')));
+    const core = hostPrompt.preparePromptHistory(ctx.chat, text => text);
+    // Sending may perform its existing optional vector query; compare the shared coverage with retrieval disabled.
+    ctx.extensionSettings['tiandao-memory-engine'].enableRetrieval = false;
+    await h.api.interceptor(core, 32768, () => assert.fail('unexpected abort'), 'normal');
+    assert.equal(h.api.preview().text, dryText);
+    assert.equal(external.mock.callCount(), 0);
+});
+
+test('manual native hides and visible opt-outs are persisted and survive repeated sync', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+    seedVisibilityChat(ctx); ctx.chat[14].is_system = true;
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    ctx.chat[2].is_system = false;
+    await h.emit('GENERATION_STARTED', 'normal', {}, false);
+    assert.equal(ctx.chat[2].extra.suwei_auto_hide_opt_out, true);
+    assert.equal(h.persistedChat()[2].extra.suwei_auto_hide_opt_out, true);
+    ctx.extensionSettings['tiandao-memory-engine'].enabled = false;
+    h.api.syncLegacyHidden(); await h.api.flushVisibility();
+    assert.equal(ctx.chat[14].is_system, true);
+    assert.ok(ctx.chat.slice(0, 14).every(message => !message.is_system));
+});
+
+test('cancelled swipe preview waits for the host to restore the actual selected reply', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+    seedVisibilityChat(ctx); await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    const stable = h.api.preview().text;
+    let state = 'swiping'; ctx.swipe.state = () => state;
+    await h.emit('GENERATION_STARTED', 'swipe', {}, true);
+    assert.doesNotMatch(h.api.preview().text, /真实剧情8/);
+    await h.emit('GENERATION_STOPPED');
+    await new Promise(resolve => setTimeout(resolve, 10));
+    ctx.chat.at(-1).mes = '真实剧情8'; state = 'none';
+    await new Promise(resolve => setTimeout(resolve, 80));
+    await h.api.flushVisibility();
+    assert.equal(h.api.preview().text, stable);
+    assert.ok(!Object.keys(ctx.extensionPrompts).some(key => key.startsWith('suwei_dry_run_')));
+});
+
+test('native visibility save failure restores newly hidden floors and reports unconfirmed state', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+    seedVisibilityChat(ctx); ctx.saveChat = async () => false;
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    assert.ok(ctx.chat.every(message => !message.is_system));
+    assert.ok(h.messages.some(message => /隐藏状态保存失败/.test(message)));
+});
+
+
+test('unknown visibility saves retry readback without resaving unchanged messages', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+    seedVisibilityChat(ctx); h.setReadbackAvailable(false);
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    const saves = h.nativeSaves(), reads = h.readbacks();
+    assert.ok(saves > 0);
+    assert.ok(h.messages.some(message => message.includes('隐藏状态保存未确认')));
+    h.setReadbackAvailable(true);
+    h.api.syncLegacyHidden(); await h.api.flushVisibility();
+    assert.equal(h.nativeSaves(), saves);
+    assert.equal(h.readbacks(), reads + 1);
+    h.api.syncLegacyHidden(); await h.api.flushVisibility();
+    assert.equal(h.readbacks(), reads + 1, 'confirmed visibility must need no further readback');
+    assert.equal(h.persistedChat().filter(message => message.extra?.tiandao_hidden).length, 10);
+});
+
+test('new summary drafts cannot hide raw floors until their source metadata save is confirmed', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+    const memory = seedVisibilityChat(ctx);
+    const round3 = memory.archivePool.find(item => item.roundRange === '3');
+    memory.archivePool = memory.archivePool.filter(item => item !== round3);
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    assert.equal(h.api.preview().coveredRounds, 2);
+    memory.archivePool.push(round3);
+    await h.emit('GENERATION_STARTED', 'normal', {}, true);
+    assert.equal(h.api.preview().coveredRounds, 2);
+    assert.equal(ctx.chat.filter(message => message.is_system).length, 4);
+    await h.api.saveChatMemory();
+    await h.emit('GENERATION_STARTED', 'normal', {}, true);
+    assert.equal(h.api.preview().coveredRounds, 5);
+    assert.equal(ctx.chat.filter(message => message.is_system).length, 10);
+});
+
+test('a native save finishing after same-array chat reuse never rolls old hidden patches into the new chat', async () => {
+    const h = harness({ nativeSync: true, events: true }), a = h.current(); seedVisibilityChat(a);
+    let release, started;
+    const gate = new Promise(resolve => { release = resolve; });
+    const entered = new Promise(resolve => { started = resolve; });
+    let savedTarget;
+    a.saveChat = async () => { started(); await gate; savedTarget = h.current().chatId; };
+    await h.emit('CHAT_CHANGED'); await entered;
+    const b = makeContext('b');
+    a.chat.splice(0, a.chat.length, ...b.chat); b.chat = a.chat;
+    h.switchTo(b); await h.emit('CHAT_CHANGED');
+    const before = JSON.stringify(b.chat);
+    release(); await h.api.flushVisibility();
+    assert.equal(savedTarget, 'b', 'native conditional save reads active globals after its wait');
+    assert.equal(JSON.stringify(b.chat), before);
+    assert.equal(h.api.preview().chatKey, 'b');
+    assert.ok(b.chat.every(message => !message.extra?.tiandao_hidden));
+});
+
+test('a deferred preview from A cannot publish after A→B→A with the same file name', async () => {
+    const h = harness({ nativeSync: true, events: true }), a = h.current(); seedVisibilityChat(a);
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    const work = h.api.refreshPromptInjection();
+    const b = makeContext(a.chatId); b.characters[0].avatar = 'other-character.png';
+    h.switchTo(b); await h.emit('CHAT_CHANGED');
+    h.switchTo(a); const back = h.emit('CHAT_CHANGED');
+    assert.equal(await work, null);
+    await back; await h.api.flushVisibility();
+    assert.equal(h.api.preview().coveredRounds, 5);
+});
+
+test('the host range interface is preferred without a duplicate fallback save', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current(); seedVisibilityChat(ctx);
+    const save = ctx.saveChat, calls = [];
+    ctx.hideChatMessageRange = async (start, end, unhide) => { calls.push([start, end, unhide]); await save(); };
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    assert.deepEqual(calls, [[0, 9, false]]);
+    assert.equal(h.nativeSaves(), 1);
+    assert.equal(h.persistedChat()[0].extra.tiandao_hidden, true);
+});
+
+
+test('a gap opening after host filtering aborts instead of silently dropping newly required raw floors', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+    const memory = seedVisibilityChat(ctx); await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    await h.emit('GENERATION_STARTED', 'normal', {}, false);
+    const core = hostPrompt.preparePromptHistory(ctx.chat, text => text);
+    memory.archivePool = memory.archivePool.filter(item => item.roundRange !== '3');
+    h.api.syncLegacyHidden(); await h.api.flushVisibility();
+    let aborted = false;
+    await h.api.interceptor(core, 32768, () => { aborted = true; }, 'normal');
+    assert.equal(aborted, true);
+    assert.ok(h.messages.some(message => /原文窗口.*发生变化/.test(message)));
+    assert.equal(ctx.chat[4].is_system, false);
+});
+
+for (const change of ['disable replacement', 'expand recent rounds']) {
+    test('dry-run rejects stale injection after settings change: ' + change, async () => {
+        const h = harness({ nativeSync: true, events: true }), ctx = h.current();
+        seedVisibilityChat(ctx); await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+        await h.emit('GENERATION_STARTED', 'normal', {}, true);
+        assert.ok(Object.keys(ctx.extensionPrompts).some(key => key.startsWith('suwei_dry_run_')));
+        if (change === 'disable replacement') {
+            ctx.extensionSettings['tiandao-memory-engine'].autoHideOldMessages = false;
+            await h.api.refreshPromptInjection();
+            assert.ok(!Object.keys(ctx.extensionPrompts).some(key => key.startsWith('suwei_dry_run_')));
+            assert.ok(ctx.chat.every(message => !message.extra?.tiandao_hidden));
+        } else ctx.extensionSettings['tiandao-memory-engine'].keepRecentRoundsCount = 5;
+        await assert.rejects(h.emit('CHAT_COMPLETION_PROMPT_READY', { dryRun: true }), /设置已变化/);
+        assert.ok(!Object.keys(ctx.extensionPrompts).some(key => key.startsWith('suwei_dry_run_')));
+    });
+}
+
+test('late dry-run prompt assembly rejects a preparation invalidated by a content edit', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current(); seedVisibilityChat(ctx);
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    await h.emit('GENERATION_STARTED', 'normal', {}, true);
+    h.api.invalidateActiveSummaryWork('正文编辑');
+    await assert.rejects(h.emit('CHAT_COMPLETION_PROMPT_READY', { dryRun: true }), /已变化/);
+    assert.ok(!Object.keys(ctx.extensionPrompts).some(key => key.startsWith('suwei_dry_run_')));
+});
+
+
+test('a gap repaired before host filtering uses the new native visibility mapping without losing source rounds', async () => {
+    const h = harness({ nativeSync: true, events: true }), ctx = h.current(), memory = seedVisibilityChat(ctx);
+    const round3 = memory.archivePool.find(item => item.roundRange === '3');
+    memory.archivePool = memory.archivePool.filter(item => item !== round3);
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
+    await h.emit('GENERATION_STARTED', 'normal', {}, false);
+    memory.archivePool.push(round3); await h.api.saveChatMemory();
+    h.api.syncLegacyHidden(); await h.api.flushVisibility();
+    const core = hostPrompt.preparePromptHistory(ctx.chat, text => text);
+    await h.api.interceptor(core, 32768, () => assert.fail('unexpected abort'), 'normal');
+    assert.equal(h.api.preview().coveredRounds, 5);
+    assert.equal(h.api.preview().rawMessages, 6);
+    assert.match(h.api.preview().text, /已保存事实3/);
+    assert.ok(core.some(message => message.mes === '真实提问6'));
+    assert.ok(core.some(message => message.mes === '真实剧情8'));
+});
+
+test('a late interceptor cannot apply an old chat generation after switching characters', async () => {
+    const h = harness({ nativeSync: true, events: true }), a = h.current(); seedVisibilityChat(a);
+    await h.emit('CHAT_CHANGED'); await h.api.flushVisibility(); await h.emit('GENERATION_STARTED', 'normal', {}, false);
+    const core = hostPrompt.preparePromptHistory(a.chat, text => text);
+    const b = makeContext('b'); h.switchTo(b); await h.emit('CHAT_CHANGED');
+    let aborted = false;
+    await h.api.interceptor(core, 32768, () => { aborted = true; }, 'normal');
+    assert.equal(aborted, true); assert.equal(h.api.preview().chatKey, 'b');
 });

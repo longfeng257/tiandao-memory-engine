@@ -6,9 +6,7 @@ const clone = value => JSON.parse(JSON.stringify(value));
 
 // Auto-hiding changes is_system, but does not change the underlying story.
 export function recoveryChatSignature(chat) {
-    return buildChatMessageFingerprint((chat || []).map(message => message?.extra?.tiandao_hidden
-        ? { ...message, is_system: false }
-        : message)).join("\n");
+    return buildChatMessageFingerprint(chat || [], true).join("\n");
 }
 
 export function createRecoveryPoint(memory, chat, label, now = Date.now()) {

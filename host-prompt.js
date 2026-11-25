@@ -22,9 +22,9 @@ export function isStoryMessage(message, includeNativeHidden = false) {
     return Boolean(message && (!message.is_system || message.extra?.tiandao_hidden || includeNativeHidden));
 }
 
-export function createPromptTextReader(chat, processText, generationType = '', includeNativeHidden = false) {
+export function createPromptTextReader(chat, processText, generationType = '', includeNativeHidden = false, canUseTools = true) {
     const visible = chat.map((message, index) => ({ message, index }))
-        .filter(({ message }) => message && (!message.is_system || Array.isArray(message.extra?.tool_invocations)));
+        .filter(({ message }) => message && (!message.is_system || (canUseTools && Array.isArray(message.extra?.tool_invocations))));
     const excludedIndex = generationType === 'swipe' ? visible.pop()?.index : undefined;
     const depthByIndex = new Map(visible.map(({ index }, position) =>
         [index, visible.length - position - (generationType === 'continue' ? 2 : 1)]));
@@ -45,10 +45,10 @@ export function createPromptTextReader(chat, processText, generationType = '', i
     };
 }
 
-export function preparePromptHistory(chat, processText, generationType = '') {
-    const read = createPromptTextReader(chat, processText, generationType);
+export function preparePromptHistory(chat, processText, generationType = '', canUseTools = true) {
+    const read = createPromptTextReader(chat, processText, generationType, false, canUseTools);
     const visible = chat.map((message, sourceIndex) => ({ message, sourceIndex }))
-        .filter(({ message }) => message && (!message.is_system || Array.isArray(message.extra?.tool_invocations)));
+        .filter(({ message }) => message && (!message.is_system || (canUseTools && Array.isArray(message.extra?.tool_invocations))));
     if (generationType === 'swipe') visible.pop();
     return visible.map(({ message, sourceIndex }, index) => ({ ...message, index, mes: read(sourceIndex) }));
 }

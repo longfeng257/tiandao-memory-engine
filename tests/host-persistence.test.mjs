@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { saveAndVerifyChatMetadata, readPersistedFields, CHAT_PERSISTENCE_STATUS } from "../host-persistence.js";
+import { saveAndVerifyChatMetadata, readPersistedFields, saveAndVerifyChatMessages, CHAT_PERSISTENCE_STATUS } from "../host-persistence.js";
+
+import { visibilitySnapshot } from "../native-visibility.js";
 
 function context({ group = false } = {}) {
     return {
@@ -141,4 +143,47 @@ test("save verification freezes its readback route before awaiting a native save
     });
     assert.equal(result.status, CHAT_PERSISTENCE_STATUS.confirmed);
     assert.deepEqual(request, { url: "/api/chats/get", body: { avatar_url: "traveler.png", file_name: "chat-file-1" } });
+});
+
+for (const format of ['header', 'plain', 'wrapped', 'group']) {
+    test('message visibility readback verifies full ownership and source identity: ' + format, async () => {
+        const ctx = context({ group: format === 'group' });
+        const message = { is_user: false, mes: '来源正文', is_system: true, swipe_id: 2, extra: { tiandao_hidden: true } };
+        let saved = false;
+        const records = format === 'plain' ? [message] : format === 'wrapped' ? { chat: [message] } : [{ chat_metadata: {} }, message];
+        const result = await saveAndVerifyChatMessages(ctx, [visibilitySnapshot(message, 0)], async () => { saved = true; }, async () => jsonResponse(records));
+        assert.ok(saved); assert.equal(result.status, CHAT_PERSISTENCE_STATUS.confirmed);
+    });
+}
+for (const defect of ['metadata-only', 'missing-owner', 'wrong-text', 'wrong-swipe', 'deleted-optout']) {
+    test('message persistence refuses ' + defect, async () => {
+        const expected = { is_user: false, mes: '原始正文', is_system: true, swipe_id: 0, extra: { tiandao_hidden: true, suwei_auto_hide_opt_out: true } };
+        const actual = structuredClone(expected);
+        if (defect === 'missing-owner') delete actual.extra.tiandao_hidden;
+        if (defect === 'wrong-text') actual.mes = '相同下标其他消息';
+        if (defect === 'wrong-swipe') actual.swipe_id = 1;
+        if (defect === 'deleted-optout') delete actual.extra.suwei_auto_hide_opt_out;
+        const records = [{ chat_metadata: {} }, ...(defect === 'metadata-only' ? [] : [actual])];
+        const result = await saveAndVerifyChatMessages(context(), [visibilitySnapshot(expected, 0)], async () => {}, async () => jsonResponse(records));
+        assert.equal(result.status, CHAT_PERSISTENCE_STATUS.failed);
+    });
+}
+
+test('message save freezes its route and expected fields before a native wait', async () => {
+    const ctx = context();
+    const original = { is_user: true, mes: '固定来源', is_system: true, extra: { tiandao_hidden: true } };
+    const expected = [visibilitySnapshot(original, 0)];
+    let request;
+    const result = await saveAndVerifyChatMessages(ctx, expected, async () => {
+        ctx.getCurrentChatId = () => 'other-file'; ctx.characters[0].avatar = 'other.png';
+        expected[0].tiandao_hidden = false;
+    }, async (url, options) => { request = JSON.parse(options.body); return jsonResponse([{ chat_metadata: {} }, original]); });
+    assert.equal(result.status, CHAT_PERSISTENCE_STATUS.confirmed);
+    assert.deepEqual(request, { avatar_url: 'traveler.png', file_name: 'chat-file-1' });
+});
+
+test('message saves switched during the native wait stay unknown without reading another chat', async () => {
+    let active = true, reads = 0;
+    const result = await saveAndVerifyChatMessages(context(), [], async () => { active = false; }, async () => { reads++; }, () => active);
+    assert.equal(result.status, CHAT_PERSISTENCE_STATUS.unknown); assert.equal(reads, 0);
 });
