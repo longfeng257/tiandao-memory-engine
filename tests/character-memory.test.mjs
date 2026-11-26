@@ -153,7 +153,7 @@ test('independent extraction and the embedded response protocol use the same gro
     globalThis.fetch = async (_url, options) => {
         requests++;
         const system = JSON.parse(options.body).messages[0].content;
-        assert.match(system, /growth/); assert.match(system, /重大事件本身/); assert.match(system, /有名字也不等于重要/);
+        assert.match(system, /growth/); assert.match(system, /重大事件本身/); assert.match(system, /有名字不自动等于重要/); assert.match(system, /addressingEvidence/); assert.match(system, /locationEvidence/);
         return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(payload) } }] }), { status: 200 });
     };
     try {
@@ -174,6 +174,18 @@ test('injection carries its own continuity guidance, facts, scope, and source ro
     assert.ok(prompt.indexOf('溯微角色连续性演绎') < prompt.indexOf('<tiandao_memory_system>'));
     assert.equal((prompt.match(/<\/tiandao_memory_system>/g) || []).length, 1);
     assert.match(buildNarrativeStoryView(memory), /长期成长/);
+});
+
+test('narrative view separates current wear, carried props and removed wearables', () => {
+    const memory = createEmptyMemoryData();
+    memory.stateLedger = mergeStateLedger({}, { characters: { 苏晚: actor({
+        wear: '深灰色西装', inventory: ['铜钥匙'], removedItemsLock: ['黑色外套（已脱下搭在椅背）'],
+    }) } }, 4);
+    const view = buildNarrativeStoryView(memory);
+    assert.match(view, /当前衣着: 深灰色西装/);
+    assert.match(view, /随身道具: 铜钥匙/);
+    assert.match(view, /已脱下\/摘下记录: 黑色外套/);
+    assert.doesNotMatch(view, /随身道具: [^\n]*黑色外套/);
 });
 
 test('history places the growth snapshot before newer raw changes and excludes a discarded future reply', () => {
@@ -261,4 +273,56 @@ test('a combined independent L0 returns growth in the existing single request', 
         assert.equal(memory.stateLedger.characters.苏晚.growth[0].sourceRound, 1);
         assert.equal(memory.archivePool[0].postStateSnapshot.characters.苏晚.growth[0].sourceRound, 1);
     } finally { globalThis.fetch = originalFetch; }
+});
+
+
+test('off-screen supporting relatives retain durable location facts and identity continuity', () => {
+    const ledger = mergeStateLedger({}, { characters: {
+        母亲: actor({ importance: 'supporting', importanceReason: '主角的母亲；原文明示居住香港，后续家庭线会引用', named: false,
+            location: '香港', locationEvidence: '母亲一直住在香港。' }),
+    } }, 3);
+    assert.ok(ledger.characters.母亲, 'a durable off-screen relationship is retained');
+    assert.equal(ledger.characters.母亲.location, '香港');
+    assert.equal(ledger.characters.母亲.locationRound, 3);
+
+    const prompt = buildInjectedMemoryPrompt({ stateLedger: ledger }, [], '', { snapshotRound: 3 });
+    assert.match(prompt, /母亲/);
+    assert.match(prompt, /香港/);
+    assert.match(prompt, /依据第 3 轮：母亲一直住在香港/);
+});
+
+test('source-backed locations and forms of address resist unsupported drift but accept explicit plot changes', () => {
+    let ledger = mergeStateLedger({}, { characters: {
+        少爷: actor({ importance: 'core', importanceReason: '持续主线人物',
+            location: '香港', locationEvidence: '少爷目前住在香港。',
+            addressing: '少爷自称「本少爷」；手下阿策称少爷「少爷」',
+            addressingEvidence: '阿策说：「少爷，车已备好。」' }),
+    } }, 5);
+    assert.equal(ledger.characters.少爷.locationRound, 5);
+    assert.equal(ledger.characters.少爷.addressingRound, 5);
+
+    ledger = mergeStateLedger(ledger, { characters: {
+        少爷: { location: '台湾', addressing: '少爷自称「老子」；手下阿策称其「家主」' },
+    } }, 30);
+    assert.equal(ledger.characters.少爷.location, '香港');
+    assert.equal(ledger.characters.少爷.addressing, '少爷自称「本少爷」；手下阿策称少爷「少爷」');
+    assert.equal(ledger.characters.少爷.locationRound, 5);
+    assert.equal(ledger.characters.少爷.addressingRound, 5);
+
+    ledger = mergeStateLedger(ledger, { characters: {
+        少爷: { location: '台湾', locationEvidence: '他已搬到台湾定居。',
+            addressing: '少爷改为自称「老子」；阿策改称其「家主」',
+            addressingEvidence: '阿策改口道：「家主，车已备好。」' },
+    } }, 31);
+    assert.equal(ledger.characters.少爷.location, '台湾');
+    assert.equal(ledger.characters.少爷.locationRound, 31);
+    assert.equal(ledger.characters.少爷.addressing, '少爷改为自称「老子」；阿策改称其「家主」');
+    assert.equal(ledger.characters.少爷.addressingRound, 31);
+
+    const prompt = buildInjectedMemoryPrompt({ stateLedger: ledger }, [], '', { snapshotRound: 31 });
+    assert.match(prompt, /稳定自称\/关系称呼/);
+    assert.match(prompt, /最近一次有依据/);
+    const view = buildNarrativeStoryView({ stateLedger: ledger });
+    assert.match(view, /台湾/);
+    assert.match(view, /老子/);
 });

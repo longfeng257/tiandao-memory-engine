@@ -973,7 +973,7 @@ test("history backfill saves in batches instead of after every round", async () 
     assert.equal(saves, 3);
 });
 
-test("history backfill creates configured multi-round L0 groups", async () => {
+test("history backfill creates complete configured multi-round L0 groups", async () => {
     const data = createEmptyMemoryData();
     const chat = [];
     for (let round = 1; round <= 7; round++) {
@@ -1007,9 +1007,41 @@ test("history backfill creates configured multi-round L0 groups", async () => {
         "角色",
     );
 
-    assert.equal(result.processedCount, 7);
-    assert.equal(calls, 3);
-    assert.deepEqual(data.archivePool.map(item => item.roundRange), ["1-3", "4-6", "7"]);
+    assert.equal(result.processedCount, 6);
+    assert.equal(calls, 2);
+    assert.deepEqual(data.archivePool.map(item => item.roundRange), ["1-3", "4-6"]);
+    assert.equal(data.lastProcessedMessageId, 11);
+});
+
+test("history backfill leaves a partial five-round batch raw until it is complete", async t => {
+    const data = createEmptyMemoryData();
+    const chat = [];
+    for (let round = 1; round <= 3; round++) {
+        chat.push({ is_user: true, mes: `玩家 ${round}` });
+        chat.push({ is_user: false, name: "角色", mes: `回复 ${round}` });
+    }
+    let calls = 0;
+    t.mock.method(globalThis, "fetch", async () => {
+        calls++;
+        return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+            l0_summary: "五轮合并摘要", keywords: [], stateLedger: {},
+        }) } }] }), { headers: { "Content-Type": "application/json" } });
+    });
+    const settings = { ...SETTINGS, l0RoundsPerSummary: 5 };
+    const first = await backfillExistingChatHistory(settings, data, chat, "玩家", "角色");
+    assert.equal(first.processedCount, 0);
+    assert.equal(calls, 0);
+    assert.equal(data.lastProcessedMessageId, -1);
+    assert.equal(data.archivePool.length, 0);
+
+    for (let round = 4; round <= 5; round++) {
+        chat.push({ is_user: true, mes: `玩家 ${round}` });
+        chat.push({ is_user: false, name: "角色", mes: `回复 ${round}` });
+    }
+    const second = await backfillExistingChatHistory(settings, data, chat, "玩家", "角色");
+    assert.equal(second.processedCount, 5);
+    assert.equal(calls, 1);
+    assert.deepEqual(data.archivePool.map(item => item.roundRange), ["1-5"]);
 });
 
 test("history backfill sends the card opening with the first real round", async () => {
@@ -3436,4 +3468,71 @@ test("runtime stats record reported usage and leave missing usage unknown", asyn
     assert.equal(after.promptTokens - before.promptTokens, 12);
     assert.equal(after.completionTokens - before.completionTokens, 7);
     assert.equal(after.usageUnknown - before.usageUnknown, 1);
+});
+
+
+test("current-state vector recall prefers source-backed recent location over an older superseded raw excerpt", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options = {}) => {
+        if (String(url).endsWith("/embeddings")) {
+            const body = JSON.parse(options.body);
+            const inputs = Array.isArray(body.input) ? body.input : [body.input];
+            return new Response(JSON.stringify({
+                data: inputs.map((_, index) => ({ index, embedding: [1, 0] })),
+            }), { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        throw new Error("unexpected fetch");
+    };
+    try {
+        const data = createEmptyMemoryData();
+        const chat = [
+            { is_user: true, mes: "" },
+            { is_user: false, mes: "苏晚的母亲一直住在香港。" },
+            { is_user: true, mes: "" },
+            { is_user: false, mes: "苏晚后来收到消息，母亲已搬到台湾，现在住在台湾。" },
+        ];
+        data.lastProcessedMessageId = 3;
+        data.archivePool.push({ id: "L0_r1-2", level: 0, roundRange: "1-2", startMessageId: 0, endMessageId: 3,
+            text: "母亲从香港迁居台湾。", keywords: ["母亲", "台湾"] });
+        data.stateLedger = mergeStateLedger({}, { characters: {
+            母亲: { importance: "supporting", importanceReason: "苏晚的母亲；有明确居住地并与后续家庭剧情相关", named: false,
+                location: "台湾", locationEvidence: "母亲已搬到台湾，现在住在台湾。" },
+        } }, 2);
+        const settings = {
+            enableRetrieval: true, retrievalTopK: 3, useEmbeddingApi: true, vectorRawMemory: true,
+            embeddingApiUrl: "https://temporal-location.invalid/v1", embeddingApiKey: "embed-key",
+            embeddingModel: "m-temporal",
+        };
+        assert.equal(await embedArchivedRawVectors(settings, data, chat), 2);
+        const roundIndex = { aiTurns: [{ idx: 1, round: 1 }, { idx: 3, round: 2 }] };
+
+        const currentDetails = [];
+        const current = await retrieveRelevantArchivedMemories(settings, data, "母亲现在住在哪里", { chat, roundIndex, allowNetwork: false, details: currentDetails });
+        assert.deepEqual(current.map(item => item.id), ["raw-3"]);
+        assert.match(current[0].text, /台湾/);
+
+        const historical = await retrieveRelevantArchivedMemories(settings, data, "母亲以前住在哪里", { chat, roundIndex });
+        assert.deepEqual(new Set(historical.map(item => item.id)), new Set(["raw-1", "raw-3"]));
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("current location retrieval suppresses summaries from before the latest source-backed update", async () => {
+    const data = createEmptyMemoryData();
+    data.archivePool.push(
+        { id: "old-hong-kong", level: 0, roundRange: "1", startMessageId: 1, endMessageId: 1,
+            text: "苏晚的母亲长期居住在香港。", keywords: ["母亲", "香港"] },
+        { id: "new-taiwan", level: 0, roundRange: "5", startMessageId: 9, endMessageId: 9,
+            text: "母亲已经搬到台湾定居。", keywords: ["母亲", "台湾"] },
+    );
+    data.stateLedger = mergeStateLedger({}, { characters: {
+        母亲: { importance: "supporting", importanceReason: "主角的母亲，居住地是后续剧情会引用的稳定信息", named: false,
+            location: "台湾", locationEvidence: "母亲已经搬到台湾定居。" },
+    } }, 5);
+    const settings = { enableRetrieval: true, retrievalTopK: 3, useEmbeddingApi: false, vectorRawMemory: false };
+    const current = await retrieveRelevantArchivedMemories(settings, data, "母亲现在住在哪里");
+    assert.deepEqual(current.map(item => item.id), ["new-taiwan"]);
+    const historical = await retrieveRelevantArchivedMemories(settings, data, "母亲以前住在哪里");
+    assert.deepEqual(new Set(historical.map(item => item.id)), new Set(["old-hong-kong", "new-taiwan"]));
 });

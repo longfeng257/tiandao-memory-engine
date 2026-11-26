@@ -397,6 +397,54 @@ test('editing the summarized source invalidates the unsaved candidate instead of
     assert.equal(calls(), 2);
 });
 
+test('editing an unarchived partial batch does not summarize before the configured L0 size', async t => {
+    const h = harness({ events: true }), ctx = h.current(), calls = mockSummary(t, h);
+    Object.assign(ctx.extensionSettings['tiandao-memory-engine'], {
+        autoSummarizePerTurn: true, l0RoundsPerSummary: 5, summarizeTiming: 'after_reply',
+    });
+    ctx.chat = Array.from({ length: 3 }, (_, i) => [
+        { is_user: true, mes: '玩家 ' + (i + 1) },
+        { is_user: false, mes: '回复 ' + (i + 1) },
+    ]).flat();
+    h.api.invalidateRoundIndexCache(ctx.chat);
+    ctx.chat[5].mes = '编辑后的第三轮回复';
+
+    await h.emit('MESSAGE_EDITED', 5);
+
+    assert.equal(calls(), 0);
+    assert.equal(ctx.chatMetadata.tiandao_memory.archivePool.length, 0);
+    assert.equal(ctx.chatMetadata.tiandao_memory.lastProcessedMessageId, -1);
+});
+
+test('history scan leaves a three-round tail raw when L0 is configured for five rounds', async t => {
+    const h = harness(), ctx = h.current(), calls = mockSummary(t, h);
+    Object.assign(ctx.extensionSettings['tiandao-memory-engine'], {
+        autoSummarizePerTurn: true, l0RoundsPerSummary: 5, l0MergeMode: 'auto',
+    });
+    ctx.chat = Array.from({ length: 3 }, (_, i) => [
+        { is_user: true, mes: '玩家 ' + (i + 1) },
+        { is_user: false, mes: '回复 ' + (i + 1) },
+    ]).flat();
+    h.api.invalidateRoundIndexCache(ctx.chat);
+
+    await h.api.scanChatHistory({ innerHTML: '' });
+
+    const memory = ctx.chatMetadata.tiandao_memory;
+    assert.equal(calls(), 0);
+    assert.equal(memory.archivePool.length, 0);
+    assert.equal(memory.lastProcessedMessageId, -1);
+    assert.match(h.messages.at(-1), /3\/5 轮未归档/);
+
+    for (let round = 4; round <= 5; round++) {
+        ctx.chat.push({ is_user: true, mes: '玩家 ' + round }, { is_user: false, mes: '回复 ' + round });
+    }
+    h.api.invalidateRoundIndexCache(ctx.chat);
+    await h.api.scanChatHistory({ innerHTML: '' });
+
+    assert.equal(calls(), 1);
+    assert.deepEqual(memory.archivePool.map(item => item.roundRange), ['1-5']);
+});
+
 test('failed generated save after switching chats rolls back only the original and can be retried there', async t => {
     const h = harness(), calls = mockSummary(t, h), original = h.current();
     let reject;
@@ -1058,6 +1106,22 @@ test("character growth renders inside the existing card with escaped facts and s
     assert.match(html, /铜钥匙/);
 });
 
+test("wear and removed clothing stay separate from carried props", () => {
+    const h = harness();
+    const person = h.current().chatMetadata.tiandao_memory.stateLedger.characters.旅人;
+    person.wear = "深灰色西装";
+    person.inventory = ["铜钥匙"];
+    person.removedItemsLock = ["黑色外套（已脱下搭在椅背）"];
+    const html = h.api.buildLedgerHtml(h.current().chatMetadata.tiandao_memory);
+    const propsStart = html.indexOf("<b>随身道具</b>");
+    const removedStart = html.indexOf("已脱下/摘下记录");
+    assert.match(html, /当前衣着<\/b>: 深灰色西装/);
+    assert.ok(propsStart >= 0 && removedStart > propsStart);
+    assert.match(html.slice(propsStart, removedStart), /铜钥匙/);
+    assert.doesNotMatch(html.slice(propsStart, removedStart), /黑色外套/);
+    assert.match(html.slice(removedStart), /黑色外套/);
+});
+
 test("a revealed name is displayed while card actions keep their stable storage key", () => {
  const h=harness();const memory=h.current().chatMetadata.tiandao_memory;
  memory.stateLedger.characters={戴面具的引路人:{canonicalName:'沈舟',aliases:[],inventory:['铜钥匙']}};
@@ -1453,9 +1517,13 @@ test('383-round screenshot regression keeps L1 selection, five raw rounds, token
     ctx.chat.splice(0, ctx.chat.length, ...completeChat);
     await h.emit('CHAT_CHANGED'); await h.api.flushVisibility();
     const stable = h.api.preview();
+    const timeline = h.api.buildTimelineHtml(memory);
     assert.equal(stable.coveredRounds, 378);
     assert.equal(stable.rawMessages, 10);
     assert.match(stable.text, /阶段事实\[301-325\]/);
+    for (const [start, end] of [[251, 275], [276, 300], [301, 325], [326, 350], [351, 370]]) {
+        assert.ok(timeline.includes(`阶段事实[${start}-${end}]`), `timeline includes L1 ${start}-${end}`);
+    }
     for (let round = 301; round <= 325; round++) assert.doesNotMatch(stable.text, new RegExp('已保存事实' + round + '(?![0-9])'));
     for (let round = 371; round <= 378; round++) assert.match(stable.text, new RegExp('已保存事实' + round + '(?![0-9])'));
     assert.equal(ctx.chat.filter(message => !message.is_system).length, 10);

@@ -40,7 +40,7 @@ test('state protocol parses data without changing source and rejects incomplete 
 
 test('protocol instructions are explicit about deltas, physical identity and continuation', () => {
     const prompt = buildStateUpdateInstruction(5, true);
-    for (const text of ['baseRound', '只返回变化字段', '物品不限条数', '续写', 'data-suwei-state']) assert.ok(prompt.includes(text));
+    for (const text of ['baseRound', '只返回变化字段', '物品不限条数', '衣物、鞋袜和佩戴饰品只记在 wear', '续写', 'data-suwei-state']) assert.ok(prompt.includes(text));
     assert.ok(prompt.includes('"baseRound":5'));
     assert.match(prompt, /<details hidden data-suwei-state="1">/);
 });

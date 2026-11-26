@@ -9,7 +9,7 @@ export { formatCharacterGrowth, characterDisplayName } from "./character-memory.
  *
  * 核心设计：
  * 1. 按“一问一答轮数 (Round)”进行叙事归档与时间线提炼（绝非生硬楼层，一问一答即为一轮）。
- * 2. 结构化人物物理状态账本：按在场各角色（不仅是 User）分别追踪：地点、状态与行动、衣着穿戴、已摘除饰品锁（防人设回滚）、随身道具。
+ * 2. 结构化人物物理状态账本：按在场各角色分别追踪地点、行动、当前穿戴、卸下记录与随身道具。
  * 3. 纯故事叙事时间线记忆金字塔：用时间跨度与叙事文本串联剧情（例如：第1轮某年某月某日上午发生…，第5轮某日晚上…），告别冰冷代码感。
  * 4. 重Roll回滚快照与存量断点续传。
  */
@@ -732,7 +732,7 @@ export function applyStateChanges(previous, payload, roundNumber = 0) {
         if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || !item.trim())) throw Error(label + '必须为非空文本数组');
         return value;
     };
-    const scalars = ['canonicalName', 'location', 'statusAndAction', 'wear', 'viewTarget', 'viewTargetVisible', 'present'];
+    const scalars = ['canonicalName', 'location', 'locationEvidence', 'addressing', 'addressingEvidence', 'statusAndAction', 'wear', 'viewTarget', 'viewTargetVisible', 'present'];
     const itemFields = ['inventoryAdd', 'inventoryRemove', 'removedItemsLockAdd', 'removedItemsLockRemove'];
     const chars = { ...(previous.characters || {}) };
     const knownChars = { ...chars };
@@ -3156,6 +3156,11 @@ function sanitizeStateDelta(delta, depth = 0, path = []) {
 }
 
 // Physical identity excludes mutable location/wearing annotations; latest state wins.
+// Parenthetical or colon-suffixed placement text ("挂于衣架"/"已脱下放在沙发上") is an
+// annotation, not a new object; colors, numbers and real names still distinguish items.
+const ITEM_STATE_CLAUSE = /(?:(?:已|尚未|未)(?:穿|戴|脱|摘|卸|佩)(?:着|戴|下)?|穿在身上|穿着|戴着|挂(?:在|于|到)|搭(?:在|于)|放(?:在|于|到)|置于|拎在|拿在|捧在|握在|夹在|携带|塞进|叠在|摆在|搁在|洗净|收起|存放|锁在|转移(?:至|到)|交给|归还给)/;
+const ITEM_STATE_PREFIX = /^(?:(?:已|尚未|未|刚|正在)?(?:穿在|穿着|戴在|戴着|脱下|摘下|卸下|挂在|挂于|搭在|搭于|放在|放于|置于|拎在|拿在|捧在|握在|夹在|携带|塞进|叠在|摆在|搁在|收起|存放|锁在|转移至|转移到|交给|归还给)[^，,。；;：:]{0,40}?的(?=[^，,。；;：:]))/;
+
 export function ledgerItemIdentity(value) {
     // Cache only this pure string transformation, never mutable ledgers or snapshots.
     const text = String(value ?? '');
@@ -3163,11 +3168,13 @@ export function ledgerItemIdentity(value) {
     if (cached !== undefined) return cached;
     const identity = text.normalize('NFKC').trim()
         .replace(/^(?:已摘下|已脱下|已卸下|未穿戴|未佩戴)[：:\s]*/, '')
+        .replace(ITEM_STATE_PREFIX, '')
         .replace(/\(([^()]*)\)/g, (match, detail) => {
             const clauses = detail.split(/[，,；;]/).map(part => part.trim()).filter(Boolean);
-            const identity = clauses.filter(part => !/(?:(?:已|尚未|未)(?:脱|摘|卸|穿|佩|戴|放|置|挂|交|归还|收|取下)|当前|现由|放在|放于|搭于|置于|捧在|拿在|交给|暂持|收起)/.test(part));
+            const identity = clauses.filter(part => !ITEM_STATE_CLAUSE.test(part));
             return identity.length === clauses.length ? match : (identity.length ? '(' + identity.join(',') + ')' : '');
         })
+        .replace(/[：:]([^：:]+)$/, (match, tail) => (ITEM_STATE_CLAUSE.test(tail) ? '' : match))
         .replace(/[\s，,。；;：:]+/g, '').toLowerCase();
     if (text.length <= 1000) {
         if (itemIdentityCache.size >= MAX_ITEM_IDENTITY_CACHE) itemIdentityCache.delete(itemIdentityCache.keys().next().value);
@@ -3213,8 +3220,13 @@ function normalizeStateLedger(value) {
                 {
                     ...normalizeCharacterMemory(info),
                     canonicalName: asString(info.canonicalName, name),
-                    aliases: normalizeStringList(info.aliases, 8).filter(alias => alias !== name),
+                    aliases: normalizeStringList(info.aliases, 8).filter(alias => alias !== name && !isGenericCharacterAlias(alias)),
                     location: asString(info.location, "未知位置"),
+                    locationEvidence: asString(info.locationEvidence, ""),
+                    locationRound: Math.max(0, numOr(info.locationRound, 0)),
+                    addressing: asString(info.addressing, ""),
+                    addressingEvidence: asString(info.addressingEvidence, "", 600),
+                    addressingRound: Math.max(0, numOr(info.addressingRound, 0)),
                     statusAndAction: asString(info.statusAndAction, "平静"),
                     wear: asString(info.wear, "日常衣着"),
                     viewTarget: asString(info.viewTarget, ""),
@@ -3427,7 +3439,7 @@ function mergeCharacterRecord(previousName, oldInfo, incoming, incomingName, rou
         oldCanonicalName,
         incomingName,
         previousName,
-    ])].filter(alias => alias && alias !== canonicalName);
+    ])].filter(alias => alias && alias !== canonicalName && !isGenericCharacterAlias(alias));
     const seenRound = numOr(roundNumber, 0);
     const present = incoming
         ? incoming.present !== false
@@ -3450,6 +3462,38 @@ function mergeCharacterRecord(previousName, oldInfo, incoming, incomingName, rou
             : numOr(oldInfo?.viewSeenRound, 0))
         : 0;
 
+    const previousLocation = asString(oldInfo?.location, "未知位置");
+    const hasLocation = Boolean(incoming && Object.prototype.hasOwnProperty.call(incoming, "location"));
+    const proposedLocation = hasLocation ? asString(incoming.location, previousLocation) : previousLocation;
+    const incomingLocationEvidence = asString(incoming?.locationEvidence, "", 500);
+    const locationChanged = hasLocation && proposedLocation !== previousLocation;
+    // Once a source-backed location exists, later summaries cannot silently replace it with a guess.
+    const hasEstablishedLocation = Boolean(asString(oldInfo?.locationEvidence, "", 500));
+    const acceptLocation = !locationChanged || Boolean(incomingLocationEvidence) || !hasEstablishedLocation;
+    const location = hasLocation && acceptLocation ? proposedLocation : previousLocation;
+    const previousLocationEvidence = asString(oldInfo?.locationEvidence, "", 500);
+    const locationEvidence = incomingLocationEvidence && acceptLocation
+        ? incomingLocationEvidence : previousLocationEvidence;
+    const locationEvidenceChanged = Boolean(incomingLocationEvidence && acceptLocation
+        && (locationChanged || incomingLocationEvidence !== previousLocationEvidence));
+    const locationRound = locationEvidenceChanged
+        ? numOr(roundNumber, numOr(oldInfo?.locationRound, 0)) : numOr(oldInfo?.locationRound, 0);
+    const previousAddressing = asString(oldInfo?.addressing, "", 500);
+    const hasAddressing = Boolean(incoming && Object.prototype.hasOwnProperty.call(incoming, "addressing"));
+    const proposedAddressing = hasAddressing ? asString(incoming.addressing, "", 500) : previousAddressing;
+    const incomingAddressingEvidence = asString(incoming?.addressingEvidence, "", 600);
+    const addressingChanged = hasAddressing && proposedAddressing !== previousAddressing;
+    // Keep established forms of address unless the current source contains explicit dialogue evidence.
+    const hasEstablishedAddressing = Boolean(oldInfo && previousAddressing);
+    const acceptAddressing = !addressingChanged || Boolean(incomingAddressingEvidence) || !hasEstablishedAddressing;
+    const addressing = hasAddressing && acceptAddressing ? proposedAddressing : previousAddressing;
+    const previousAddressingEvidence = asString(oldInfo?.addressingEvidence, "", 600);
+    const addressingEvidence = incomingAddressingEvidence && acceptAddressing
+        ? incomingAddressingEvidence : previousAddressingEvidence;
+    const addressingEvidenceChanged = Boolean(incomingAddressingEvidence && acceptAddressing
+        && (addressingChanged || incomingAddressingEvidence !== previousAddressingEvidence));
+    const addressingRound = addressingEvidenceChanged
+        ? numOr(roundNumber, numOr(oldInfo?.addressingRound, 0)) : numOr(oldInfo?.addressingRound, 0);
     const characterMemory = normalizeCharacterMemory({ ...oldInfo, ...incoming });
     const growth = mergeGrowth(oldInfo?.growth, incoming?.growth, roundNumber);
     if (growth.length) characterMemory.growth = growth;
@@ -3457,7 +3501,12 @@ function mergeCharacterRecord(previousName, oldInfo, incoming, incomingName, rou
         ...characterMemory,
         canonicalName,
         aliases: aliases.slice(0, 8),
-        location: asString(incoming?.location, asString(oldInfo?.location, "未知位置")),
+        location,
+        locationEvidence,
+        locationRound,
+        addressing,
+        addressingEvidence,
+        addressingRound,
         statusAndAction: asString(incoming?.statusAndAction, asString(oldInfo?.statusAndAction, "平静")),
         wear: asString(incoming?.wear, asString(oldInfo?.wear, "日常衣着")),
         viewTarget,
@@ -3657,9 +3706,9 @@ export async function summarizeSingleTurn(settings, memoryData, turnInfo) {
 - 多人卡、群像卡、大世界卡的角色卡名可能代表世界、组织或多个角色，严禁把卡名硬套给某一个出场人物。
 - 玩家可能以具体角色、旁白、系统、上帝视角或完全不在场的观察者身份参与。玩家不一定是角色，也不需要每轮都出现在账本中。
 - 如果玩家在本段剧情中以某个具体角色身份行动，请把玩家控制的那个角色放在 characters 对象的第一位；如果玩家是旁白/系统/上帝视角，则不要为了排序而强行添加玩家条目。
-- 只记录剧情中真实出场、且拥有独立行动/物理状态的个体，并优先使用剧情内最稳定、最明确的称呼作为键名。
+- 追踪剧情中实际出场的人物，以及虽未出场但有明确持续关系和后续可用事实的场外人物；前者应有独立行动/状态，后者须注明具体收录依据。优先使用剧情内最稳定、最明确的称呼作为键名。
 - 不要使用“User”“Char”“Character”“玩家”“主角”等占位称呼作为人物名；使用剧情中的真实称呼。
-- 若同一人物有本名、称号、昵称或别名，请沿用上一段账本的键名，并在 aliases 中记录本段出现的其他称呼；canonicalName 保持最稳定的本名。
+- 若同一人物有本名、称号、昵称或别名，请沿用上一段账本的键名，并在 aliases 中记录本段出现的身份称呼；canonicalName 保持最稳定的本名。敬称、自称、主仆/亲属间叫法写入 addressing，不得混进 aliases。
 - present 表示本段结束时该个体是否仍在场；暂时离开但仍会回归的人物保留条目并标记 present=false，不要直接删除。
 
 核心要求：
@@ -3680,14 +3729,17 @@ ${CHARACTER_MEMORY_RULES}
    - 仅收录上方人物收录规则允许的个体。重要的无名人物必须注明持续主线作用；背景人物只在摘要中叙述必要事件。
    - importance、importanceReason、named 按实际身份和剧情分量填写；growth 只返回本段有明确依据的新状态或变化项，省略的旧成长继续保留。
    - 同一人物沿用上一段账本中的键名；上一段账本中的条目若本段未明确离场，应继续增量更新，不要无故删除。
-     * **location**：该个体当前具体所在的地点/房间。
+     * **location**：该个体当前具体所在的地点/房间；只在原文明示当前所在或明确迁移时更新，区分常住地、临时所在和计划目的地。
+     * **locationEvidence**：支持本段地点更新的原文短句；没有新证据时沿用旧地点。
+     * **addressing**：稳定的自称及说话者对对象的称呼关系，明确对象，例如“甲自称「本少爷」；手下乙称甲「少爷」”。不要把它当作身份别名。
+     * **addressingEvidence**：支持本段新增/改变称呼习惯的原文对话；单次措辞或文风变化不算改变。
      * **statusAndAction**：当前可观察的动作或正在进行的行动，不推测心理，不写“尚未回应/等待玩家”等收尾。
      * **wear**：当前身上的衣着与穿戴（根据剧情穿脱实时更新）。
-     * **removedItemsLock（核心防回滚锁·极其重要）**：
-       - 只要该个体在剧情中摘下了某件饰品（如眼镜、耳环、发卡）或脱下了衣物（如外套、鞋袜），必须加入此数组！注明状态（例："金丝眼镜（已摘下放床头柜，当前未佩戴）"）。
+     * **removedItemsLock（卸下状态防回滚）**：
+       - 记录剧情中已脱下/摘下且尚未重新穿戴的衣物或饰品，注明最新状态；这不是随身道具清单。
        - **继承铁律**：本段未明确重新穿戴的物品必须保留未穿戴状态。每件实物只保留一条，物品名称保持稳定，括号只更新为最新位置/持有人；同一件外套从衣架移到别人手中时更新原条目，禁止另加一条。不得同时放进 inventory 和 removedItemsLock；不要合并确为不同的两件实物。
        - 只有剧情明确描写重新戴上某件物品时，才把该物品写入同一个个体的 unlockedItems 数组；不确定时不要写。
-     * **inventory**：该个体随身携带或持有的信物、道具、钥匙、手机及其他物品。不要按固定条数裁剪；本段未明确消耗、丢弃或转交的旧道具应保留，仅合并同一实物的重复记录，不同实物保持区分。
+     * **inventory**：只记录非穿戴类道具，如信物、钥匙、手机；衣物、鞋袜和佩戴饰品只写入 wear 或 removedItemsLock，不得作为随身道具。不要按固定条数裁剪；本段未明确消耗、丢弃或转交的旧道具应保留，仅合并同一实物的重复记录，不同实物保持区分。
      * **viewTarget**：本段剧情中该角色私下看到、听到、读到或感知到、且尚未公开的关键信息（如密信内容、偷听到的对话、私下观察到的动作）。只写该角色有权知道的内容；公共事件或旁白已知信息不要重复；没有则留空字符串。该字段只给对应角色看，严禁把 A 的私密视角写进 B 的 viewTarget。
 3. **todosAndPromises（只记真正需要跨轮跟进的事项）**：
    - 只记录会影响后续剧情、需要持续跟进的事项：明确承诺、约定、期限、计划，或确有叙事分量的未决选择。
@@ -3708,15 +3760,18 @@ ${CHARACTER_MEMORY_RULES}
         "canonicalName": "该个体最稳定的本名",
         "aliases": ["本段出现的别名/称号/昵称"],
         "importance": "supporting",
-        "importanceReason": "已发生的持续主线作用或重要关系",
+        "importanceReason": "已发生的持续主线作用、稳定关系或后续可用事实",
         "named": true,
         "growth": [{"key":"该方面稳定名称","dimension":"cognition","target":"","state":"有依据的当前判断与选择方式","evidence":"本段具体事实或明确对话"}],
-        "location": "当前具体地点",
+        "location": "当前具体地点或有明确依据的常住地",
+        "locationEvidence": "本段支持地点的原文短句；未变化时沿用旧账本",
+        "addressing": "稳定自称及说话者—对象称呼关系；未变化时沿用旧账本",
+        "addressingEvidence": "支持本段称呼变化的原文对话；未变化时留空"
         "statusAndAction": "神态动作与当前正在做的事",
         "wear": "当前衣着与佩戴",
         "removedItemsLock": ["已摘下/脱下未重新穿戴的饰品或衣物（未重戴绝不清除）"],
         "unlockedItems": ["本段明确重新戴上的物品；没有则留空数组"],
-        "inventory": ["随身携带的关键道具/信物"],
+        "inventory": ["非穿戴类随身道具/信物"],
         "viewTarget": "本段该角色私下所见/所闻、且其他角色尚不知情的关键信息；没有则留空字符串",
         "viewTargetVisible": true,
         "present": true
@@ -3743,7 +3798,7 @@ ${CHARACTER_MEMORY_RULES}
 - 玩家输入署名：${safeUserName || "未设置"}
 - 本条回复的发言者/角色卡名：${safeCharName || "未设置"}
 
-【上一段实体状态账本 (请在此基础上增量更新，切勿丢失已摘除饰品锁)】：
+【上一段实体状态账本 (请在此基础上增量更新，切勿丢失有来源依据的地点、称呼习惯和已摘除饰品锁)】：
 ${currentStateJson}
 
 【第 ${roundRange} 轮剧情原文】：
@@ -4311,6 +4366,28 @@ function roundForMessageIndex(roundIndex, index) {
     return turns.length ? turns.at(-1).round : 0;
 }
 
+function currentFactQueryIntent(query) {
+    const text = String(query || '').toLowerCase();
+    if (/(以前|从前|当初|当时|最初|曾经|过去|历史上|先后|变化过程|后来怎么)/.test(text)) {
+        return { location: false, addressing: false, current: false };
+    }
+    const location = /(哪里|哪儿|何处|在哪|住址|居住地|现居|住所|所在地|当前位置|当前地点|去向|目前.*(?:住|地点|位置)|现在.*(?:住|地点|位置)|当前.*(?:住|地点|位置)|如今.*(?:住|地点|位置))/.test(text);
+    const addressing = /(自称|称呼|称谓|叫法|怎么叫|如何称呼|怎么称呼|惯用语)/.test(text);
+    return { location, addressing, current: location || addressing };
+}
+
+function quotedAddressTerms(value) {
+    return [...String(value || '').matchAll(/[「『“\"]([^」』”\"]+)[」』”\"]/g)]
+        .map(match => match[1].trim()).filter(Boolean);
+}
+
+function characterMentionedInQuery(name, info, focus, addressingQuery) {
+    const aliases = [...characterAliases(name, info)];
+    if (aliases.some(alias => alias && focus.includes(alias.toLowerCase()))) return true;
+    return addressingQuery && quotedAddressTerms(info?.addressing)
+        .some(term => focus.includes(term.toLowerCase()));
+}
+
 // 按句末标点切分；不用 lookbehind，避免 Safari 16.4 之前解析整个模块失败。
 function splitStorySentences(source) {
     const parts = [];
@@ -4358,10 +4435,15 @@ async function retrieveRawExcerpts(settings, memoryData, queryText, options) {
     const chat = options.chat;
     if (!Array.isArray(chat)) return [];
     const focus = String(options.focusQuery || queryText).toLowerCase();
+    const intent = currentFactQueryIntent(focus);
     const names = [];
+    const stateMatches = [];
     for (const [name, character] of Object.entries(memoryData.stateLedger?.characters || {})) {
         const aliases = [...characterAliases(name, character)];
-        if (aliases.some(alias => focus.includes(String(alias).toLowerCase()))) names.push(...aliases);
+        if (characterMentionedInQuery(name, character, focus, intent.addressing)) {
+            names.push(...aliases);
+            stateMatches.push([name, character]);
+        }
     }
     const expanded = [focus, ...new Set(names)].join(' ');
     const queryEmbedding = await getQueryEmbedding(settings, expanded, options.allowNetwork !== false);
@@ -4380,6 +4462,15 @@ async function retrieveRawExcerpts(settings, memoryData, queryText, options) {
         if (queryEmbedding && (entry.dim !== queryEmbedding.length || entry.model !== embeddingModel)) continue;
         const text = chunk.text;
         if (!text) continue;
+        const entryRound = roundForMessageIndex(options.roundIndex, entry.index);
+        const textLower = text.toLowerCase();
+        // For a current-state/usage question, a newer source-backed ledger value supersedes older raw wording.
+        if (intent.current && entryRound > 0 && stateMatches.some(([name, character]) => {
+            const aliases = [...characterAliases(name, character)].map(alias => alias.toLowerCase());
+            if (!aliases.some(alias => alias && textLower.includes(alias))) return false;
+            return (intent.location && numOr(character.locationRound, 0) > entryRound)
+                || (intent.addressing && numOr(character.addressingRound, 0) > entryRound);
+        })) continue;
         let score = 0;
         const reasons = [];
         const alias = names.find(name => text.toLowerCase().includes(String(name).toLowerCase()));
@@ -4392,11 +4483,12 @@ async function retrieveRawExcerpts(settings, memoryData, queryText, options) {
         if (lexical >= 0.2) reasons.push('原文词语相近');
         const similarity = queryEmbedding ? Math.max(0, cosineSimilarity(queryEmbedding, entry.embedding)) : 0;
         score += similarity * 1.2;
+        if (intent.current && upper > 0) score += (entry.index / upper) * 0.2;
         if (similarity >= 0.2) reasons.push('向量语义相关');
         if (score < 0.12) continue;
         scored.push({ entry, text, score, reason: reasons.join('；') || '话题词语相关' });
     }
-    scored.sort((a, b) => b.score - a.score || a.entry.index - b.entry.index);
+    scored.sort((a, b) => b.score - a.score || (intent.current ? b.entry.index - a.entry.index : a.entry.index - b.entry.index));
     const topK = Math.min(20, Math.max(1, numOr(settings.retrievalTopK, 3)));
     const selected = [];
     const seenTexts = new Set();
@@ -4427,13 +4519,35 @@ export async function retrieveRelevantArchivedMemories(settings, memoryData, que
         return retrieveRawExcerpts(settings, memoryData, queryText, options);
     }
     const activeL0Ids = new Set((memoryData.levels[0] || []).map(item => item.id));
-    const candidates = memoryData.archivePool.filter(item => !activeL0Ids.has(item.id));
+    const retrievalFocus = String(options.focusQuery || queryText).toLowerCase();
+    const retrievalIntent = currentFactQueryIntent(retrievalFocus);
+    const relevantState = Object.entries(memoryData.stateLedger?.characters || {})
+        .filter(([name, character]) => characterMentionedInQuery(name, character, retrievalFocus, retrievalIntent.addressing));
+    const candidates = memoryData.archivePool.filter(item => {
+        if (activeL0Ids.has(item.id)) return false;
+        if (!retrievalIntent.current) return true;
+        const itemEndRound = parseRoundRange(item.roundRange).end;
+        const itemText = String(item.text || '').toLowerCase();
+        return !relevantState.some(([name, character]) => {
+            const aliases = [...characterAliases(name, character)].map(alias => alias.toLowerCase());
+            const sourceRound = retrievalIntent.location ? numOr(character.locationRound, 0) : 0;
+            const addressRound = retrievalIntent.addressing ? numOr(character.addressingRound, 0) : 0;
+            const factRound = Math.max(sourceRound, addressRound);
+            return factRound > itemEndRound && factRound > 0
+                && aliases.some(alias => alias && itemText.includes(alias));
+        });
+    });
     if (!candidates.length) return [];
-    const focus = String(options.focusQuery || queryText).toLowerCase();
+    const focus = retrievalFocus;
+    const intent = retrievalIntent;
     const names = [];
+    const stateMatches = [];
     for (const [name, character] of Object.entries(memoryData.stateLedger?.characters || {})) {
         const aliases = [...characterAliases(name, character)];
-        if (aliases.some(alias => focus.includes(String(alias).toLowerCase()))) names.push(...aliases);
+        if (characterMentionedInQuery(name, character, focus, intent.addressing)) {
+            names.push(...aliases);
+            stateMatches.push([name, character]);
+        }
     }
     const expanded = [focus, ...new Set(names)].join(' ');
     const queryBigrams = extractBigramsAndTokens(expanded);
@@ -4515,10 +4629,15 @@ export function buildInjectedMemoryPrompt(
         if (!original) continue;
         const info = { ...original, ...normalizeCharacterItems(original) };
         const removed = (info.removedItemsLock || []).length > 0
-            ? `\n    - 已摘除/脱下饰品(锁): ${info.removedItemsLock.join("; ")} [未描写重戴前严禁出现!]`
+            ? `\n    - 已脱下/摘下记录（防回滚，不是随身道具）: ${info.removedItemsLock.join("; ")} [未描写重穿/重戴前严禁视为已穿戴]`
             : "";
+        const locationSource = info.locationEvidence
+            ? `（依据第 ${info.locationRound || "?"} 轮：${info.locationEvidence}）` : "";
+        const addressingText = info.addressing
+            ? `
+    - 稳定自称/关系称呼（第 ${info.addressingRound || "?"} 轮确认）: ${info.addressing}${info.addressingEvidence ? `；依据: ${info.addressingEvidence}` : ""}` : "";
         const inv = (info.inventory || []).length > 0
-            ? `\n    - 随身携带道具: ${info.inventory.join("; ")}`
+            ? `\n    - 随身道具（非衣物/穿戴物）: ${info.inventory.join("; ")}`
             : "";
         const view = info.viewTarget && info.viewTargetVisible !== false
             ? `\n    - 私下所见（第 ${info.viewSeenRound || "?"} 轮，仅此角色知晓，严禁外传）: ${info.viewTarget}`
@@ -4537,9 +4656,9 @@ export function buildInjectedMemoryPrompt(
             primary: name === primaryKey,
             away: info.present === false,
             text: `- **【${displayName}】**${presence}${aliasText}
-    - 归档时地点: ${info.location || "未知"}
+    - 归档时地点: ${info.location || "未知"}${locationSource}
     - 状态与行动: ${info.statusAndAction || "无"}
-    - 归档时穿戴: ${info.wear || "常规穿戴"}${removed}${inv}${view}${growthText}`,
+    - 归档时穿戴: ${info.wear || "常规穿戴"}${removed}${inv}${view}${addressingText}${growthText}`,
         });
     }
 
@@ -4683,6 +4802,7 @@ const sections = [
             Number.isInteger(options.snapshotRound) && options.snapshotRound > 0
                 ? '- **状态同步截至**: 第 ' + options.snapshotRound + ' 轮结束；此后未归档原文不包含在该快照内。'
                 : '- **状态同步范围**: 仅代表已保存的归档快照，不能据此推断最新剧情状态。',
+            '- 地点与称呼习惯以账本中最近一次有依据的记录为准；较早时间线/向量召回只代表当时事实，不能覆盖较新的地点或称呼。明确询问过去时再按历史轮次回答。',
             '- 后续原文若改变位置、穿戴、持有物、离场状态或完成约定，以之后发生的事实为准；已摘除锁也仅代表快照时点，后文明确重戴即可解除，不得用旧快照覆盖新剧情。',
             '- **归档故事时间**: ' + safeTime,
             safeBlocks.map(block => block.text).join('\n\n') || '（暂无出场个体状态）',
@@ -4703,21 +4823,24 @@ export function buildNarrativeStoryView(memoryData) {
     const chars = ledger.characters || {};
 
     const charList = Object.entries(chars).filter(([name, info]) => shouldTrackCharacter(name, info, { existing: true })).slice(0, 200).map(([name, info]) => {
-        // 已摘除的饰品并入随身道具展示（标注“已摘下”），不再单独列出
         const removedParts = (info.removedItemsLock || []).map(x => {
             const text = String(x);
-            return /已摘|未佩戴|已脱/.test(text) ? text : `${text}（已摘下）`;
+            return /已摘|未佩戴|已脱/.test(text) ? text : `${text}（已脱下/摘下）`;
         });
-        const allItems = [...(info.inventory || []), ...removedParts];
-        const inv = allItems.length > 0
-            ? `\n  - 随身道具: ${allItems.join(", ")}`
+        const inventory = Array.isArray(info.inventory) ? info.inventory : [];
+        const inv = inventory.length > 0
+            ? `\n  - 随身道具: ${inventory.join(", ")}`
+            : "";
+        const removed = removedParts.length > 0
+            ? `\n  - 已脱下/摘下记录: ${removedParts.join(", ")}`
             : "";
         const alias = (info.aliases || []).length > 0 ? `（别名: ${info.aliases.join(", ")}）` : "";
         const presence = info.present === false ? "（暂离场）" : "";
         return `【${characterDisplayName(name, info)}】${presence}${alias}
-  - 所在地点: ${info.location || "未知"}
+  - 所在地点: ${info.location || "未知"}${info.locationRound ? `（第 ${info.locationRound} 轮更新；依据：${info.locationEvidence || "剧情原文"}）` : ""}
   - 状态与行动: ${info.statusAndAction || "正常"}
-  - 衣着穿戴: ${info.wear || "未记录"}${inv}${formatCharacterGrowth(info, chars).map(entry => `\n  - 长期成长·${entry.label}: ${entry.state}（依据：${entry.evidence}${entry.sourceRound ? `；第 ${entry.sourceRound} 轮` : ""}）`).join("")}`;
+  - 当前衣着: ${info.wear || "未记录"}${inv}${removed}${info.addressing ? `
+  - 稳定自称/关系称呼: ${info.addressing}` : ""}${formatCharacterGrowth(info, chars).map(entry => `\n  - 长期成长·${entry.label}: ${entry.state}（依据：${entry.evidence}${entry.sourceRound ? `；第 ${entry.sourceRound} 轮` : ""}）`).join("")}`;
     }).join("\n\n");
 
     const lines = [];
@@ -4962,7 +5085,11 @@ export async function backfillExistingChatHistory(
         throw error;
     }
     const pendingTurns = roundIndex.aiTurns.filter(turn => turn.idx > memoryData.lastProcessedMessageId);
-    const l0Groups = groupAiTurnsForL0(pendingTurns, resolveL0RoundsPerSummary(settings), false);
+    const l0Groups = groupAiTurnsForL0(
+        pendingTurns,
+        resolveL0RoundsPerSummary(settings),
+        settings.l0MergeMode !== "manual",
+    );
     let beforeBatch = typeof onChunkSaved === 'function' ? deepClone(memoryData) : null;
     let batchCount = 0, batchEndMessageId = -1, batchSignature = '';
     let firstBatchRound = l0Groups[0]?.[0]?.round;

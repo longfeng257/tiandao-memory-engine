@@ -3013,9 +3013,10 @@ function initFloatingWidget() {
         <div id="tiandao_widget_card" class="tiandao-widget-card" role="dialog" aria-label="溯微长线记忆引擎" aria-owns="tiandao_model_menu tiandao_emb_model_menu" hidden>
             <div class="tiandao-card-header">
                 <div class="tiandao-segmented-control" role="tablist" aria-label="溯微主导航">
-                    <button type="button" id="tiandao_tab_ledger_btn" class="tiandao-segment-btn active" role="tab" aria-controls="tiandao_tab_ledger_content" aria-selected="true" tabindex="0"><i class="fa-solid fa-book-bookmark" aria-hidden="true"></i> 状态看板</button>
-                    <button type="button" id="tiandao_tab_story_btn" class="tiandao-segment-btn" role="tab" aria-controls="tiandao_tab_story_content" aria-selected="false" tabindex="-1"><i class="fa-solid fa-scroll" aria-hidden="true"></i> 剧情</button>
-                    <button type="button" id="tiandao_tab_settings_btn" class="tiandao-segment-btn" role="tab" aria-controls="tiandao_tab_settings_content" aria-selected="false" tabindex="-1"><i class="fa-solid fa-sliders" aria-hidden="true"></i> 溯微设置</button>
+                    <button type="button" id="tiandao_tab_ledger_btn" class="tiandao-segment-btn active" role="tab" aria-label="状态看板" aria-controls="tiandao_tab_ledger_content" aria-selected="true" tabindex="0"><i class="fa-solid fa-book-bookmark" aria-hidden="true"></i><span>看板</span></button>
+                    <button type="button" id="tiandao_tab_story_btn" class="tiandao-segment-btn" role="tab" aria-label="剧情" aria-controls="tiandao_tab_story_content" aria-selected="false" tabindex="-1"><i class="fa-solid fa-scroll" aria-hidden="true"></i><span>剧情</span></button>
+                    <button type="button" id="tiandao_tab_debug_btn" class="tiandao-segment-btn" role="tab" aria-label="调试" aria-controls="tiandao_tab_debug_content" aria-selected="false" tabindex="-1"><i class="fa-solid fa-bug" aria-hidden="true"></i><span>调试</span></button>
+                    <button type="button" id="tiandao_tab_settings_btn" class="tiandao-segment-btn" role="tab" aria-label="溯微设置" aria-controls="tiandao_tab_settings_content" aria-selected="false" tabindex="-1"><i class="fa-solid fa-sliders" aria-hidden="true"></i><span>设置</span></button>
                 </div>
                 <button type="button" id="tiandao_widget_close_btn" class="tiandao-card-close" aria-label="关闭溯微看板" title="关闭溯微看板">&times;</button>
             </div>
@@ -3050,17 +3051,6 @@ function initFloatingWidget() {
             <div id="tiandao_widget_body" class="tiandao-card-body">
                 <!-- Tab 1: 状态看板 -->
                 <div id="tiandao_tab_ledger_content" class="tiandao-tab-page" role="tabpanel" aria-labelledby="tiandao_tab_ledger_btn">
-                    <details class="tiandao-diagnostic-panel" id="tiandao_injection_preview">
-                        <summary>本轮聊天记录替换预览</summary>
-                        <p id="tiandao_injection_info" class="tiandao-field-caption"></p>
-                        <p class="tiandao-field-caption">这是准备替换酒馆原生聊天记录的完整内容，按来源轮次排列；不按固定 Token 预算删减。角色卡、世界书和其他预设仍由酒馆管理。</p>
-                        <textarea id="tiandao_injection_text" class="tiandao-preview-text" readonly aria-label="聊天记录替换文本" spellcheck="false"></textarea>
-                        <button type="button" id="tiandao_injection_copy" class="tiandao-btn tiandao-btn-sm">复制聊天记录</button>
-                    </details>
-                    <details class="tiandao-diagnostic-panel">
-                        <summary>运行统计（本次页面会话）</summary>
-                        <p id="tiandao_runtime_stats" class="tiandao-field-caption"></p>
-                    </details>
                     <div id="tiandao_widget_body_inner" class="tiandao-ledger-list">
                         <!-- 动态内容 -->
                     </div>
@@ -3082,50 +3072,74 @@ function initFloatingWidget() {
                             </button>
                         </div>
                     </div>
-                    <div class="tiandao-story-range-bar">
-                        <div class="tiandao-story-range-fields" role="group" aria-labelledby="tiandao_story_range_label">
-                            <span id="tiandao_story_range_label" class="tiandao-story-range-label">轮次</span>
-                            <input id="tiandao_story_range_from" type="number" min="1" class="tiandao-input tiandao-input-sm" placeholder="起始" aria-label="起始轮次" />
-                            <span class="tiandao-story-range-dash" aria-hidden="true">-</span>
-                            <input id="tiandao_story_range_to" type="number" min="1" class="tiandao-input tiandao-input-sm" placeholder="结束" aria-label="结束轮次" />
-                        </div>
-                        <div class="tiandao-story-range-actions">
-                            <select id="tiandao_story_range_mode" class="tiandao-select tiandao-story-range-mode" aria-label="总结范围操作">
-                                <option value="fill">补缺失+前置</option>
-                                <option value="merge_l0">手动合 L0</option>
-                                <option value="view">仅筛选查看</option>
-                                <option value="rebuild">重新总结</option>
-                            </select>
-                            <button type="button" id="tiandao_story_range_btn" class="tiandao-btn tiandao-btn-sm" title="重新总结所选轮次范围">
-                                <i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> 执行
-                            </button>
-                        </div>
-                    </div>
-                    <div class="tiandao-story-bulk-bar">
-                        <label class="tiandao-story-sort-control" title="切换时间线排序方向">
-                            <span>排序</span>
-                            <select id="tiandao_story_sort_order" class="tiandao-select tiandao-story-sort-select" aria-label="时间线排序方向">
-                                <option value="desc" selected>倒序</option>
-                                <option value="asc">正序</option>
-                            </select>
-                        </label>
-                        <button type="button" id="tiandao_story_rebuild_all_btn" class="tiandao-btn tiandao-btn-sm">
-                            <i class="fa-solid fa-arrows-rotate"></i> 重新总结全部
-                        </button>
-                    </div>
                     <div class="tiandao-story-filter-bar">
                         <input id="tiandao_story_search" type="search" class="tiandao-input" aria-label="搜索人物、关系或事件" placeholder="搜索人物、关系、约定或事件" />
-                        <select id="tiandao_story_scope" class="tiandao-select" aria-label="记忆查看范围">
-                            <option value="active">当前记忆</option>
-                            <option value="all">全部 L0 归档</option>
-                            <option value="pinned">仅固定记忆</option>
-                        </select>
+                        <div class="tiandao-story-filter-controls">
+                            <select id="tiandao_story_scope" class="tiandao-select" aria-label="记忆树范围">
+                                <option value="active">当前记忆树</option>
+                                <option value="all">全部 L0 归档</option>
+                                <option value="pinned">仅固定记忆</option>
+                            </select>
+                            <label class="tiandao-story-sort-control" title="切换时间线排序方向">
+                                <span>排序</span>
+                                <select id="tiandao_story_sort_order" class="tiandao-select tiandao-story-sort-select" aria-label="时间线排序方向">
+                                    <option value="desc" selected>倒序</option>
+                                    <option value="asc">正序</option>
+                                </select>
+                            </label>
+                        </div>
                     </div>
-                    <p class="tiandao-field-caption">L0 可固定，最多 12 条；固定内容独立参与注入，不按固定 Token 预算删减。旧归档可切换“全部 L0”查找。</p>
+                    <details class="tiandao-story-operations">
+                        <summary><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> 按轮次整理</summary>
+                        <div class="tiandao-story-range-bar">
+                            <div class="tiandao-story-range-fields" role="group" aria-labelledby="tiandao_story_range_label">
+                                <span id="tiandao_story_range_label" class="tiandao-story-range-label">轮次</span>
+                                <input id="tiandao_story_range_from" type="number" min="1" class="tiandao-input tiandao-input-sm" placeholder="起始" aria-label="起始轮次" />
+                                <span class="tiandao-story-range-dash" aria-hidden="true">-</span>
+                                <input id="tiandao_story_range_to" type="number" min="1" class="tiandao-input tiandao-input-sm" placeholder="结束" aria-label="结束轮次" />
+                            </div>
+                            <div class="tiandao-story-range-actions">
+                                <select id="tiandao_story_range_mode" class="tiandao-select tiandao-story-range-mode" aria-label="总结范围操作">
+                                    <option value="fill">补缺失+前置</option>
+                                    <option value="merge_l0">手动合 L0</option>
+                                    <option value="view">仅筛选查看</option>
+                                    <option value="rebuild">重新总结</option>
+                                </select>
+                                <button type="button" id="tiandao_story_range_btn" class="tiandao-btn tiandao-btn-sm" title="执行所选轮次操作">
+                                    <i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> 执行
+                                </button>
+                            </div>
+                        </div>
+                        <div class="tiandao-story-rebuild-row">
+                            <button type="button" id="tiandao_story_rebuild_all_btn" class="tiandao-btn tiandao-btn-sm">
+                                <i class="fa-solid fa-arrows-rotate" aria-hidden="true"></i> 重新总结全部
+                            </button>
+                        </div>
+                    </details>
                     <div id="tiandao_story_page_timeline" class="tiandao-story-page"></div>
                 </div>
 
-                <!-- Tab 3: 溯微设置（二级分页：运行 / API / 数据 / 外观） -->
+                <!-- Tab 3: 诊断与运行状态 -->
+                <div id="tiandao_tab_debug_content" class="tiandao-tab-page" role="tabpanel" aria-labelledby="tiandao_tab_debug_btn" hidden>
+                    <p id="tiandao_widget_summary_info" class="tiandao-diagnostic-meta"></p>
+                    <details class="tiandao-diagnostic-panel">
+                        <summary>状态账本同步</summary>
+                        <div id="tiandao_debug_ledger_freshness"></div>
+                    </details>
+                    <details class="tiandao-diagnostic-panel" id="tiandao_injection_preview">
+                        <summary>聊天记录替换预览</summary>
+                        <p id="tiandao_injection_info" class="tiandao-field-caption"></p>
+                        <p class="tiandao-field-caption">角色卡、世界书与预设仍由酒馆管理。</p>
+                        <textarea id="tiandao_injection_text" class="tiandao-preview-text" readonly aria-label="聊天记录替换文本" spellcheck="false"></textarea>
+                        <button type="button" id="tiandao_injection_copy" class="tiandao-btn tiandao-btn-sm">复制聊天记录</button>
+                    </details>
+                    <details class="tiandao-diagnostic-panel">
+                        <summary>运行统计（本次页面会话）</summary>
+                        <p id="tiandao_runtime_stats" class="tiandao-field-caption"></p>
+                    </details>
+                </div>
+
+                <!-- Tab 4: 溯微设置（二级分页：运行 / API / 数据 / 外观） -->
                 <div id="tiandao_tab_settings_content" class="tiandao-tab-page" role="tabpanel" aria-labelledby="tiandao_tab_settings_btn" hidden>
                     <div class="tiandao-subtabs" role="tablist" aria-label="溯微设置分类">
                         <button type="button" id="tiandao_settings_run_tab" class="tiandao-subtab active" data-page="run" role="tab" aria-controls="tiandao_settings_run" aria-selected="true" tabindex="0"><i class="fa-solid fa-sliders" aria-hidden="true"></i> 运行</button>
@@ -3202,21 +3216,23 @@ function initFloatingWidget() {
                                     <option value="main_response">主模型随正文返回状态</option>
                                 </select>
                             </div>
-                            <div id="tiandao_state_update_hint" class="tiandao-field-caption">
-                                独立模式使用上方总结 API，每轮回复后提取状态；与回复后 L0 同时到期时共用请求，下一次发送才总结时则另计 L0 请求。正文模式不增加独立状态请求，但主模型会多输出状态数据；协议区块在聊天中隐藏，发送历史时剔除，本地原始消息仍保留以便恢复。漏写或格式错误只提示，不自动付费补跑。切换只作用于后续回复，不会自动重跑历史。
-                            </div>
+                            <div id="tiandao_state_update_hint" class="tiandao-field-caption">正文模式不额外调用 API；漏写状态不会自动补跑。</div>
+                            <details class="tiandao-inline-help">
+                                <summary>状态更新说明</summary>
+                                <p>独立模式每轮调用总结 API；正文模式由主模型随回复返回，不增加请求，状态区块发送时剔除。漏写只提示，不自动补跑；切换只作用于后续回复，不会重跑历史。</p>
+                            </details>
                             <div class="tiandao-form-row">
                                 <label class="tiandao-field-label" for="tiandao_l0_chunk">每几轮合成一条 L0</label>
                                 <input id="tiandao_l0_chunk" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" class="tiandao-input tiandao-input-sm" placeholder="1" />
                             </div>
                             <div class="tiandao-field-caption" style="margin:0 0 8px;">
-                                自动模式满 N 轮才归档；手动模式不会自动生成 L0，仍可在剧情页选择连续轮次手动合并。手动合并后，下一段从合并结束后的第一轮重新计数。“随 L0 总结更新”模式下，账本随整组总结更新；需要每轮提取状态时设为 1 轮并选择“AI 回复完成后立即总结”，或选择上方两种逐轮状态模式。状态同步与剧情归档分别计数，未同步期间以之后的剧情为准。
+                                自动模式满 N 轮归档；手动模式需在剧情页选择轮次合并。
                             </div>
                             <div class="tiandao-form-row">
                                 <label class="tiandao-field-label" for="tiandao_merge_chunk">L1+ 向上合并步长</label>
                                 <input id="tiandao_merge_chunk" type="number" class="tiandao-input tiandao-input-sm" min="2" max="15" placeholder="5" />
                             </div>
-                            <div class="tiandao-field-caption">发送位置固定为酒馆原生聊天记录区块。历史记忆按轮次由远及近排列，随后衔接近期原文；不按固定 Token 预算删减记忆。</div>
+                            <div class="tiandao-field-caption">按轮次由远及近注入，再衔接近期原文；不按 Token 预算裁剪。</div>
                         </div>
 
                         <!-- 向量与关键词混合检索设置（自「高级」页移入） -->
@@ -3237,8 +3253,12 @@ function initFloatingWidget() {
                                 <input id="tiandao_vector_raw_memory" type="checkbox" class="tiandao-checkbox" />
                             </label>
                             <div class="tiandao-field-caption" style="margin:5px 0 0;">
-                                开启后召回来源改为已归档原文的向量片段（需同时启用下方 Embedding API），命中注入原文短句；关闭则为纯总结记忆（关键词/词法召回 L0 摘要）。开启后新归档轮次自动建向量，可在弹窗确认后回填旧历史；向量随聊天存档保存（上限 500 块，超出按均匀采样保留，会增大聊天文件体积）。需保持「自动隐藏旧消息」开启——只有被记忆替换的旧区域才注入召回片段；渠道需支持 OpenAI /embeddings 批量格式（data 数组带 index）。
+                                命中时注入归档原文短句；需开启 Embedding API 与原文替换。
                             </div>
+                            <details class="tiandao-inline-help">
+                                <summary>向量召回说明</summary>
+                                <p>向量随存档保存，最多 500 块；启用后新归档轮次自动建向量，历史内容可在弹窗确认后回填。</p>
+                            </details>
                             <label class="tiandao-toggle-row" style="margin-top:6px;">
                                 <span class="tiandao-toggle-label">启用外部 Embedding 向量 API (默认本地词法分词)</span>
                                 <input id="tiandao_use_embedding" type="checkbox" class="tiandao-checkbox" aria-controls="tiandao_embedding_box" />
@@ -3252,7 +3272,7 @@ function initFloatingWidget() {
                                 <div class="tiandao-input-block">
                                     <label class="tiandao-field-caption" for="tiandao_emb_url">Embedding URL</label>
                                     <input id="tiandao_emb_url" type="text" class="tiandao-input" placeholder="https://api.siliconflow.cn/v1" aria-describedby="tiandao_emb_url_hint" />
-                                    <div id="tiandao_emb_url_hint" class="tiandao-field-caption" style="margin:5px 0 0;">建议使用 HTTPS；HTTP 会明文传输 Embedding API Key。</div>
+                                    <div id="tiandao_emb_url_hint" class="tiandao-field-caption" style="margin:5px 0 0;">建议 HTTPS；HTTP 会明文传输 Key。</div>
                                 </div>
                                 <div class="tiandao-input-block">
                                     <label class="tiandao-field-caption" for="tiandao_emb_key">Embedding API Key</label>
@@ -3303,7 +3323,7 @@ function initFloatingWidget() {
                                 </button>
                             </div>
                             <div class="tiandao-field-caption tiandao-api-profile-hint">
-                                保存地址、Key、模型、请求模式与生成参数，切换后立即生效。
+                                保存地址、Key、模型与生成参数。
                             </div>
                         </div>
 
@@ -3319,7 +3339,7 @@ function initFloatingWidget() {
                                     <i class="fa-solid fa-link tiandao-input-icon" aria-hidden="true"></i>
                                     <input id="tiandao_api_url" type="text" class="tiandao-input with-icon" placeholder="https://api.deepseek.com/v1" aria-describedby="tiandao_api_url_hint" />
                                 </div>
-                                <div id="tiandao_api_url_hint" class="tiandao-field-caption" style="margin:5px 0 0;">建议使用 HTTPS；HTTP 会明文传输 API Key 与剧情内容。</div>
+                                <div id="tiandao_api_url_hint" class="tiandao-field-caption" style="margin:5px 0 0;">建议 HTTPS；HTTP 会明文传输 Key 与剧情内容。</div>
                             </div>
 
                             <div class="tiandao-input-block">
@@ -3355,7 +3375,7 @@ function initFloatingWidget() {
                                 <input id="tiandao_request_timeout" type="number" step="10" min="0" max="86400" class="tiandao-input tiandao-input-sm" placeholder="600" aria-describedby="tiandao_request_timeout_hint" />
                             </div>
                             <div id="tiandao_request_timeout_hint" class="tiandao-field-caption" style="margin:5px 0 0;">
-                                留空按 600 秒；填 0 表示不限时，最多 86400 秒。长思维链模型建议 600~1800 秒；超时和流式格式错误不会自动重试，可随时在进度框点停止。
+                                留空默认 600 秒；0 为不限时。
                             </div>
                             <div class="tiandao-form-row">
                                 <label class="tiandao-field-label" for="tiandao_stream_mode">请求模式</label>
@@ -3365,7 +3385,7 @@ function initFloatingWidget() {
                                 </select>
                             </div>
                             <div id="tiandao_stream_mode_hint" class="tiandao-field-caption" style="margin:5px 0 0;">
-                                流式会边生成边读取，适合长思维链；若渠道忽略或拒绝 stream，会自动回退普通 JSON。空闲超时仍按上方设置。
+                                不支持流式时自动回退普通请求。
                             </div>
                             <label class="tiandao-toggle-row">
                                 <span class="tiandao-toggle-label">启用 JSON 模式（不支持时自动回退）</span>
@@ -3376,7 +3396,7 @@ function initFloatingWidget() {
                                 <label class="tiandao-field-caption" for="tiandao_target_tags">🎯 目标正文提取标签（白名单优先）</label>
                                 <input id="tiandao_target_tags" type="text" class="tiandao-input" placeholder="" maxlength="500" aria-describedby="tiandao_target_tags_hint" />
                                 <div id="tiandao_target_tags_hint" class="tiandao-field-caption" style="margin:5px 0 0;">
-                                    英文逗号、中文逗号或空格均可分隔，例如 content, story, reply。标签名不必带尖括号，大小写不敏感；多个目标标签会按填写顺序尝试。
+                                    中英文逗号或空格分隔；按顺序尝试。
                                 </div>
                             </div>
 
@@ -3384,14 +3404,14 @@ function initFloatingWidget() {
                                 <label class="tiandao-field-caption" for="tiandao_strip_tags">备用排除标签（黑名单）</label>
                                 <input id="tiandao_strip_tags" type="text" class="tiandao-input" placeholder="" maxlength="500" aria-describedby="tiandao_strip_tags_hint" />
                                 <div id="tiandao_strip_tags_hint" class="tiandao-field-caption" style="margin:5px 0 0;">
-                                    同样使用英文逗号、中文逗号或空格分隔，例如 thinking, status_bar。匹配到的整个标签块会从正文中移除。两项都留空时，玩家输入与 AI 回复会完整进入 L0 总结；楼层显示时间属于酒馆元数据，不等同于剧情内时间。
+                                    中英文逗号或空格分隔；匹配标签块会从正文移除。
                                 </div>
                             </div>
 
                             <button type="button" id="tiandao_test_api_btn" class="tiandao-btn tiandao-btn-primary tiandao-btn-full" aria-describedby="tiandao_test_api_hint" style="margin-top: 10px;">
                                 <i class="fa-solid fa-bolt" aria-hidden="true"></i> <span>测试独立 API 连通性</span>
                             </button>
-                            <p id="tiandao_test_api_hint" class="tiandao-field-caption">向当前渠道发送一条简短的测试提示，不发送聊天内容；渠道可能按实际生成的 Token 计费。</p>
+                            <p id="tiandao_test_api_hint" class="tiandao-field-caption">只发一条短测试提示，不含聊天内容；可能产生费用。</p>
                         </div>
                     </div>
 
@@ -3416,7 +3436,7 @@ function initFloatingWidget() {
                                 <input id="tiandao_include_native_hidden" type="checkbox" class="tiandao-checkbox" />
                             </label>
                             <div class="tiandao-field-caption" style="margin:5px 0 0;">
-                                影响扫描、自动归档与时序裁剪。隐藏楼层必须属于剧情正文才开启；切换后建议立即重新扫描或重建，避免新旧轮次错位。
+                                隐藏楼层属于剧情正文时才开启；切换后请重新扫描或重建。
                             </div>
                         </div>
 
@@ -3427,7 +3447,7 @@ function initFloatingWidget() {
                                 <button type="button" id="tiandao_recovery_restore" class="tiandao-btn">恢复所选记忆</button>
                                 <button type="button" id="tiandao_recovery_export" class="tiandao-btn">下载所选备份</button>
                             </div>
-                            <p class="tiandao-field-caption">导入、清空、重总结和手工修改前自动保存，随当前聊天保留最近 3 个，总容量受限。原文或分支变化后禁止直接恢复，可下载 JSON 备份。恢复也会备份当前状态。</p>
+                            <p class="tiandao-field-caption">导入、清空、重总结前自动保存，保留最近 3 个；原文变化后禁止直接恢复。</p>
                         </div>
                         <!-- 导入与导出 -->
                         <div class="tiandao-card-panel">
@@ -3444,7 +3464,7 @@ function initFloatingWidget() {
                                 <input id="tiandao_import_json_input" type="file" accept=".json" hidden />
                             </div>
                             <div id="tiandao_import_json_hint" class="tiandao-field-caption" style="margin-top:7px; margin-bottom:0;">
-                                导出当前存档的记忆 JSON 文件；导入会覆盖本存档记忆，并自动保留覆盖前的恢复点。
+                                导入会覆盖本存档记忆，并保留覆盖前的恢复点。
                             </div>
                         </div>
                     </div>
@@ -3498,12 +3518,6 @@ function initFloatingWidget() {
                 </div>
             </div>
 
-            <!-- 卡片底栏 -->
-            <div class="tiandao-card-footer">
-                <div id="tiandao_widget_summary_info" class="tiandao-footer-meta">
-                    L0: 0 | L1: 0 | L2: 0
-                </div>
-            </div>
         </div>
     `;
     document.body.appendChild(widget);
@@ -3599,6 +3613,7 @@ function initFloatingWidget() {
     });
 
     const ledgerBody = document.getElementById("tiandao_widget_body_inner");
+    const debugContent = document.getElementById("tiandao_tab_debug_content");
     if (ledgerBody) {
         ledgerBody.addEventListener("click", (event) => {
             const characterToggle = event.target.closest("[data-char-toggle]");
@@ -3653,6 +3668,11 @@ function initFloatingWidget() {
             updateTodoCompletion(checkbox.dataset.todoId, checkbox.checked);
         });
     }
+    debugContent?.addEventListener("click", event => {
+        if (!event.target.closest("[data-retry-state]")) return;
+        const chat = getSTContext().chat || [];
+        enqueueLiveStateUpdates(chat, chat.length - 1, { allowSummary: false });
+    });
 
     bindWidgetTabs(mainTabList, tab => {
         closeModelMenu();
@@ -3661,6 +3681,7 @@ function initFloatingWidget() {
             renderStoryTimeline();
             renderStoryRecoveryState();
         }
+        if (tab.id === "tiandao_tab_debug_btn") updateFloatingWidgetUI();
     });
     bindWidgetTabs(card.querySelector(".tiandao-subtabs"), () => closeModelMenu());
 
@@ -3987,6 +4008,7 @@ function renderFloatingWidgetUI({ forceLedger = false } = {}) {
     const pill = document.getElementById("tiandao_widget_pill");
     const badge = document.getElementById("tiandao_widget_badge");
     const bodyInner = document.getElementById("tiandao_widget_body_inner");
+    const debugFreshness = document.getElementById("tiandao_debug_ledger_freshness");
     const summaryInfo = document.getElementById("tiandao_widget_summary_info");
 
     const l0Count = (memoryData.levels?.[0] || []).length;
@@ -4034,7 +4056,7 @@ function renderFloatingWidgetUI({ forceLedger = false } = {}) {
         const fadedText = fadedCount > 0 ? ` · 远史:${fadedCount}` : "";
         const rawVectorCount = (memoryData.rawVectors || []).filter(entry => Array.isArray(entry.embedding)).length;
         const rawVectorText = rawVectorCount > 0 ? ` · 原文向量:${rawVectorCount}` : "";
-        summaryInfo.textContent = `L0(${l0Count}) L1(${l1Count}) L2(${l2Count}) L3(${l3Count}) · 回溯池:${memoryData.archivePool?.length || 0}${fadedText}${rawVectorText}${tokenText}`;
+        summaryInfo.textContent = `记忆结构：L0(${l0Count}) L1(${l1Count}) L2(${l2Count}) L3(${l3Count}) · 回溯池:${memoryData.archivePool?.length || 0}${fadedText}${rawVectorText}${tokenText}`;
     }
 
     if (!bodyInner) return;
@@ -4044,7 +4066,8 @@ function renderFloatingWidgetUI({ forceLedger = false } = {}) {
     const ledgerFreshness = getLedgerFreshness(memoryData);
     const ledgerRenderKey = `${getChatKey()}|${getSTContext().name1 || ""}|${memoryBusy ? 1 : 0}|${JSON.stringify(ledgerFreshness)}|${JSON.stringify(memoryData.stateLedger || {})}`;
     if (forceLedger || ledgerRenderKey !== lastLedgerRenderKey) {
-        bodyInner.innerHTML = buildLedgerHtml(memoryData, ledgerFreshness);
+        bodyInner.innerHTML = buildLedgerHtml(memoryData, ledgerFreshness, { includeFreshness: false });
+        if (debugFreshness) debugFreshness.innerHTML = buildLedgerFreshnessHtml(ledgerFreshness, memoryBusy);
         lastLedgerRenderKey = ledgerRenderKey;
     }
 
@@ -4111,9 +4134,17 @@ function getLedgerFreshness(memoryData) {
 }
 
 /**
- * 状态账本通用渲染（状态看板 Tab 与 剧情 → 状态账本 分页共用同一份数据视图）
+ * 渲染剧情状态账本与可选的同步提示。
  */
-function buildLedgerHtml(memoryData, freshness = getLedgerFreshness(memoryData)) {
+function buildLedgerFreshnessHtml(freshness, memoryBusy = false) {
+    return `<div class="tiandao-ledger-freshness${freshness.stale ? " is-stale" : ""}" role="status">
+        <strong>${escapeHTML(freshness.title)}</strong>
+        <span>${escapeHTML(freshness.detail)}</span>
+        ${freshness.stale && freshness.mode !== "with_summary" ? `<button type="button" data-retry-state class="tiandao-btn tiandao-btn-sm" ${memoryBusy ? "disabled" : ""}>${freshness.mode === "main_response" ? "重新读取正文状态（不调用 API）" : "同步状态（调用 API）"}</button>` : ""}
+    </div>`;
+}
+
+function buildLedgerHtml(memoryData, freshness = getLedgerFreshness(memoryData), options = {}) {
     const ledger = memoryData.stateLedger || {};
     const chars = ledger.characters || {};
     const charCards = [];
@@ -4144,52 +4175,35 @@ function buildLedgerHtml(memoryData, freshness = getLedgerFreshness(memoryData))
 
     for (const [name, info] of entries) {
         if (!info) continue;
-        // 已摘除的饰品并入随身道具展示（标注“已摘下”），不再单列一行
         const inventoryItems = Array.isArray(info.inventory) ? info.inventory : [];
         const removedItems = Array.isArray(info.removedItemsLock) ? info.removedItemsLock : [];
-        const itemEntries = [
-            ...inventoryItems.map((text, index) => ({
-                text,
-                kind: "inventory",
-                index,
-                removed: false,
-            })),
-            ...removedItems.map((text, index) => ({
-                text,
-                kind: "removed",
-                index,
-                removed: true,
-            })),
-        ];
-        const removedCount = removedItems.length;
+        const renderItemChips = (items, kind, removed = false) => items.map((text, index) => {
+            const rawText = String(text);
+            const label = removed && !/已摘|未佩戴|已脱/.test(rawText)
+                ? `${rawText}（已脱下/摘下）`
+                : rawText;
+            const deleteTitle = memoryBusy
+                ? "总结进行中，完成后再删除记录"
+                : (removed ? "从当前状态账本删除这条卸下记录" : "从当前状态账本删除这件随身道具");
+            return `<span class="tiandao-item-chip${removed ? " tiandao-item-off" : ""}">
+                <span class="tiandao-item-text">${escapeHTML(label)}</span>
+                <button type="button"
+                    class="tiandao-item-delete"
+                    data-char-name="${escapeHTML(name)}"
+                    data-delete-item="${kind}"
+                    data-item-index="${index}"
+                    title="${deleteTitle}"
+                    aria-label="${removed ? "删除卸下记录" : "删除随身道具"}：${escapeHTML(rawText)}"
+                    ${memoryBusy ? "disabled" : ""}>
+                    <i class="fa-solid fa-trash-can" aria-hidden="true"></i>
+                </button>
+            </span>`;
+        }).join("");
         const itemListId = `tiandao-char-items-${charCards.length}`;
-        const itemHtml = itemEntries.length > 0
+        const itemHtml = inventoryItems.length > 0
             ? (() => {
                 const inventoryExpanded = expandedInventoryCards.has(`${chatKey}::${name}`);
-                const chips = itemEntries.map(({ text, kind, index, removed }) => {
-                    const rawText = String(text);
-                    const label = removed && !/已摘|未佩戴|已脱/.test(rawText)
-                        ? `${rawText}（已摘下）`
-                        : rawText;
-                    const deleteTitle = memoryBusy
-                        ? "总结进行中，完成后再删除物品"
-                        : (kind === "removed"
-                            ? "从当前状态账本删除这条已摘下记录"
-                            : "从当前状态账本删除这件随身道具");
-                    return `<span class="tiandao-item-chip${removed ? " tiandao-item-off" : ""}">
-                        <span class="tiandao-item-text">${escapeHTML(label)}</span>
-                        <button type="button"
-                            class="tiandao-item-delete"
-                            data-char-name="${escapeHTML(name)}"
-                            data-delete-item="${kind}"
-                            data-item-index="${index}"
-                            title="${deleteTitle}"
-                            aria-label="删除物品：${escapeHTML(rawText)}"
-                            ${memoryBusy ? "disabled" : ""}>
-                            <i class="fa-solid fa-trash-can" aria-hidden="true"></i>
-                        </button>
-                    </span>`;
-                }).join("");
+                const chips = renderItemChips(inventoryItems, "inventory");
                 return `<div class="tiandao-char-item-section">
                     <button type="button"
                         class="tiandao-item-toggle"
@@ -4199,13 +4213,19 @@ function buildLedgerHtml(memoryData, freshness = getLedgerFreshness(memoryData))
                         <span class="tiandao-item-heading">
                             <i class="fa-solid fa-box-archive"></i>
                             <b>随身道具</b>
-                            <span class="tiandao-item-count">${itemEntries.length}件${removedCount > 0 ? ` · ${removedCount}已摘下` : ""}</span>
+                            <span class="tiandao-item-count">${inventoryItems.length} 件</span>
                         </span>
                         <i class="fa-solid fa-chevron-down tiandao-item-chevron${inventoryExpanded ? " expanded" : ""}" aria-hidden="true"></i>
                     </button>
                     <div id="${itemListId}" class="tiandao-item-list" ${inventoryExpanded ? "" : "hidden"}>${chips}</div>
                 </div>`;
             })()
+            : "";
+        const removedHtml = removedItems.length > 0
+            ? `<details class="tiandao-char-removed-section">
+                <summary>已脱下/摘下记录 · ${removedItems.length}</summary>
+                <div class="tiandao-item-list">${renderItemChips(removedItems, "removed", true)}</div>
+            </details>`
             : "";
         const displayName = characterDisplayName(name, info);
         const displayAliases = [...new Set([...(Array.isArray(info.aliases) ? info.aliases : []), ...(displayName !== name ? [name] : [])])].filter(alias => alias !== displayName);
@@ -4248,6 +4268,7 @@ function buildLedgerHtml(memoryData, freshness = getLedgerFreshness(memoryData))
                     ${viewHtml}
                     ${growthHtml}
                     ${itemHtml}
+                    ${removedHtml}
                 </div>
             </div>
         `);
@@ -4273,11 +4294,7 @@ function buildLedgerHtml(memoryData, freshness = getLedgerFreshness(memoryData))
         : "<div class='tiandao-empty-hint'>暂无未完成的约定与待办</div>";
 
     return `
-        <div class="tiandao-ledger-freshness${freshness.stale ? " is-stale" : ""}" role="status">
-            <strong>${escapeHTML(freshness.title)}</strong>
-            <span>${escapeHTML(freshness.detail)}</span>
-            ${freshness.stale && freshness.mode !== "with_summary" ? `<button type="button" data-retry-state class="tiandao-btn tiandao-btn-sm" ${memoryBusy ? "disabled" : ""}>${freshness.mode === "main_response" ? "重新读取正文状态（不调用 API）" : "同步状态（调用 API）"}</button>` : ""}
-        </div>
+        ${options.includeFreshness === false ? "" : buildLedgerFreshnessHtml(freshness, memoryBusy)}
         <div class="tiandao-time-banner">
             <span class="tiandao-time-label"><i class="fa-regular fa-clock"></i> 快照故事时间</span>
             <span class="tiandao-time-val">${escapeHTML(ledger.time || "未知时间")}</span>
@@ -4576,8 +4593,8 @@ function buildTimelineHtml(memoryData) {
 
     return `
         <div class="tiandao-pagehead">
-            <span class="tiandao-pagecap">剧情时间线（${storySortOrder === "desc" ? "由近及远" : "由远及近"}）</span>
-            <span class="tiandao-pagehint">${storyViewRange ? `显示第 ${storyViewRange.from}-${storyViewRange.to} 轮` : "点击 ✏ 可修改每条剧情总结"}</span>
+            <span class="tiandao-pagecap">剧情时间线</span>
+            ${storyViewRange ? `<span class="tiandao-pagehint">第 ${storyViewRange.from}-${storyViewRange.to} 轮</span>` : ""}
         </div>
         ${pager}
         ${body}`;
@@ -5031,16 +5048,27 @@ async function scanChatHistory(backfillBtn) {
     const memoryData = getChatMemory();
     const metadata = ctx.chatMetadata || window.chat_metadata;
     const saveKey = getStateSaveKey(ctx);
+    const settings = getSettings();
+    const l0Chunk = resolveL0RoundsPerSummary(settings);
+    const completeOnly = settings.l0MergeMode !== "manual";
     const missing = collectMissingAiTurns(chat, memoryData, Infinity, getSettings().includeNativeHidden,
         getCachedRoundIndex(chat, getSettings().includeNativeHidden));
-    if (missing.some(turn => turn.idx <= memoryData.lastProcessedMessageId)) {
+    const hasHistoricalGaps = missing.some(turn => turn.idx <= memoryData.lastProcessedMessageId);
+    const groups = groupAiTurnsForL0(missing, l0Chunk, completeOnly);
+    if (missing.length === 0) return updateStatusBar("✅ 所有历史对话轮次均已在记忆树中。");
+    if (completeOnly && groups.length === 0) {
+        updateStatusBar(hasHistoricalGaps
+            ? `历史缺档不足 ${l0Chunk} 轮，未扫描；请在剧情页选择范围补档。`
+            : `当前有 ${missing.length}/${l0Chunk} 轮未归档，暂不扫描。`);
+        return;
+    }
+    if (hasHistoricalGaps) {
         return runStoryResummarize(missing, {
             button: backfillBtn,
             title: "扫描并补齐历史缺档",
-            groups: groupAiTurnsForL0(missing, resolveL0RoundsPerSummary(getSettings()), false),
+            groups,
         });
     }
-    if (missing.length === 0) return updateStatusBar("✅ 所有历史对话轮次均已在记忆树中。");
     if (!confirm(`确定要扫描当前存档中的历史对话轮次吗？`)) return;
     isBackfilling = true;
     abortBackfillFlag = false;
@@ -5108,9 +5136,12 @@ async function scanChatHistory(backfillBtn) {
         memoryData.lastSummaryError = null;
         syncHiddenMessagesState();
         updateFloatingWidgetUI();
+        const unprocessed = Math.max(0, missing.length - result.processedCount);
         updateStatusBar(result.aborted
             ? `⏸️ 已暂停，当前已处理 ${result.processedCount} 轮；再次点击可继续。`
-            : `✅ 存量历史按轮次扫描构建完成！`);
+            : (unprocessed > 0 && completeOnly
+                ? `✅ 已扫描 ${result.processedCount} 轮；余下 ${unprocessed} 轮未满 ${l0Chunk} 轮。`
+                : `✅ 存量历史按轮次扫描构建完成！`));
     } catch (e) {
         if (e?.code === "MEMORY_SAVE_FAILED") {
             if (isCurrentChat(backfillChatKey) && currentMemoryReference() === memoryData) {
@@ -5687,6 +5718,6 @@ function registerMemoryEvents(ctx = getSTContext()) {
 
         registerMemoryEvents(ctx);
         updateFloatingWidgetUI();
-        console.log("[溯微] v1.18.1 (角色成长·身份衔接·删除回退修复) 加载完毕！");
+        console.log("[溯微] v1.20.0 (状态来源追踪·物品分类·界面优化) 加载完毕！");
     } catch (err) { console.error("[溯微] 初始化异常:", err); }
 })();

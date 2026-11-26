@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeStateLedger, normalizeMemoryData, createEmptyMemoryData, normalizeCharacterItems,
+import { mergeStateLedger, normalizeMemoryData, createEmptyMemoryData, normalizeCharacterItems, ledgerItemIdentity, applyStateChanges,
     sanitizeSummaryFlourish, buildInjectedMemoryPrompt, resolveStateLedgerAfterEntry, summarizeSingleTurn, backfillExistingChatHistory, DEFAULT_SETTINGS } from '../memory-engine.js';
 
 const SETTINGS = { ...DEFAULT_SETTINGS, apiUrl: 'https://example.invalid/v1', apiKey: 'test-key', model: 'test-model', mergeChunkSize: 20, useEmbeddingApi: false };
@@ -32,7 +32,29 @@ test('item identity preserves distinguishing descriptions and separate coloured 
     const items = normalizeCharacterItems({ inventory: ['戒指（红宝石）', '戒指（蓝宝石）', '黑色外套', '白色外套', '第二件黑色外套'] });
     assert.equal(items.inventory.length, 5);
     assert.equal(normalizeCharacterItems({ inventory: ['戒指（未鉴定的红宝石）', '戒指（未鉴定的蓝宝石）'] }).inventory.length, 2);
+    assert.equal(normalizeCharacterItems({ inventory: ['戒指（红宝石镶嵌在戒面上）', '戒指（蓝宝石镶嵌在戒面上）'] }).inventory.length, 2);
+    assert.equal(normalizeCharacterItems({ inventory: ['徽章（系在蓝色缎带上的红色银鹰）', '徽章（系在蓝色缎带上的白色银鹰）'] }).inventory.length, 2);
+    assert.equal(ledgerItemIdentity('外套（尚未脱下）'), ledgerItemIdentity('外套（已脱下）'));
+    assert.notEqual(ledgerItemIdentity('小型脱水机的钥匙'), ledgerItemIdentity('钥匙'));
     assert.equal(normalizeCharacterItems({ removedItemsLock: ['外套（黑色，已脱下）', '外套（白色，已脱下）'] }).removedItemsLock.length, 2);
+});
+
+test('per-reply item changes keep one row per physical object, not one row per wording', () => {
+    let ledger = { time: '未知时间', todosAndPromises: [], characters: {
+        旅人: { named: true, location: '营地', wear: '西装', inventory: [], removedItemsLock: [] },
+    } };
+    const step = (round, change) => {
+        ledger = applyStateChanges(ledger, { version: 1, baseRound: round - 1, changes: { characters: { 旅人: change } } }, round);
+    };
+    step(1, { inventoryAdd: ['深灰色定制西装（挂于主卧衣帽间外侧黄铜衣架上）'] });
+    step(2, { inventoryAdd: ['深灰色定制西装（穿在身上）'] });
+    step(3, { inventoryAdd: ['手机（转移至深灰西装内侧口袋）'] });
+    step(4, { inventoryAdd: ['手机（放在床头柜上）'] });
+    assert.deepEqual(ledger.characters.旅人.inventory, ['深灰色定制西装（穿在身上）', '手机（放在床头柜上）']);
+    step(5, { removedItemsLockAdd: ['深灰色定制西装（已脱下搭在沙发扶手上）'] });
+    step(6, { removedItemsLockAdd: ['深灰色定制西装（已脱下搭在二层包厢沙发上）'] });
+    assert.deepEqual(ledger.characters.旅人.inventory, ['手机（放在床头柜上）']);
+    assert.deepEqual(ledger.characters.旅人.removedItemsLock, ['深灰色定制西装（已脱下搭在二层包厢沙发上）']);
 });
 
 test('reported unanswered-player and atmosphere endings are stripped without losing actions', () => {
@@ -183,6 +205,7 @@ test('summary generation preserves large inventories without asking the model to
     await summarizeSingleTurn(SETTINGS, memory, { roundNumber: 1, startMessageId: 0, endMessageId: 1, dialogueText: '甲清点物品。', shouldCommit: () => true });
     assert.doesNotMatch(body.messages[0].content, /随身道具，上限/);
     assert.match(body.messages[0].content, /不要按固定条数裁剪/);
+    assert.match(body.messages[0].content, /衣物、鞋袜和佩戴饰品只写入 wear 或 removedItemsLock/);
     assert.ok(JSON.stringify(body.messages).includes(inventory.at(-1)));
     assert.deepEqual(memory.stateLedger.characters.甲.inventory, inventory);
     assert.equal(memory.stateLedger.characters.甲.removedItemsLock.length, 180);

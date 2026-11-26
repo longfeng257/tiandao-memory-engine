@@ -11,6 +11,39 @@ const styleSource = readFileSync(join(root, "style.css"), "utf8");
 const historySource = readFileSync(join(root, "history-builder.js"), "utf8");
 const backupSource = readFileSync(join(root, "memory-backup.js"), "utf8");
 
+test("dashboard is focused on story state while diagnostics have their own tab", () => {
+    const dashboardStart = indexSource.indexOf('id="tiandao_tab_ledger_content"');
+    const storyStart = indexSource.indexOf('id="tiandao_tab_story_content"', dashboardStart);
+    const debugStart = indexSource.indexOf('id="tiandao_tab_debug_content"', storyStart);
+    const settingsStart = indexSource.indexOf('id="tiandao_tab_settings_content"', debugStart);
+    const dashboard = indexSource.slice(dashboardStart, storyStart);
+    const debug = indexSource.slice(debugStart, settingsStart);
+    assert.match(indexSource, /id="tiandao_tab_debug_btn"[^>]*aria-controls="tiandao_tab_debug_content"/);
+    assert.doesNotMatch(dashboard, /tiandao_injection_preview|tiandao_runtime_stats|tiandao_debug_ledger_freshness|tiandao_widget_summary_info/);
+    for (const id of ["tiandao_injection_preview", "tiandao_runtime_stats", "tiandao_debug_ledger_freshness", "tiandao_widget_summary_info"]) {
+        assert.ok(debug.includes(`id="${id}"`), `${id} belongs to the debug tab`);
+    }
+    assert.match(indexSource, /id="tiandao_story_scope"[^>]*aria-label="记忆树范围"[\s\S]*?<option value="active">当前记忆树<\/option>/);
+    assert.match(indexSource, /id="tiandao_injection_preview"/);
+});
+
+test("main navigation has four compact, accessible tabs in one row", () => {
+    for (const id of ["tiandao_tab_ledger_btn", "tiandao_tab_story_btn", "tiandao_tab_debug_btn", "tiandao_tab_settings_btn"]) {
+        assert.match(indexSource, new RegExp(`id="${id}"[^>]*aria-label="[^"]+"`));
+    }
+    assert.match(styleSource, /grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\)/);
+});
+
+test("story browsing controls are grouped separately from batch operations", () => {
+    const storyStart = indexSource.indexOf('id="tiandao_tab_story_content"');
+    const debugStart = indexSource.indexOf('id="tiandao_tab_debug_content"', storyStart);
+    const story = indexSource.slice(storyStart, debugStart);
+    assert.ok(story.indexOf("tiandao-story-filter-bar") < story.indexOf("tiandao-story-operations"));
+    assert.match(story, /<details class="tiandao-story-operations">[\s\S]*?id="tiandao_story_range_from"[\s\S]*?id="tiandao_story_range_mode"[\s\S]*?id="tiandao_story_range_btn"[\s\S]*?id="tiandao_story_rebuild_all_btn"/);
+    assert.match(styleSource, /\.tiandao-story-filter-controls\s*\{/);
+    assert.match(styleSource, /\.tiandao-story-operations\s*\{/);
+});
+
 test("widget no longer renders hardcoded model shortcut chips", () => {
     assert.doesNotMatch(indexSource, /data-model="/);
     assert.doesNotMatch(indexSource, /tiandao-quick-chips/);
@@ -24,9 +57,8 @@ test("tag inputs stay visually empty and custom strip tags have no defaults", ()
 });
 
 test("tag fields document comma, Chinese comma and whitespace separators", () => {
-    assert.match(indexSource, /英文逗号、中文逗号或空格均可分隔/);
-    assert.match(indexSource, /同样使用英文逗号、中文逗号或空格分隔/);
-    assert.match(indexSource, /标签名不必带尖括号，大小写不敏感/);
+    assert.match(indexSource, /中英文逗号或空格分隔；按顺序尝试/);
+    assert.match(indexSource, /中英文逗号或空格分隔；匹配标签块会从正文移除/);
 });
 
 test("status bar starts hidden and contains transient status logic", () => {
@@ -244,7 +276,7 @@ test("story timeline paginates twenty entries with older and newer controls", ()
 test("history preserves early coverage without a budget trim loop", () => {
     assert.match(historySource, /selectHistoricalEntries/);
     assert.doesNotMatch(engineSource, /while \(estimatePromptTokens\(prompt\)/);
-    assert.match(indexSource, /需要每轮提取状态时设为 1 轮并选择“AI 回复完成后立即总结”/);
+    assert.match(indexSource, /自动模式满 N 轮归档；手动模式需在剧情页选择轮次合并/);
 });
 
 test("prompt injection keeps chronological order independent of the timeline display sort", () => {
@@ -257,7 +289,7 @@ test("story timeline defaults to descending order and exposes ascending order", 
     assert.match(indexSource, /let storySortOrder = "desc"/);
     assert.match(indexSource, /id="tiandao_story_sort_order"[\s\S]{0,220}<option value="desc" selected>倒序<\/option>[\s\S]{0,80}<option value="asc">正序<\/option>/);
     assert.match(indexSource, /const displayEntries = storySortOrder === "desc"[\s\S]{0,60}entries\.slice\(\)\.reverse\(\)/);
-    assert.match(indexSource, /剧情时间线（\$\{storySortOrder === "desc" \? "由近及远" : "由远及近"\}）/);
+    assert.match(indexSource, /tiandao-pagecap">剧情时间线<\/span>/);
     assert.match(styleSource, /\.tiandao-story-sort-select\s*\{/);
 });
 
@@ -281,7 +313,7 @@ test("legacy state snapshot migration is persisted after load", () => {
 test("story range groups its endpoints and wraps without shrinking interactive targets", () => {
     assert.match(indexSource, /class="tiandao-story-range-fields" role="group" aria-labelledby="tiandao_story_range_label"/);
     assert.match(indexSource, /class="tiandao-story-range-actions"/);
-    assert.match(styleSource, /\.tiandao-story-range-bar\s*\{[^}]*flex-wrap:\s*wrap/);
+    assert.match(styleSource, /\.tiandao-story-range-bar\s*\{[^}]*display:\s*grid/);
     assert.match(styleSource, /\.tiandao-story-range-bar \.tiandao-input-sm\s*\{[^}]*min-height:\s*28px/);
     assert.match(styleSource, /\.tiandao-story-range-mode\s*,\s*\.tiandao-story-range-bar \.tiandao-btn-sm,[^}]*min-height:\s*32px/);
 });
@@ -337,7 +369,7 @@ test("legacy migration can explicitly include native hidden floors", () => {
     assert.match(indexSource, /bindCheck\("tiandao_include_native_hidden", "includeNativeHidden", \(\) =>/);
     assert.match(indexSource, /buildRoundMessageIndex\(chat, settings\.includeNativeHidden\)/);
     assert.match(indexSource, /轮次计算与总结包含酒馆原生隐藏楼层/);
-    assert.match(indexSource, /切换后建议立即重新扫描或重建/);
+    assert.match(indexSource, /切换后请重新扫描或重建/);
 });
 
 test("story range has an explicit settings binding", () => {
@@ -596,7 +628,7 @@ test("long-chat hot paths reuse normalized memory and cap raw scanning", () => {
 test('ledger render cache includes freshness even when stored state is unchanged', () => {
     assert.match(indexSource, /const ledgerFreshness = getLedgerFreshness\(memoryData\)/);
     assert.match(indexSource, /ledgerRenderKey = [^\n]*JSON\.stringify\(ledgerFreshness\)/);
-    assert.match(indexSource, /bodyInner\.innerHTML = buildLedgerHtml\(memoryData, ledgerFreshness\)/);
+    assert.match(indexSource, /bodyInner\.innerHTML = buildLedgerHtml\(memoryData, ledgerFreshness, \{ includeFreshness: false \}\)/);
     assert.match(styleSource, /\.tiandao-ledger-freshness\.is-stale/);
     assert.match(indexSource, /eventTypes\.USER_MESSAGE_RENDERED, \(\) => \{[\s\S]{0,240}updateFloatingWidgetUI\(\)/);
 });
@@ -608,10 +640,11 @@ test('state update modes are selectable, preserve legacy defaults and disclose p
     assert.match(indexSource, /option value="main_response"/);
     assert.match(engineSource, /stateUpdateMode: "with_summary"/);
     assert.match(indexSource, /bindInput\("tiandao_state_update_mode", "stateUpdateMode"/);
-    assert.match(indexSource, /切换只作用于后续回复，不会自动重跑历史/);
-    assert.match(indexSource, /下一次发送才总结时则另计 L0 请求/);
-    assert.match(indexSource, /正文模式不增加独立状态请求/);
-    assert.match(indexSource, /协议区块在聊天中隐藏，发送历史时剔除，本地原始消息仍保留以便恢复/);
+    assert.match(indexSource, /切换只作用于后续回复，不会重跑历史/);
+    assert.match(indexSource, /独立模式每轮调用总结 API/);
+    assert.match(indexSource, /正文模式由主模型随回复返回，不增加请求/);
+    assert.match(indexSource, /状态区块发送时剔除/);
+    assert.match(indexSource, /漏写只提示，不自动补跑/);
     assert.match(styleSource, /details\[data-suwei-state="1"\][^}]*display: none !important/);
     assert.match(indexSource, /stateMode !== "independent" && settings.autoSummarizePerTurn/);
 });
